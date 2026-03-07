@@ -50,6 +50,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let mode: HelperMode
     private var socketServer: SocketServer!
     private var pasteboardManager: PasteboardManager!
+    private var fileTransferCoordinator: FileTransferCoordinator!
 
     init(socketPath: String, mode: HelperMode) {
         self.socketPath = socketPath
@@ -71,8 +72,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func setupComponents() {
+        // Initialize file transfer coordinator
+        fileTransferCoordinator = FileTransferCoordinator()
+        fileTransferCoordinator.sendMessage = { [weak self] msg in
+            self?.socketServer.send(msg)
+        }
+
         // Initialize pasteboard manager
         pasteboardManager = PasteboardManager()
+        // Inject coordinator so it can write NSFilePromiseProviders (client mode)
+        pasteboardManager.fileTransferCoordinator = fileTransferCoordinator
 
         // Initialize socket server
         socketServer = SocketServer(socketPath: socketPath)
@@ -88,11 +97,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         socketServer.onMessage = { [weak self] message in
             self?.handleMessage(message)
-        }
-
-        socketServer.onClientConnected = { [weak self] in
-            Log.info("Parent connected, starting pasteboard polling")
-            self?.pasteboardManager.startPolling()
         }
 
         socketServer.onClientDisconnected = { [weak self] in
@@ -157,9 +161,102 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             pasteboardManager.stopPolling()
             exit(0)
 
+        case .fileChunkRequest:
+            // Parent (Go server) is requesting a local file chunk to serve a remote client
+            if case .fileChunkRequest(let req) = message.payload {
+                handleIncomingFileChunkRequest(req)
+            }
+
+        case .fileChunkData:
+            // Parent (shen/Rust) is delivering a file chunk we previously requested
+            if case .fileChunkData(let chunk) = message.payload {
+                fileTransferCoordinator.handleChunkData(chunk)
+            }
+
         default:
             Log.warning("Unhandled message type: \(message.type)")
         }
+    }
+
+    // MARK: - File chunk request (server mode — read local file)
+
+    /// Called when the Go parent needs a chunk of a locally-copied file
+    /// (to serve a remote WebRTC client that is pasting from clipboard).
+    private func handleIncomingFileChunkRequest(_ req: Leviathan_HelperFileChunkRequest) {
+        guard let localURL = pasteboardManager.localFileURLs[req.fileID] else {
+            Log.warning("[FileTransfer] FILE_CHUNK_REQUEST for unknown fileID=\(req.fileID)")
+            sendFileChunkError(transferID: req.transferID, fileID: req.fileID,
+                               offset: req.offset, error: "file not found")
+            return
+        }
+
+        let chunkSize = req.size > 0 ? Int(req.size) : 262_144
+        let offset = req.offset
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            do {
+                let fh = try FileHandle(forReadingFrom: localURL)
+                defer { fh.closeFile() }
+
+                let fileSize = (try? FileManager.default.attributesOfItem(atPath: localURL.path))?[.size] as? UInt64 ?? 0
+
+                if offset >= fileSize && fileSize > 0 {
+                    // Past EOF — send empty last chunk
+                    self.sendFileChunk(
+                        transferID: req.transferID, fileID: req.fileID,
+                        offset: offset, data: Data(), isLast: true)
+                    return
+                }
+
+                try fh.seek(toOffset: offset)
+                let toRead = min(chunkSize, Int(fileSize - offset))
+                let data = fh.readData(ofLength: toRead)
+                let isLast = (offset + UInt64(data.count)) >= fileSize
+
+                self.sendFileChunk(
+                    transferID: req.transferID, fileID: req.fileID,
+                    offset: offset, data: data, isLast: isLast)
+
+                Log.debug("[FileTransfer] Served chunk offset=\(offset) size=\(data.count) isLast=\(isLast)")
+            } catch {
+                self.sendFileChunkError(
+                    transferID: req.transferID, fileID: req.fileID,
+                    offset: offset, error: error.localizedDescription)
+            }
+        }
+    }
+
+    private func sendFileChunk(transferID: String, fileID: String,
+                                offset: UInt64, data: Data, isLast: Bool) {
+        var chunk = Leviathan_HelperFileChunkData()
+        chunk.transferID = transferID
+        chunk.fileID = fileID
+        chunk.offset = offset
+        chunk.data = data
+        chunk.isLast = isLast
+
+        var msg = Leviathan_HelperMessage()
+        msg.type = .fileChunkData
+        msg.payload = .fileChunkData(chunk)
+        msg.timestamp = currentTimestamp()
+        socketServer.send(msg)
+    }
+
+    private func sendFileChunkError(transferID: String, fileID: String,
+                                     offset: UInt64, error: String) {
+        var chunk = Leviathan_HelperFileChunkData()
+        chunk.transferID = transferID
+        chunk.fileID = fileID
+        chunk.offset = offset
+        chunk.error = error
+        chunk.isLast = true
+
+        var msg = Leviathan_HelperMessage()
+        msg.type = .fileChunkData
+        msg.payload = .fileChunkData(chunk)
+        msg.timestamp = currentTimestamp()
+        socketServer.send(msg)
     }
 
     // MARK: - Outgoing Messages

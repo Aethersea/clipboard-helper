@@ -16,6 +16,13 @@ final class PasteboardManager: NSObject {
     private var renderedData: Data?
     private var lastSetHash: String?
 
+    // File transfer coordinator (injected by AppDelegate in client mode)
+    var fileTransferCoordinator: FileTransferCoordinator?
+
+    // Local file URLs from the last pasteboard read, keyed by file_id.
+    // Used in server mode so AppDelegate can serve FILE_CHUNK_REQUESTs.
+    private(set) var localFileURLs: [String: URL] = [:]
+
     // Callbacks
     var onClipboardChanged: ((Leviathan_ClipboardData) -> Void)?
     var onDataRequest: ((Leviathan_ClipboardDataRequest) -> Void)?
@@ -112,9 +119,15 @@ final class PasteboardManager: NSObject {
         case .image:
             types = [.png, .tiff]
         case .files:
-            types = [.fileURL]
+            // Files use NSFilePromiseProvider — handled separately below
+            break
         default:
             break
+        }
+
+        if announcement.contentType == .files {
+            announceDelayedFiles(announcement)
+            return
         }
 
         guard !types.isEmpty else {
@@ -127,6 +140,44 @@ final class PasteboardManager: NSObject {
         lastChangeCount = pasteboard.changeCount
 
         Log.info("Announced delayed: \(announcement.contentType) hash=\(announcement.contentHash)")
+    }
+
+    private func announceDelayedFiles(_ announcement: Leviathan_ClipboardAnnouncement) {
+        assert(Thread.isMainThread)
+
+        guard !announcement.files.isEmpty else {
+            Log.warning("Announce files: empty file list")
+            return
+        }
+
+        // Register with coordinator so we can map chunks back to this transfer
+        fileTransferCoordinator?.registerAnnouncement(announcement)
+
+        let transferID = announcement.transferID.isEmpty
+            ? announcement.contentHash  // fall back to content hash as stable ID
+            : announcement.transferID
+
+        // Write one NSFilePromiseProvider per file.
+        // When the user drops/pastes into Finder, macOS calls
+        // filePromiseProvider(_:writePromiseTo:completionHandler:) and shows a
+        // native progress dialog automatically via NSProgress.
+        let providers: [NSFilePromiseProvider] = announcement.files.map { file in
+            let fileType = utiFromMimeType(file.mimeType) ?? "public.item"
+            let provider = NSFilePromiseProvider(fileType: fileType, delegate: self)
+            provider.userInfo = [
+                "transferID": transferID,
+                "fileID": file.fileID,
+                "filename": file.filename,
+                "fileSize": file.fileSize,
+            ] as [String: Any]
+            return provider
+        }
+
+        pasteboard.clearContents()
+        pasteboard.writeObjects(providers as [NSPasteboardWriting])
+        lastChangeCount = pasteboard.changeCount
+
+        Log.info("Announced delayed files: \(announcement.files.count) file(s) transferID=\(transferID)")
     }
 
     // MARK: - Provide Data (response from parent)
@@ -243,6 +294,7 @@ final class PasteboardManager: NSObject {
             .urlReadingFileURLsOnly: true
         ]) as? [URL], !urls.isEmpty {
             data.contentType = .files
+            localFileURLs = [:]  // reset and repopulate
             for (i, url) in urls.enumerated() {
                 var meta = Leviathan_FileMetadata()
                 meta.fileID = "\(i)"
@@ -253,6 +305,7 @@ final class PasteboardManager: NSObject {
                 }
                 meta.isDirectory = url.hasDirectoryPath
                 data.files.append(meta)
+                localFileURLs[meta.fileID] = url  // store for FILE_CHUNK_REQUEST serving
             }
             // Hash based on file paths
             let pathString = urls.map { $0.path }.joined(separator: "\n")
@@ -299,5 +352,87 @@ private extension NSImage {
             return nil
         }
         return bitmap.representation(using: .png, properties: [:])
+    }
+}
+
+// MARK: - NSFilePromiseProviderDelegate
+
+extension PasteboardManager: NSFilePromiseProviderDelegate {
+
+    /// Called by macOS to get the filename for the promised item.
+    func filePromiseProvider(
+        _ filePromiseProvider: NSFilePromiseProvider,
+        fileNameForType fileType: String
+    ) -> String {
+        guard let info = filePromiseProvider.userInfo as? [String: Any],
+              let filename = info["filename"] as? String, !filename.isEmpty
+        else { return "file" }
+        return filename
+    }
+
+    /// Called when the user actually drops/pastes a promised file:
+    /// macOS provides a destination URL and we must write the file there.
+    /// NSProgress tracking happens automatically — Finder shows a progress dialog.
+    func filePromiseProvider(
+        _ filePromiseProvider: NSFilePromiseProvider,
+        writePromiseTo url: URL,
+        completionHandler: @escaping (Error?) -> Void
+    ) {
+        guard let info = filePromiseProvider.userInfo as? [String: Any],
+              let transferID = info["transferID"] as? String,
+              let fileID = info["fileID"] as? String,
+              let fileSize = (info["fileSize"] as? NSNumber)?.uint64Value ?? (info["fileSize"] as? UInt64),
+              let coordinator = fileTransferCoordinator
+        else {
+            completionHandler(NSError(
+                domain: "FileTransfer", code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "Missing transfer metadata"]))
+            return
+        }
+
+        let filename = (info["filename"] as? String) ?? url.lastPathComponent
+        Log.info("[FileTransfer] Promise write requested: \(filename) → \(url.path)")
+
+        // Create a progress node; Finder sums all sibling nodes into the copy dialog.
+        let fileProgress = Progress(totalUnitCount: Int64(max(fileSize, 1)))
+
+        coordinator.startFileDownload(
+            transferID: transferID,
+            fileID: fileID,
+            fileSize: fileSize,
+            to: url,
+            parentProgress: fileProgress,
+            completion: completionHandler
+        )
+    }
+
+    /// Use a dedicated operation queue for promise writes so we don't block the main thread.
+    func operationQueue(for filePromiseProvider: NSFilePromiseProvider) -> OperationQueue {
+        let q = OperationQueue()
+        q.qualityOfService = .userInitiated
+        q.maxConcurrentOperationCount = 4
+        return q
+    }
+}
+
+// MARK: - UTI helper
+
+/// Map a MIME type to a UTI string for NSFilePromiseProvider.
+/// Falls back to "public.item" for unknown types.
+private func utiFromMimeType(_ mime: String) -> String? {
+    switch mime {
+    case "application/pdf": return "com.adobe.pdf"
+    case "image/png": return "public.png"
+    case "image/jpeg": return "public.jpeg"
+    case "image/gif": return "com.compuserve.gif"
+    case "image/webp": return "org.webmproject.webp"
+    case "video/mp4": return "public.mpeg-4"
+    case "audio/mpeg": return "public.mp3"
+    case "text/plain": return "public.plain-text"
+    case "application/zip": return "com.pkware.zip-archive"
+    case let m where m.hasPrefix("text/"): return "public.plain-text"
+    default:
+        // Use UTTypeCreatePreferredIdentifierForTag if available (macOS 11+)
+        return "public.item"
     }
 }

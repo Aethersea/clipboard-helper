@@ -23,6 +23,10 @@ enum HelperMessageType {
   HELPER_MESSAGE_TYPE_CLIPBOARD_CONTENT = 12; // Response to GET_CLIPBOARD
   HELPER_MESSAGE_TYPE_ERROR = 13;             // Error notification
   HELPER_MESSAGE_TYPE_READY = 14;             // Helper initialized
+
+  // Bidirectional — either side can request/supply file chunks
+  HELPER_MESSAGE_TYPE_FILE_CHUNK_REQUEST = 15; // Requester: need chunk at offset
+  HELPER_MESSAGE_TYPE_FILE_CHUNK_DATA = 16;    // Supplier: here is the chunk
 }
 
 message HelperMessage {
@@ -34,6 +38,8 @@ message HelperMessage {
     HelperProvideData provide_data = 4;           // For PROVIDE_DATA
     ClipboardDataRequest data_request = 5;        // For DATA_REQUEST
     string error_message = 6;                     // For ERROR
+    HelperFileChunkRequest file_chunk_request = 8; // For FILE_CHUNK_REQUEST
+    HelperFileChunkData file_chunk_data = 9;       // For FILE_CHUNK_DATA
   }
 
   uint64 timestamp = 7;
@@ -42,4 +48,22 @@ message HelperMessage {
 message HelperProvideData {
   string content_hash = 1;
   bytes data = 2;
+}
+
+// Request for a file chunk — sent by whichever side needs the data.
+message HelperFileChunkRequest {
+  string transfer_id = 1;  // Identifies the file set (from ClipboardAnnouncement)
+  string file_id = 2;      // Which file
+  uint64 offset = 3;       // Byte offset in file
+  uint32 size = 4;         // Bytes to read (0 = use 262144 default)
+}
+
+// A file chunk in response to HelperFileChunkRequest.
+message HelperFileChunkData {
+  string transfer_id = 1;
+  string file_id = 2;
+  uint64 offset = 3;
+  bytes data = 4;
+  bool is_last = 5;   // true if this is the final chunk
+  string error = 6;   // non-empty on error
 }

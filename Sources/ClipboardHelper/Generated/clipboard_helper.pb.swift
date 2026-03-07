@@ -30,6 +30,10 @@ public enum Leviathan_HelperMessageType: SwiftProtobuf.Enum, Swift.CaseIterable 
     case error // = 13
     case ready // = 14
 
+    // Bidirectional — either side can request/supply file chunks
+    case fileChunkRequest // = 15
+    case fileChunkData // = 16
+
     case UNRECOGNIZED(Int)
 
     public init() {
@@ -49,6 +53,8 @@ public enum Leviathan_HelperMessageType: SwiftProtobuf.Enum, Swift.CaseIterable 
         case 12: self = .clipboardContent
         case 13: self = .error
         case 14: self = .ready
+        case 15: self = .fileChunkRequest
+        case 16: self = .fileChunkData
         default: self = .UNRECOGNIZED(rawValue)
         }
     }
@@ -66,6 +72,8 @@ public enum Leviathan_HelperMessageType: SwiftProtobuf.Enum, Swift.CaseIterable 
         case .clipboardContent: return 12
         case .error: return 13
         case .ready: return 14
+        case .fileChunkRequest: return 15
+        case .fileChunkData: return 16
         case .UNRECOGNIZED(let i): return i
         }
     }
@@ -73,7 +81,7 @@ public enum Leviathan_HelperMessageType: SwiftProtobuf.Enum, Swift.CaseIterable 
     public static let allCases: [Leviathan_HelperMessageType] = [
         .unspecified, .setClipboard, .announceDelayed, .provideData,
         .getClipboard, .shutdown, .clipboardChanged, .dataRequest,
-        .clipboardContent, .error, .ready,
+        .clipboardContent, .error, .ready, .fileChunkRequest, .fileChunkData,
     ]
 }
 
@@ -90,6 +98,8 @@ extension Leviathan_HelperMessageType: SwiftProtobuf._ProtoNameProviding {
         12: .same(proto: "HELPER_MESSAGE_TYPE_CLIPBOARD_CONTENT"),
         13: .same(proto: "HELPER_MESSAGE_TYPE_ERROR"),
         14: .same(proto: "HELPER_MESSAGE_TYPE_READY"),
+        15: .same(proto: "HELPER_MESSAGE_TYPE_FILE_CHUNK_REQUEST"),
+        16: .same(proto: "HELPER_MESSAGE_TYPE_FILE_CHUNK_DATA"),
     ]
 }
 
@@ -107,6 +117,8 @@ public struct Leviathan_HelperMessage: Sendable {
         case provideData(Leviathan_HelperProvideData)
         case dataRequest(Leviathan_ClipboardDataRequest)
         case errorMessage(String)
+        case fileChunkRequest(Leviathan_HelperFileChunkRequest)
+        case fileChunkData(Leviathan_HelperFileChunkData)
     }
 
     public init() {}
@@ -117,6 +129,36 @@ public struct Leviathan_HelperMessage: Sendable {
 public struct Leviathan_HelperProvideData: Sendable {
     public var contentHash: String = String()
     public var data: Data = Data()
+    public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+    public init() {}
+}
+
+// MARK: - HelperFileChunkRequest
+
+public struct Leviathan_HelperFileChunkRequest: Sendable {
+    /// Identifies the file set (matches transfer_id in ClipboardAnnouncement)
+    public var transferID: String = String()
+    public var fileID: String = String()
+    public var offset: UInt64 = 0
+    /// Bytes to read (0 = default 262144)
+    public var size: UInt32 = 0
+    public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+    public init() {}
+}
+
+// MARK: - HelperFileChunkData
+
+public struct Leviathan_HelperFileChunkData: Sendable {
+    public var transferID: String = String()
+    public var fileID: String = String()
+    public var offset: UInt64 = 0
+    public var data: Data = Data()
+    /// True if this is the final chunk for this file
+    public var isLast: Bool = false
+    /// Non-empty if an error occurred
+    public var error: String = String()
     public var unknownFields = SwiftProtobuf.UnknownStorage()
 
     public init() {}
@@ -134,6 +176,8 @@ extension Leviathan_HelperMessage: SwiftProtobuf.Message, SwiftProtobuf._Message
         5: .standard(proto: "data_request"),
         6: .standard(proto: "error_message"),
         7: .same(proto: "timestamp"),
+        8: .standard(proto: "file_chunk_request"),
+        9: .standard(proto: "file_chunk_data"),
     ]
 
     public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
@@ -196,6 +240,30 @@ extension Leviathan_HelperMessage: SwiftProtobuf.Message, SwiftProtobuf._Message
                     self.payload = .errorMessage(v)
                 }
             case 7: try decoder.decodeSingularUInt64Field(value: &self.timestamp)
+            case 8:
+                var v: Leviathan_HelperFileChunkRequest?
+                var hadOneofValue = false
+                if let current = self.payload {
+                    hadOneofValue = true
+                    if case .fileChunkRequest(let m) = current { v = m }
+                }
+                try decoder.decodeSingularMessageField(value: &v)
+                if let v = v {
+                    if hadOneofValue { try decoder.handleConflictingOneOf() }
+                    self.payload = .fileChunkRequest(v)
+                }
+            case 9:
+                var v: Leviathan_HelperFileChunkData?
+                var hadOneofValue = false
+                if let current = self.payload {
+                    hadOneofValue = true
+                    if case .fileChunkData(let m) = current { v = m }
+                }
+                try decoder.decodeSingularMessageField(value: &v)
+                if let v = v {
+                    if hadOneofValue { try decoder.handleConflictingOneOf() }
+                    self.payload = .fileChunkData(v)
+                }
             default: break
             }
         }
@@ -216,6 +284,10 @@ extension Leviathan_HelperMessage: SwiftProtobuf.Message, SwiftProtobuf._Message
             try visitor.visitSingularMessageField(value: v, fieldNumber: 5)
         case .errorMessage(let v)?:
             try visitor.visitSingularStringField(value: v, fieldNumber: 6)
+        case .fileChunkRequest(let v)?:
+            try visitor.visitSingularMessageField(value: v, fieldNumber: 8)
+        case .fileChunkData(let v)?:
+            try visitor.visitSingularMessageField(value: v, fieldNumber: 9)
         case nil:
             break
         }
@@ -264,6 +336,112 @@ extension Leviathan_HelperProvideData: SwiftProtobuf.Message, SwiftProtobuf._Mes
     public static func ==(lhs: Leviathan_HelperProvideData, rhs: Leviathan_HelperProvideData) -> Bool {
         if lhs.contentHash != rhs.contentHash { return false }
         if lhs.data != rhs.data { return false }
+        if lhs.unknownFields != rhs.unknownFields { return false }
+        return true
+    }
+}
+
+extension Leviathan_HelperFileChunkRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+    public static let protoMessageName: String = "leviathan.HelperFileChunkRequest"
+    public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
+        1: .standard(proto: "transfer_id"),
+        2: .standard(proto: "file_id"),
+        3: .same(proto: "offset"),
+        4: .same(proto: "size"),
+    ]
+
+    public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+        while let fieldNumber = try decoder.nextFieldNumber() {
+            switch fieldNumber {
+            case 1: try decoder.decodeSingularStringField(value: &self.transferID)
+            case 2: try decoder.decodeSingularStringField(value: &self.fileID)
+            case 3: try decoder.decodeSingularUInt64Field(value: &self.offset)
+            case 4: try decoder.decodeSingularUInt32Field(value: &self.size)
+            default: break
+            }
+        }
+    }
+
+    public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+        if !self.transferID.isEmpty {
+            try visitor.visitSingularStringField(value: self.transferID, fieldNumber: 1)
+        }
+        if !self.fileID.isEmpty {
+            try visitor.visitSingularStringField(value: self.fileID, fieldNumber: 2)
+        }
+        if self.offset != 0 {
+            try visitor.visitSingularUInt64Field(value: self.offset, fieldNumber: 3)
+        }
+        if self.size != 0 {
+            try visitor.visitSingularUInt32Field(value: self.size, fieldNumber: 4)
+        }
+        try unknownFields.traverse(visitor: &visitor)
+    }
+
+    public static func ==(lhs: Leviathan_HelperFileChunkRequest, rhs: Leviathan_HelperFileChunkRequest) -> Bool {
+        if lhs.transferID != rhs.transferID { return false }
+        if lhs.fileID != rhs.fileID { return false }
+        if lhs.offset != rhs.offset { return false }
+        if lhs.size != rhs.size { return false }
+        if lhs.unknownFields != rhs.unknownFields { return false }
+        return true
+    }
+}
+
+extension Leviathan_HelperFileChunkData: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+    public static let protoMessageName: String = "leviathan.HelperFileChunkData"
+    public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
+        1: .standard(proto: "transfer_id"),
+        2: .standard(proto: "file_id"),
+        3: .same(proto: "offset"),
+        4: .same(proto: "data"),
+        5: .standard(proto: "is_last"),
+        6: .same(proto: "error"),
+    ]
+
+    public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+        while let fieldNumber = try decoder.nextFieldNumber() {
+            switch fieldNumber {
+            case 1: try decoder.decodeSingularStringField(value: &self.transferID)
+            case 2: try decoder.decodeSingularStringField(value: &self.fileID)
+            case 3: try decoder.decodeSingularUInt64Field(value: &self.offset)
+            case 4: try decoder.decodeSingularBytesField(value: &self.data)
+            case 5: try decoder.decodeSingularBoolField(value: &self.isLast)
+            case 6: try decoder.decodeSingularStringField(value: &self.error)
+            default: break
+            }
+        }
+    }
+
+    public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+        if !self.transferID.isEmpty {
+            try visitor.visitSingularStringField(value: self.transferID, fieldNumber: 1)
+        }
+        if !self.fileID.isEmpty {
+            try visitor.visitSingularStringField(value: self.fileID, fieldNumber: 2)
+        }
+        if self.offset != 0 {
+            try visitor.visitSingularUInt64Field(value: self.offset, fieldNumber: 3)
+        }
+        if !self.data.isEmpty {
+            try visitor.visitSingularBytesField(value: self.data, fieldNumber: 4)
+        }
+        if self.isLast != false {
+            try visitor.visitSingularBoolField(value: self.isLast, fieldNumber: 5)
+        }
+        if !self.error.isEmpty {
+            try visitor.visitSingularStringField(value: self.error, fieldNumber: 6)
+        }
+        try unknownFields.traverse(visitor: &visitor)
+    }
+
+    public static func ==(lhs: Leviathan_HelperFileChunkData, rhs: Leviathan_HelperFileChunkData) -> Bool {
+        if lhs.transferID != rhs.transferID { return false }
+        if lhs.fileID != rhs.fileID { return false }
+        if lhs.offset != rhs.offset { return false }
+        if lhs.data != rhs.data { return false }
+        if lhs.isLast != rhs.isLast { return false }
+        if lhs.error != rhs.error { return false }
         if lhs.unknownFields != rhs.unknownFields { return false }
         return true
     }
