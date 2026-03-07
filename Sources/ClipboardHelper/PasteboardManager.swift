@@ -146,7 +146,7 @@ final class PasteboardManager: NSObject {
 
     // MARK: - NSPasteboard Owner (delayed rendering callbacks)
 
-    override func pasteboard(_ sender: NSPasteboard, provideDataForType type: NSPasteboard.PasteboardType) {
+    @objc func pasteboard(_ sender: NSPasteboard, provideDataForType type: NSPasteboard.PasteboardType) {
         guard let announcement = pendingAnnouncement else {
             Log.warning("provideDataForType called but no pending announcement")
             return
@@ -183,7 +183,7 @@ final class PasteboardManager: NSObject {
         writeDataToPasteboard(data, type: type, announcement: announcement)
     }
 
-    override func pasteboardChangedOwner(_ sender: NSPasteboard) {
+    @objc func pasteboardChangedOwner(_ sender: NSPasteboard) {
         Log.info("Pasteboard ownership lost")
         pendingAnnouncement = nil
         renderedData = nil
