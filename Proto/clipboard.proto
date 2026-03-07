@@ -1,0 +1,59 @@
+syntax = "proto3";
+
+package leviathan;
+
+option go_package = "github.com/aethersea/leviathan/proto";
+
+// ─── Clipboard Sync Messages ─────────────────────────────────────────────────
+// Bidirectional clipboard synchronization between client and server.
+// Text and images are sent via protobuf over WebRTC DataChannel.
+// Files are transferred via WebRTC DataChannel with chunked transfer support.
+
+// Clipboard sync data — sent server→client or client→server on clipboard change.
+message ClipboardData {
+  ClipboardContentType content_type = 1;  // Type of clipboard content
+  bytes payload = 2;                      // UTF-8 text bytes, or lossless WebP bytes for images
+  string content_hash = 3;                // SHA-256 hex hash for deduplication
+  
+  // For FILES type: file metadata (transfer via DataChannel)
+  repeated FileMetadata files = 4;        // File metadata list
+  string transfer_id = 5;                 // Transfer session ID for file transfer
+}
+
+// Type of clipboard content.
+enum ClipboardContentType {
+  CLIPBOARD_CONTENT_TYPE_UNSPECIFIED = 0;
+  CLIPBOARD_CONTENT_TYPE_TEXT = 1;        // payload = UTF-8 text
+  CLIPBOARD_CONTENT_TYPE_IMAGE = 2;       // payload = lossless WebP bytes
+  CLIPBOARD_CONTENT_TYPE_FILES = 3;       // payload empty; files transferred via DataChannel
+}
+
+// Metadata for a single file in clipboard.
+message FileMetadata {
+  string file_id = 1;                     // Unique ID for this file (UUID)
+  string filename = 2;                    // Original filename (basename only)
+  string relative_path = 3;              // Relative path for directory structure (optional)
+  uint64 file_size = 4;                   // File size in bytes
+  string mime_type = 5;                   // MIME type (e.g., "application/pdf")
+  string checksum_sha256 = 6;             // SHA-256 hash for integrity verification
+  bool is_directory = 7;                  // True if this represents a directory
+}
+
+// Announcement sent when clipboard content changes (metadata only, no payload).
+message ClipboardAnnouncement {
+  ClipboardContentType content_type = 1;
+  string content_hash = 2;
+  uint64 size_bytes = 3;
+  
+  uint32 image_width = 4;
+  uint32 image_height = 5;
+  
+  repeated FileMetadata files = 6;
+  string transfer_id = 7;
+}
+
+// Request to fetch actual clipboard content (sent when user pastes).
+message ClipboardDataRequest {
+  string content_hash = 1;
+  ClipboardContentType content_type = 2;
+}

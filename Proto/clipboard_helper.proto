@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package leviathan;
+
+option go_package = "github.com/aethersea/leviathan/proto";
+
+import "clipboard.proto";
+
+// Direction of helper IPC message
+enum HelperMessageType {
+  HELPER_MESSAGE_TYPE_UNSPECIFIED = 0;
+
+  // Parent → Helper
+  HELPER_MESSAGE_TYPE_SET_CLIPBOARD = 1;      // Apply content directly to pasteboard
+  HELPER_MESSAGE_TYPE_ANNOUNCE_DELAYED = 2;   // Set up delayed rendering
+  HELPER_MESSAGE_TYPE_PROVIDE_DATA = 3;       // Supply data (response to DATA_REQUEST)
+  HELPER_MESSAGE_TYPE_GET_CLIPBOARD = 4;      // Request current pasteboard content
+  HELPER_MESSAGE_TYPE_SHUTDOWN = 5;           // Graceful shutdown
+
+  // Helper → Parent
+  HELPER_MESSAGE_TYPE_CLIPBOARD_CHANGED = 10; // Pasteboard changed (polled)
+  HELPER_MESSAGE_TYPE_DATA_REQUEST = 11;      // OS paste triggered, need data
+  HELPER_MESSAGE_TYPE_CLIPBOARD_CONTENT = 12; // Response to GET_CLIPBOARD
+  HELPER_MESSAGE_TYPE_ERROR = 13;             // Error notification
+  HELPER_MESSAGE_TYPE_READY = 14;             // Helper initialized
+}
+
+message HelperMessage {
+  HelperMessageType type = 1;
+
+  oneof payload {
+    ClipboardData clipboard_data = 2;            // For SET_CLIPBOARD, CLIPBOARD_CHANGED, CLIPBOARD_CONTENT
+    ClipboardAnnouncement announcement = 3;      // For ANNOUNCE_DELAYED
+    HelperProvideData provide_data = 4;           // For PROVIDE_DATA
+    ClipboardDataRequest data_request = 5;        // For DATA_REQUEST
+    string error_message = 6;                     // For ERROR
+  }
+
+  uint64 timestamp = 7;
+}
+
+message HelperProvideData {
+  string content_hash = 1;
+  bytes data = 2;
+}
