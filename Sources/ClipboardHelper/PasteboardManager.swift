@@ -299,7 +299,7 @@ final class PasteboardManager: NSObject {
                 var meta = Leviathan_FileMetadata()
                 meta.fileID = "\(i)"
                 meta.filename = url.lastPathComponent
-                meta.relativePath = url.lastPathComponent
+                meta.relativePath = url.path
                 if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path) {
                     meta.fileSize = (attrs[.size] as? UInt64) ?? 0
                 }
