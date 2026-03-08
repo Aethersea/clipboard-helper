@@ -160,34 +160,18 @@ final class PasteboardManager: NSObject {
             return
         }
 
-        // Register with coordinator so we can map chunks back to this transfer
-        fileTransferCoordinator?.registerAnnouncement(announcement)
+        // Store announcement so pasteboard:provideDataForType: can reference it
+        pendingAnnouncement = announcement
+        lastSetHash = announcement.contentHash
+        renderedData = nil
 
-        let transferID = announcement.transferID.isEmpty
-            ? announcement.contentHash  // fall back to content hash as stable ID
-            : announcement.transferID
-
-        // Write one NSFilePromiseProvider per file.
-        // When the user drops/pastes into Finder, macOS calls
-        // filePromiseProvider(_:writePromiseTo:completionHandler:) and shows a
-        // native progress dialog automatically via NSProgress.
-        let providers: [NSFilePromiseProvider] = announcement.files.map { file in
-            let fileType = utiForFile(filename: file.filename, mimeType: file.mimeType)
-            let provider = NSFilePromiseProvider(fileType: fileType, delegate: self)
-            provider.userInfo = [
-                "transferID": transferID,
-                "fileID": file.fileID,
-                "filename": file.filename,
-                "fileSize": file.fileSize,
-            ] as [String: Any]
-            return provider
-        }
-
-        pasteboard.clearContents()
-        pasteboard.writeObjects(providers as [NSPasteboardWriting])
+        // Use declareTypes:owner: with NSFilenamesPboardType.
+        // When the user pastes (Cmd+V), macOS calls pasteboard:provideDataForType:
+        // and we request the actual files from the parent process on demand.
+        pasteboard.declareTypes([NSPasteboard.PasteboardType("NSFilenamesPboardType")], owner: self)
         lastChangeCount = pasteboard.changeCount
 
-        Log.info("Announced delayed files: \(announcement.files.count) file(s) transferID=\(transferID)")
+        Log.info("Announced delayed files: \(announcement.files.count) file(s) hash=\(announcement.contentHash)")
     }
 
     // MARK: - Provide Data (response from parent)
@@ -228,16 +212,32 @@ final class PasteboardManager: NSObject {
         request.contentType = announcement.contentType
         onDataRequest?(request)
 
-        // Block waiting for PROVIDE_DATA response (timeout 30s)
-        let result = renderSemaphore.wait(timeout: .now() + 30)
+        // Block waiting for PROVIDE_DATA response
+        // Files need a longer timeout (5 min) since they trigger a remote download
+        let timeout: TimeInterval = announcement.contentType == .files ? 300 : 30
+        let result = renderSemaphore.wait(timeout: .now() + timeout)
 
         if result == .timedOut {
-            Log.error("Timed out waiting for data from parent")
+            Log.error("Timed out waiting for data from parent (type=\(announcement.contentType))")
             return
         }
 
         guard let data = renderedData else {
             Log.error("No data received after signal")
+            return
+        }
+
+        if announcement.contentType == .files {
+            // Data contains newline-separated file paths from the parent
+            if let pathsString = String(data: data, encoding: .utf8) {
+                let paths = pathsString.components(separatedBy: "\n").filter { !$0.isEmpty }
+                if !paths.isEmpty {
+                    pasteboard.setPropertyList(paths, forType: type)
+                    Log.info("Provided \(paths.count) file path(s) for paste")
+                } else {
+                    Log.error("No file paths in PROVIDE_DATA response")
+                }
+            }
             return
         }
 
