@@ -189,9 +189,7 @@ final class SocketServer {
 
             do {
                 let message = try Leviathan_HelperMessage(serializedBytes: messageData)
-                DispatchQueue.main.async { [weak self] in
-                    self?.onMessage?(message)
-                }
+                self.onMessage?(message)
             } catch {
                 Log.error("Failed to parse message: \(error)")
             }

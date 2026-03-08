@@ -129,32 +129,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Message Handling
 
+    /// Called on the **socket I/O queue** (not main thread).
+    /// Operations that touch AppKit / NSPasteboard are dispatched to main.
+    /// `provideData` deliberately stays on the socket queue so it can
+    /// signal the render semaphore even when the main thread is blocked
+    /// inside an NSPasteboardItemDataProvider callback.
     private func handleMessage(_ message: Leviathan_HelperMessage) {
         Log.debug("Received: \(message.type)")
 
         switch message.type {
         case .setClipboard:
             if case .clipboardData(let data) = message.payload {
-                pasteboardManager.setClipboard(data)
+                DispatchQueue.main.async { [weak self] in
+                    self?.pasteboardManager.setClipboard(data)
+                }
             }
 
         case .announceDelayed:
             if case .announcement(let ann) = message.payload {
-                pasteboardManager.announceDelayed(ann)
+                DispatchQueue.main.async { [weak self] in
+                    self?.pasteboardManager.announceDelayed(ann)
+                }
             }
 
         case .provideData:
+            // MUST NOT dispatch to main — the main thread may be blocked
+            // on renderSemaphore inside a data-provider / owner callback.
+            // provideData() only sets renderedData and signals the semaphore,
+            // which is safe from any thread.
             if case .provideData(let pd) = message.payload {
                 pasteboardManager.provideData(pd)
             }
 
         case .getClipboard:
-            let content = pasteboardManager.getCurrentClipboard()
-            var response = Leviathan_HelperMessage()
-            response.type = .clipboardContent
-            response.payload = .clipboardData(content)
-            response.timestamp = currentTimestamp()
-            socketServer.send(response)
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                let content = self.pasteboardManager.getCurrentClipboard()
+                var response = Leviathan_HelperMessage()
+                response.type = .clipboardContent
+                response.payload = .clipboardData(content)
+                response.timestamp = self.currentTimestamp()
+                self.socketServer.send(response)
+            }
 
         case .shutdown:
             Log.info("Shutdown requested")
@@ -163,21 +179,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             exit(0)
 
         case .fileChunkRequest:
-            // Parent (Go server) is requesting a local file chunk to serve a remote client
             if case .fileChunkRequest(let req) = message.payload {
                 handleIncomingFileChunkRequest(req)
             }
 
         case .fileChunkData:
-            // Parent (shen/Rust) is delivering a file chunk we previously requested
             if case .fileChunkData(let chunk) = message.payload {
                 fileTransferCoordinator.handleChunkData(chunk)
             }
 
         case .fileTransferProgress:
-            // Parent (Go server) is reporting file download progress
             if case .fileTransferProgress(let progress) = message.payload {
-                handleFileTransferProgress(progress)
+                DispatchQueue.main.async { [weak self] in
+                    self?.handleFileTransferProgress(progress)
+                }
             }
 
         default:
