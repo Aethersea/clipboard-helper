@@ -84,16 +84,25 @@ final class PasteboardManager: NSObject {
             }
 
         case .files:
-            // Write file URLs if file metadata is provided
+            // Write file URLs from paths provided in file metadata
             var urls: [NSURL] = []
             for file in data.files {
-                if !file.filename.isEmpty {
-                    // File URLs would be resolved by the parent process
-                    Log.info("Set clipboard: file \(file.filename)")
+                // The path may come via filename (full path from server) or relativePath
+                let path = !file.relativePath.isEmpty ? file.relativePath : file.filename
+                guard !path.isEmpty else { continue }
+                let url = NSURL(fileURLWithPath: path)
+                if FileManager.default.fileExists(atPath: path) {
+                    urls.append(url)
+                    Log.info("Set clipboard: file \(path)")
+                } else {
+                    Log.warning("Set clipboard: file not found at \(path)")
                 }
             }
             if !urls.isEmpty {
                 pasteboard.writeObjects(urls)
+                Log.info("Set clipboard: \(urls.count) file(s)")
+            } else {
+                Log.warning("Set clipboard: no valid file URLs to write")
             }
 
         default:

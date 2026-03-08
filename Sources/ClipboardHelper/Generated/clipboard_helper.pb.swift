@@ -34,6 +34,9 @@ public enum Leviathan_HelperMessageType: SwiftProtobuf.Enum, Swift.CaseIterable 
     case fileChunkRequest // = 15
     case fileChunkData // = 16
 
+    // Parent → Helper — progress reporting for file downloads
+    case fileTransferProgress // = 17
+
     case UNRECOGNIZED(Int)
 
     public init() {
@@ -55,6 +58,7 @@ public enum Leviathan_HelperMessageType: SwiftProtobuf.Enum, Swift.CaseIterable 
         case 14: self = .ready
         case 15: self = .fileChunkRequest
         case 16: self = .fileChunkData
+        case 17: self = .fileTransferProgress
         default: self = .UNRECOGNIZED(rawValue)
         }
     }
@@ -74,6 +78,7 @@ public enum Leviathan_HelperMessageType: SwiftProtobuf.Enum, Swift.CaseIterable 
         case .ready: return 14
         case .fileChunkRequest: return 15
         case .fileChunkData: return 16
+        case .fileTransferProgress: return 17
         case .UNRECOGNIZED(let i): return i
         }
     }
@@ -82,6 +87,7 @@ public enum Leviathan_HelperMessageType: SwiftProtobuf.Enum, Swift.CaseIterable 
         .unspecified, .setClipboard, .announceDelayed, .provideData,
         .getClipboard, .shutdown, .clipboardChanged, .dataRequest,
         .clipboardContent, .error, .ready, .fileChunkRequest, .fileChunkData,
+        .fileTransferProgress,
     ]
 }
 
@@ -100,6 +106,7 @@ extension Leviathan_HelperMessageType: SwiftProtobuf._ProtoNameProviding {
         14: .same(proto: "HELPER_MESSAGE_TYPE_READY"),
         15: .same(proto: "HELPER_MESSAGE_TYPE_FILE_CHUNK_REQUEST"),
         16: .same(proto: "HELPER_MESSAGE_TYPE_FILE_CHUNK_DATA"),
+        17: .same(proto: "HELPER_MESSAGE_TYPE_FILE_TRANSFER_PROGRESS"),
     ]
 }
 
@@ -119,6 +126,7 @@ public struct Leviathan_HelperMessage: Sendable {
         case errorMessage(String)
         case fileChunkRequest(Leviathan_HelperFileChunkRequest)
         case fileChunkData(Leviathan_HelperFileChunkData)
+        case fileTransferProgress(Leviathan_HelperFileTransferProgress)
     }
 
     public init() {}
@@ -164,6 +172,25 @@ public struct Leviathan_HelperFileChunkData: Sendable {
     public init() {}
 }
 
+// MARK: - HelperFileTransferProgress
+
+public struct Leviathan_HelperFileTransferProgress: Sendable {
+    public var transferID: String = String()
+    /// Cumulative bytes received across all files
+    public var bytesTransferred: UInt64 = 0
+    /// Total expected bytes across all files
+    public var totalBytes: UInt64 = 0
+    /// True when the entire transfer has finished
+    public var isComplete: Bool = false
+    /// Only meaningful when is_complete = true
+    public var success: Bool = false
+    /// Only meaningful when is_complete = true and success = false
+    public var errorMessage: String = String()
+    public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+    public init() {}
+}
+
 // MARK: - Protobuf Conformances
 
 extension Leviathan_HelperMessage: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
@@ -178,6 +205,7 @@ extension Leviathan_HelperMessage: SwiftProtobuf.Message, SwiftProtobuf._Message
         7: .same(proto: "timestamp"),
         8: .standard(proto: "file_chunk_request"),
         9: .standard(proto: "file_chunk_data"),
+        10: .standard(proto: "file_transfer_progress"),
     ]
 
     public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
@@ -264,6 +292,18 @@ extension Leviathan_HelperMessage: SwiftProtobuf.Message, SwiftProtobuf._Message
                     if hadOneofValue { try decoder.handleConflictingOneOf() }
                     self.payload = .fileChunkData(v)
                 }
+            case 10:
+                var v: Leviathan_HelperFileTransferProgress?
+                var hadOneofValue = false
+                if let current = self.payload {
+                    hadOneofValue = true
+                    if case .fileTransferProgress(let m) = current { v = m }
+                }
+                try decoder.decodeSingularMessageField(value: &v)
+                if let v = v {
+                    if hadOneofValue { try decoder.handleConflictingOneOf() }
+                    self.payload = .fileTransferProgress(v)
+                }
             default: break
             }
         }
@@ -288,6 +328,8 @@ extension Leviathan_HelperMessage: SwiftProtobuf.Message, SwiftProtobuf._Message
             try visitor.visitSingularMessageField(value: v, fieldNumber: 8)
         case .fileChunkData(let v)?:
             try visitor.visitSingularMessageField(value: v, fieldNumber: 9)
+        case .fileTransferProgress(let v)?:
+            try visitor.visitSingularMessageField(value: v, fieldNumber: 10)
         case nil:
             break
         }
@@ -442,6 +484,65 @@ extension Leviathan_HelperFileChunkData: SwiftProtobuf.Message, SwiftProtobuf._M
         if lhs.data != rhs.data { return false }
         if lhs.isLast != rhs.isLast { return false }
         if lhs.error != rhs.error { return false }
+        if lhs.unknownFields != rhs.unknownFields { return false }
+        return true
+    }
+}
+
+extension Leviathan_HelperFileTransferProgress: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+    public static let protoMessageName: String = "leviathan.HelperFileTransferProgress"
+    public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
+        1: .standard(proto: "transfer_id"),
+        2: .standard(proto: "bytes_transferred"),
+        3: .standard(proto: "total_bytes"),
+        4: .standard(proto: "is_complete"),
+        5: .same(proto: "success"),
+        6: .standard(proto: "error_message"),
+    ]
+
+    public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+        while let fieldNumber = try decoder.nextFieldNumber() {
+            switch fieldNumber {
+            case 1: try decoder.decodeSingularStringField(value: &self.transferID)
+            case 2: try decoder.decodeSingularUInt64Field(value: &self.bytesTransferred)
+            case 3: try decoder.decodeSingularUInt64Field(value: &self.totalBytes)
+            case 4: try decoder.decodeSingularBoolField(value: &self.isComplete)
+            case 5: try decoder.decodeSingularBoolField(value: &self.success)
+            case 6: try decoder.decodeSingularStringField(value: &self.errorMessage)
+            default: break
+            }
+        }
+    }
+
+    public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+        if !self.transferID.isEmpty {
+            try visitor.visitSingularStringField(value: self.transferID, fieldNumber: 1)
+        }
+        if self.bytesTransferred != 0 {
+            try visitor.visitSingularUInt64Field(value: self.bytesTransferred, fieldNumber: 2)
+        }
+        if self.totalBytes != 0 {
+            try visitor.visitSingularUInt64Field(value: self.totalBytes, fieldNumber: 3)
+        }
+        if self.isComplete != false {
+            try visitor.visitSingularBoolField(value: self.isComplete, fieldNumber: 4)
+        }
+        if self.success != false {
+            try visitor.visitSingularBoolField(value: self.success, fieldNumber: 5)
+        }
+        if !self.errorMessage.isEmpty {
+            try visitor.visitSingularStringField(value: self.errorMessage, fieldNumber: 6)
+        }
+        try unknownFields.traverse(visitor: &visitor)
+    }
+
+    public static func ==(lhs: Leviathan_HelperFileTransferProgress, rhs: Leviathan_HelperFileTransferProgress) -> Bool {
+        if lhs.transferID != rhs.transferID { return false }
+        if lhs.bytesTransferred != rhs.bytesTransferred { return false }
+        if lhs.totalBytes != rhs.totalBytes { return false }
+        if lhs.isComplete != rhs.isComplete { return false }
+        if lhs.success != rhs.success { return false }
+        if lhs.errorMessage != rhs.errorMessage { return false }
         if lhs.unknownFields != rhs.unknownFields { return false }
         return true
     }

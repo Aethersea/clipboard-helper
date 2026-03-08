@@ -51,6 +51,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var socketServer: SocketServer!
     private var pasteboardManager: PasteboardManager!
     private var fileTransferCoordinator: FileTransferCoordinator!
+    private var progressPanel: TransferProgressPanel?
 
     init(socketPath: String, mode: HelperMode) {
         self.socketPath = socketPath
@@ -173,12 +174,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 fileTransferCoordinator.handleChunkData(chunk)
             }
 
+        case .fileTransferProgress:
+            // Parent (Go server) is reporting file download progress
+            if case .fileTransferProgress(let progress) = message.payload {
+                handleFileTransferProgress(progress)
+            }
+
         default:
             Log.warning("Unhandled message type: \(message.type)")
         }
     }
 
     // MARK: - File chunk request (server mode — read local file)
+
+    /// Handle file transfer progress from the Go parent process.
+    /// Shows or updates a floating progress panel during file downloads.
+    private func handleFileTransferProgress(_ progress: Leviathan_HelperFileTransferProgress) {
+        if progress.isComplete {
+            Log.info("[FileTransfer] Transfer \(progress.transferID) complete: success=\(progress.success)")
+            progressPanel?.completeTransfer(success: progress.success, errorMessage: progress.errorMessage)
+            // Auto-dismiss after a short delay
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                self?.progressPanel?.close()
+                self?.progressPanel = nil
+            }
+        } else {
+            // Show or update progress
+            if progressPanel == nil {
+                progressPanel = TransferProgressPanel()
+                progressPanel?.showPanel()
+            }
+            progressPanel?.updateProgress(
+                bytesTransferred: progress.bytesTransferred,
+                totalBytes: progress.totalBytes
+            )
+        }
+    }
 
     /// Called when the Go parent needs a chunk of a locally-copied file
     /// (to serve a remote WebRTC client that is pasting from clipboard).

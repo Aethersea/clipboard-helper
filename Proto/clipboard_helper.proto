@@ -27,6 +27,9 @@ enum HelperMessageType {
   // Bidirectional — either side can request/supply file chunks
   HELPER_MESSAGE_TYPE_FILE_CHUNK_REQUEST = 15; // Requester: need chunk at offset
   HELPER_MESSAGE_TYPE_FILE_CHUNK_DATA = 16;    // Supplier: here is the chunk
+
+  // Parent → Helper — progress reporting for file downloads
+  HELPER_MESSAGE_TYPE_FILE_TRANSFER_PROGRESS = 17;
 }
 
 message HelperMessage {
@@ -40,6 +43,7 @@ message HelperMessage {
     string error_message = 6;                     // For ERROR
     HelperFileChunkRequest file_chunk_request = 8; // For FILE_CHUNK_REQUEST
     HelperFileChunkData file_chunk_data = 9;       // For FILE_CHUNK_DATA
+    HelperFileTransferProgress file_transfer_progress = 10; // For FILE_TRANSFER_PROGRESS
   }
 
   uint64 timestamp = 7;
@@ -66,4 +70,15 @@ message HelperFileChunkData {
   bytes data = 4;
   bool is_last = 5;   // true if this is the final chunk
   string error = 6;   // non-empty on error
+}
+
+// File transfer progress — sent from parent to helper so the helper can
+// display a system-level progress indicator (e.g. floating panel on macOS).
+message HelperFileTransferProgress {
+  string transfer_id = 1;
+  uint64 bytes_transferred = 2;  // Cumulative bytes received across all files
+  uint64 total_bytes = 3;        // Total expected bytes across all files
+  bool is_complete = 4;          // True when the entire transfer has finished
+  bool success = 5;              // Only meaningful when is_complete = true
+  string error_message = 6;      // Only meaningful when is_complete = true and success = false
 }
