@@ -263,7 +263,32 @@ final class PasteboardManager: NSObject {
     private func readPasteboard() -> Leviathan_ClipboardData {
         var data = Leviathan_ClipboardData()
 
-        // Try text first
+        // Try file URLs first — files on clipboard also have text/image representations,
+        // so this must be checked before text to avoid misclassifying file copies as text.
+        if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [
+            .urlReadingFileURLsOnly: true
+        ]) as? [URL], !urls.isEmpty {
+            data.contentType = .files
+            localFileURLs = [:]  // reset and repopulate
+            for (i, url) in urls.enumerated() {
+                var meta = Leviathan_FileMetadata()
+                meta.fileID = "\(i)"
+                meta.filename = url.lastPathComponent
+                meta.relativePath = url.path
+                if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path) {
+                    meta.fileSize = (attrs[.size] as? UInt64) ?? 0
+                }
+                meta.isDirectory = url.hasDirectoryPath
+                data.files.append(meta)
+                localFileURLs[meta.fileID] = url  // store for FILE_CHUNK_REQUEST serving
+            }
+            // Hash based on file paths
+            let pathString = urls.map { $0.path }.joined(separator: "\n")
+            data.contentHash = sha256Hex(Data(pathString.utf8))
+            return data
+        }
+
+        // Try text
         if let text = pasteboard.string(forType: .string), !text.isEmpty {
             data.contentType = .text
             data.payload = Data(text.utf8)
@@ -286,30 +311,6 @@ final class PasteboardManager: NSObject {
             data.contentType = .image
             data.payload = pngData
             data.contentHash = sha256Hex(pngData)
-            return data
-        }
-
-        // Try file URLs
-        if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [
-            .urlReadingFileURLsOnly: true
-        ]) as? [URL], !urls.isEmpty {
-            data.contentType = .files
-            localFileURLs = [:]  // reset and repopulate
-            for (i, url) in urls.enumerated() {
-                var meta = Leviathan_FileMetadata()
-                meta.fileID = "\(i)"
-                meta.filename = url.lastPathComponent
-                meta.relativePath = url.path
-                if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path) {
-                    meta.fileSize = (attrs[.size] as? UInt64) ?? 0
-                }
-                meta.isDirectory = url.hasDirectoryPath
-                data.files.append(meta)
-                localFileURLs[meta.fileID] = url  // store for FILE_CHUNK_REQUEST serving
-            }
-            // Hash based on file paths
-            let pathString = urls.map { $0.path }.joined(separator: "\n")
-            data.contentHash = sha256Hex(Data(pathString.utf8))
             return data
         }
 
