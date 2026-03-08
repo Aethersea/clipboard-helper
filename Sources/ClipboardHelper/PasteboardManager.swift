@@ -1,5 +1,4 @@
 import AppKit
-import CoreServices
 import Foundation
 import CommonCrypto
 
@@ -27,6 +26,11 @@ final class PasteboardManager: NSObject {
     // Callbacks
     var onClipboardChanged: ((Leviathan_ClipboardData) -> Void)?
     var onDataRequest: ((Leviathan_ClipboardDataRequest) -> Void)?
+
+    // File download coordination (for NSPasteboardItemDataProvider)
+    private var fileDownloadPaths: [String]?
+    private var fileDownloadTriggered = false
+    private let fileDownloadCondition = NSCondition()
 
     init(pollInterval: TimeInterval = 0.5) {
         self.pollInterval = pollInterval
@@ -129,7 +133,7 @@ final class PasteboardManager: NSObject {
         case .image:
             types = [.png, .tiff]
         case .files:
-            // Files use NSFilePromiseProvider — handled separately below
+            // Files use NSPasteboardItemDataProvider — handled separately below
             break
         default:
             break
@@ -160,15 +164,35 @@ final class PasteboardManager: NSObject {
             return
         }
 
-        // Store announcement so pasteboard:provideDataForType: can reference it
+        // Store announcement so the data provider callback can reference it
         pendingAnnouncement = announcement
         lastSetHash = announcement.contentHash
         renderedData = nil
 
-        // Use declareTypes:owner: with NSFilenamesPboardType.
-        // When the user pastes (Cmd+V), macOS calls pasteboard:provideDataForType:
-        // and we request the actual files from the parent process on demand.
-        pasteboard.declareTypes([NSPasteboard.PasteboardType("NSFilenamesPboardType")], owner: self)
+        // Reset file download state
+        fileDownloadCondition.lock()
+        fileDownloadPaths = nil
+        fileDownloadTriggered = false
+        fileDownloadCondition.unlock()
+
+        // Drain any stale semaphore signals from previous operations
+        while renderSemaphore.wait(timeout: .now()) == .success {}
+
+        // Create one NSPasteboardItem per file with lazy data provider for .fileURL.
+        // When the user pastes (Cmd+V), macOS calls the NSPasteboardItemDataProvider
+        // callback which triggers the on-demand download from the remote peer.
+        var items: [NSPasteboardItem] = []
+        for (i, _) in announcement.files.enumerated() {
+            let item = NSPasteboardItem()
+            // Store file index as immediate data on a custom type
+            item.setString("\(i)", forType: .init("com.leviathan.clipboard.file-index"))
+            // Register lazy data provider for file URL
+            item.setDataProvider(self, forTypes: [.fileURL])
+            items.append(item)
+        }
+
+        pasteboard.clearContents()
+        pasteboard.writeObjects(items)
         lastChangeCount = pasteboard.changeCount
 
         Log.info("Announced delayed files: \(announcement.files.count) file(s) hash=\(announcement.contentHash)")
@@ -212,10 +236,8 @@ final class PasteboardManager: NSObject {
         request.contentType = announcement.contentType
         onDataRequest?(request)
 
-        // Block waiting for PROVIDE_DATA response
-        // Files need a longer timeout (5 min) since they trigger a remote download
-        let timeout: TimeInterval = announcement.contentType == .files ? 300 : 30
-        let result = renderSemaphore.wait(timeout: .now() + timeout)
+        // Block waiting for PROVIDE_DATA response (timeout 30s)
+        let result = renderSemaphore.wait(timeout: .now() + 30)
 
         if result == .timedOut {
             Log.error("Timed out waiting for data from parent (type=\(announcement.contentType))")
@@ -224,20 +246,6 @@ final class PasteboardManager: NSObject {
 
         guard let data = renderedData else {
             Log.error("No data received after signal")
-            return
-        }
-
-        if announcement.contentType == .files {
-            // Data contains newline-separated file paths from the parent
-            if let pathsString = String(data: data, encoding: .utf8) {
-                let paths = pathsString.components(separatedBy: "\n").filter { !$0.isEmpty }
-                if !paths.isEmpty {
-                    pasteboard.setPropertyList(paths, forType: type)
-                    Log.info("Provided \(paths.count) file path(s) for paste")
-                } else {
-                    Log.error("No file paths in PROVIDE_DATA response")
-                }
-            }
             return
         }
 
@@ -366,112 +374,95 @@ private extension NSImage {
     }
 }
 
-// MARK: - NSFilePromiseProviderDelegate
+// MARK: - NSPasteboardItemDataProvider (deferred file rendering)
 
-extension PasteboardManager: NSFilePromiseProviderDelegate {
+extension PasteboardManager: NSPasteboardItemDataProvider {
 
-    /// Called by macOS to get the filename for the promised item.
-    func filePromiseProvider(
-        _ filePromiseProvider: NSFilePromiseProvider,
-        fileNameForType fileType: String
-    ) -> String {
-        guard let info = filePromiseProvider.userInfo as? [String: Any],
-              let filename = info["filename"] as? String, !filename.isEmpty
-        else { return "file" }
-        return filename
-    }
-
-    /// Called when the user actually drops/pastes a promised file:
-    /// macOS provides a destination URL and we must write the file there.
-    /// NSProgress tracking happens automatically — Finder shows a progress dialog.
-    func filePromiseProvider(
-        _ filePromiseProvider: NSFilePromiseProvider,
-        writePromiseTo url: URL,
-        completionHandler: @escaping (Error?) -> Void
-    ) {
-        guard let info = filePromiseProvider.userInfo as? [String: Any],
-              let transferID = info["transferID"] as? String,
-              let fileID = info["fileID"] as? String,
-              let fileSize = (info["fileSize"] as? NSNumber)?.uint64Value ?? (info["fileSize"] as? UInt64),
-              let coordinator = fileTransferCoordinator
-        else {
-            completionHandler(NSError(
-                domain: "FileTransfer", code: -1,
-                userInfo: [NSLocalizedDescriptionKey: "Missing transfer metadata"]))
+    /// Called by macOS when the user pastes and the file URL data is needed.
+    /// Triggers on-demand download from the remote peer, waits for completion,
+    /// then provides the local file URL.
+    func pasteboard(_ pasteboard: NSPasteboard?, item: NSPasteboardItem, provideDataForType type: NSPasteboard.PasteboardType) {
+        guard type == .fileURL else { return }
+        guard let announcement = pendingAnnouncement,
+              announcement.contentType == .files else {
+            Log.warning("File data provider called but no pending file announcement")
             return
         }
 
-        let filename = (info["filename"] as? String) ?? url.lastPathComponent
-        Log.info("[FileTransfer] Promise write requested: \(filename) → \(url.path)")
+        guard let indexStr = item.string(forType: .init("com.leviathan.clipboard.file-index")),
+              let index = Int(indexStr) else {
+            Log.error("File data provider: couldn't determine file index")
+            return
+        }
 
-        // Create a progress node; Finder sums all sibling nodes into the copy dialog.
-        let fileProgress = Progress(totalUnitCount: Int64(max(fileSize, 1)))
+        Log.info("File data provider: requested file at index \(index)")
 
-        coordinator.startFileDownload(
-            transferID: transferID,
-            fileID: fileID,
-            fileSize: fileSize,
-            to: url,
-            parentProgress: fileProgress,
-            completion: completionHandler
-        )
+        guard let paths = ensureFilesDownloaded(announcement: announcement),
+              index < paths.count else {
+            Log.error("File data provider: no path for index \(index)")
+            return
+        }
+
+        let url = URL(fileURLWithPath: paths[index])
+        item.setString(url.absoluteString, forType: .fileURL)
+        Log.info("Provided file URL: \(paths[index])")
     }
 
-    /// Use a dedicated operation queue for promise writes so we don't block the main thread.
-    func operationQueue(for filePromiseProvider: NSFilePromiseProvider) -> OperationQueue {
-        let q = OperationQueue()
-        q.qualityOfService = .userInitiated
-        q.maxConcurrentOperationCount = 4
-        return q
+    func pasteboardFinishedWithDataProvider(_ pasteboard: NSPasteboard) {
+        Log.info("Pasteboard finished with file data provider")
+    }
+
+    /// Coordinates the one-time file download across potentially multiple
+    /// concurrent data-provider callbacks (one per file).  The first caller
+    /// triggers the download; subsequent callers block until it completes.
+    private func ensureFilesDownloaded(announcement: Leviathan_ClipboardAnnouncement) -> [String]? {
+        fileDownloadCondition.lock()
+
+        // Already completed — return cached paths
+        if let paths = fileDownloadPaths {
+            fileDownloadCondition.unlock()
+            return paths
+        }
+
+        // First caller triggers the download
+        if !fileDownloadTriggered {
+            fileDownloadTriggered = true
+            fileDownloadCondition.unlock()
+
+            // Send DATA_REQUEST to parent process
+            var request = Leviathan_ClipboardDataRequest()
+            request.contentHash = announcement.contentHash
+            request.contentType = .files
+            onDataRequest?(request)
+
+            // Wait for PROVIDE_DATA (signaled by provideData() on IPC thread)
+            let result = renderSemaphore.wait(timeout: .now() + 300)
+
+            fileDownloadCondition.lock()
+            if result == .success, let data = renderedData,
+               let str = String(data: data, encoding: .utf8) {
+                fileDownloadPaths = str.components(separatedBy: "\n").filter { !$0.isEmpty }
+                Log.info("File download complete: \(fileDownloadPaths?.count ?? 0) file(s)")
+            } else {
+                Log.error("File download failed or timed out")
+            }
+            fileDownloadCondition.broadcast()
+            let paths = fileDownloadPaths
+            fileDownloadCondition.unlock()
+            return paths
+        }
+
+        // Another thread already started the download — wait for it
+        while fileDownloadPaths == nil {
+            if !fileDownloadCondition.wait(until: Date(timeIntervalSinceNow: 300)) {
+                Log.error("Timed out waiting for file download (secondary)")
+                fileDownloadCondition.unlock()
+                return nil
+            }
+        }
+        let paths = fileDownloadPaths
+        fileDownloadCondition.unlock()
+        return paths
     }
 }
 
-// MARK: - UTI helper
-
-/// Determine a concrete UTI for a file, trying MIME type first, then filename
-/// extension, and falling back to "public.data" (a concrete type accepted by
-/// NSFilePromiseProvider — "public.item" is abstract and will crash).
-private func utiForFile(filename: String, mimeType: String) -> String {
-    // 1. Try MIME type
-    if !mimeType.isEmpty, let uti = utiFromMimeType(mimeType) {
-        return uti
-    }
-    // 2. Try filename extension
-    let ext = (filename as NSString).pathExtension.lowercased()
-    if !ext.isEmpty, let uti = utiFromExtension(ext) {
-        return uti
-    }
-    // 3. Concrete fallback
-    return "public.data"
-}
-
-/// Map a MIME type to a UTI string for NSFilePromiseProvider.
-private func utiFromMimeType(_ mime: String) -> String? {
-    switch mime {
-    case "application/pdf": return "com.adobe.pdf"
-    case "image/png": return "public.png"
-    case "image/jpeg": return "public.jpeg"
-    case "image/gif": return "com.compuserve.gif"
-    case "image/webp": return "org.webmproject.webp"
-    case "video/mp4": return "public.mpeg-4"
-    case "audio/mpeg": return "public.mp3"
-    case "text/plain": return "public.plain-text"
-    case "application/zip": return "com.pkware.zip-archive"
-    case let m where m.hasPrefix("text/"): return "public.plain-text"
-    default:
-        return nil
-    }
-}
-
-/// Derive a UTI from a file extension using CoreServices.
-private func utiFromExtension(_ ext: String) -> String? {
-    guard let utType = UTTypeCreatePreferredIdentifierForTag(
-        kUTTagClassFilenameExtension, ext as CFString, nil
-    )?.takeRetainedValue() else {
-        return nil
-    }
-    let uti = utType as String
-    // Reject dynamic UTIs ("dyn.xxx") — they are not real types
-    if uti.hasPrefix("dyn.") { return nil }
-    return uti
-}
