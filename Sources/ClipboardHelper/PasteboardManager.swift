@@ -1,4 +1,5 @@
 import AppKit
+import CoreServices
 import Foundation
 import CommonCrypto
 
@@ -171,7 +172,7 @@ final class PasteboardManager: NSObject {
         // filePromiseProvider(_:writePromiseTo:completionHandler:) and shows a
         // native progress dialog automatically via NSProgress.
         let providers: [NSFilePromiseProvider] = announcement.files.map { file in
-            let fileType = utiFromMimeType(file.mimeType) ?? "public.item"
+            let fileType = utiForFile(filename: file.filename, mimeType: file.mimeType)
             let provider = NSFilePromiseProvider(fileType: fileType, delegate: self)
             provider.userInfo = [
                 "transferID": transferID,
@@ -427,8 +428,24 @@ extension PasteboardManager: NSFilePromiseProviderDelegate {
 
 // MARK: - UTI helper
 
+/// Determine a concrete UTI for a file, trying MIME type first, then filename
+/// extension, and falling back to "public.data" (a concrete type accepted by
+/// NSFilePromiseProvider — "public.item" is abstract and will crash).
+private func utiForFile(filename: String, mimeType: String) -> String {
+    // 1. Try MIME type
+    if !mimeType.isEmpty, let uti = utiFromMimeType(mimeType) {
+        return uti
+    }
+    // 2. Try filename extension
+    let ext = (filename as NSString).pathExtension.lowercased()
+    if !ext.isEmpty, let uti = utiFromExtension(ext) {
+        return uti
+    }
+    // 3. Concrete fallback
+    return "public.data"
+}
+
 /// Map a MIME type to a UTI string for NSFilePromiseProvider.
-/// Falls back to "public.item" for unknown types.
 private func utiFromMimeType(_ mime: String) -> String? {
     switch mime {
     case "application/pdf": return "com.adobe.pdf"
@@ -442,7 +459,19 @@ private func utiFromMimeType(_ mime: String) -> String? {
     case "application/zip": return "com.pkware.zip-archive"
     case let m where m.hasPrefix("text/"): return "public.plain-text"
     default:
-        // Use UTTypeCreatePreferredIdentifierForTag if available (macOS 11+)
-        return "public.item"
+        return nil
     }
+}
+
+/// Derive a UTI from a file extension using CoreServices.
+private func utiFromExtension(_ ext: String) -> String? {
+    guard let utType = UTTypeCreatePreferredIdentifierForTag(
+        kUTTagClassFilenameExtension, ext as CFString, nil
+    )?.takeRetainedValue() else {
+        return nil
+    }
+    let uti = utType as String
+    // Reject dynamic UTIs ("dyn.xxx") — they are not real types
+    if uti.hasPrefix("dyn.") { return nil }
+    return uti
 }
