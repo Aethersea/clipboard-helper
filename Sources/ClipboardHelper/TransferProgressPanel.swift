@@ -38,8 +38,8 @@ final class TransferProgressPanel {
 
         let contentView = NSView(frame: NSRect(x: 0, y: 0, width: panelWidth, height: panelHeight))
 
-        // Status label: "Receiving files…"
-        let status = NSTextField(labelWithString: "Receiving files…")
+        // Status label: "Transferring files…"
+        let status = NSTextField(labelWithString: "Transferring files…")
         status.font = NSFont.systemFont(ofSize: 13, weight: .medium)
         status.frame = NSRect(x: 16, y: 52, width: panelWidth - 32, height: 20)
         contentView.addSubview(status)

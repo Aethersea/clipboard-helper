@@ -415,6 +415,13 @@ extension PasteboardManager: NSPasteboardItemDataProvider {
     /// Coordinates the one-time file download across potentially multiple
     /// concurrent data-provider callbacks (one per file).  The first caller
     /// triggers the download; subsequent callers block until it completes.
+    ///
+    /// IMPORTANT: The NSPasteboardItemDataProvider callback runs on the main
+    /// thread.  A plain semaphore wait would block the main run loop, which
+    /// prevents DispatchQueue.main.async blocks (e.g. FileTransferProgress
+    /// updates that drive the progress panel) from executing.  Instead we
+    /// spin the run loop in small increments so that dispatched UI work —
+    /// including the progress panel — can still be processed.
     private func ensureFilesDownloaded(announcement: Leviathan_ClipboardAnnouncement) -> [String]? {
         fileDownloadCondition.lock()
 
@@ -435,11 +442,24 @@ extension PasteboardManager: NSPasteboardItemDataProvider {
             request.contentType = .files
             onDataRequest?(request)
 
-            // Wait for PROVIDE_DATA (signaled by provideData() on IPC thread)
-            let result = renderSemaphore.wait(timeout: .now() + 300)
+            // Wait for PROVIDE_DATA while keeping the main run loop alive.
+            // This allows FileTransferProgress messages (dispatched to main
+            // queue by handleMessage) to be processed, so the progress panel
+            // can appear and update during the download.
+            let deadline = Date(timeIntervalSinceNow: 300)
+            var completed = false
+            while !completed && Date() < deadline {
+                if renderSemaphore.wait(timeout: .now()) == .success {
+                    completed = true
+                } else if Thread.isMainThread {
+                    RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.05))
+                } else {
+                    Thread.sleep(forTimeInterval: 0.05)
+                }
+            }
 
             fileDownloadCondition.lock()
-            if result == .success, let data = renderedData,
+            if completed, let data = renderedData,
                let str = String(data: data, encoding: .utf8) {
                 fileDownloadPaths = str.components(separatedBy: "\n").filter { !$0.isEmpty }
                 Log.info("File download complete: \(fileDownloadPaths?.count ?? 0) file(s)")
@@ -452,17 +472,27 @@ extension PasteboardManager: NSPasteboardItemDataProvider {
             return paths
         }
 
-        // Another thread already started the download — wait for it
-        while fileDownloadPaths == nil {
-            if !fileDownloadCondition.wait(until: Date(timeIntervalSinceNow: 300)) {
-                Log.error("Timed out waiting for file download (secondary)")
-                fileDownloadCondition.unlock()
-                return nil
+        // Another caller while download is in-flight.
+        // Poll with run-loop spin to avoid deadlocking when called
+        // re-entrantly on the main thread (macOS may fire another
+        // data-provider callback while we spin the loop above).
+        fileDownloadCondition.unlock()
+        let deadline = Date(timeIntervalSinceNow: 300)
+        while Date() < deadline {
+            fileDownloadCondition.lock()
+            let paths = fileDownloadPaths
+            fileDownloadCondition.unlock()
+            if let paths = paths {
+                return paths
+            }
+            if Thread.isMainThread {
+                RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.05))
+            } else {
+                Thread.sleep(forTimeInterval: 0.05)
             }
         }
-        let paths = fileDownloadPaths
-        fileDownloadCondition.unlock()
-        return paths
+        Log.error("Timed out waiting for file download (secondary)")
+        return nil
     }
 }
 
