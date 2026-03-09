@@ -50,3 +50,25 @@ jobs:
         with:
           files: clipboard-helper
           generate_release_notes: true
+
+  release-latest:
+    needs: build
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: clipboard-helper-macos-universal
+
+      - name: Update latest release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest Build
+          body: "Automated build from the latest commit on `master`."
+          files: clipboard-helper
+          prerelease: true
+          make_latest: false
