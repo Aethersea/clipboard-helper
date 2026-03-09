@@ -17,7 +17,7 @@ jobs:
       - name: Set up Swift
         uses: fwal/setup-swift@v1
         with:
-          swift-version: '5.8'
+          swift-version: '5.9'
 
       - name: Build universal binary (arm64 + x86_64)
         run: make build-universal
