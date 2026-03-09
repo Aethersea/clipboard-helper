@@ -14,6 +14,10 @@ jobs:
     runs-on: macos-14  # Apple Silicon runner (arm64)
     steps:
       - uses: actions/checkout@v4
+      - name: Set up Swift
+        uses: fwal/setup-swift@v1
+        with:
+          swift-version: '5.8'
 
       - name: Build universal binary (arm64 + x86_64)
         run: make build-universal
