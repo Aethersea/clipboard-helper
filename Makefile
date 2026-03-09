@@ -10,7 +10,13 @@ build-release:
 
 # Universal binary (arm64 + x86_64) for distribution
 build-universal:
-	swift build -c release --arch arm64 --arch x86_64
+	swift build -c release --arch arm64
+	swift build -c release --arch x86_64
+	mkdir -p .build/universal
+	lipo -create \
+		.build/arm64-apple-macosx/release/ClipboardHelper \
+		.build/x86_64-apple-macosx/release/ClipboardHelper \
+		-output .build/universal/ClipboardHelper
 
 # Generate Swift protobuf sources
 generate-proto:

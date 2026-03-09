@@ -24,7 +24,7 @@ jobs:
 
       - name: Rename binary
         run: |
-          cp .build/apple/Products/Release/ClipboardHelper clipboard-helper
+          cp .build/universal/ClipboardHelper clipboard-helper
           chmod +x clipboard-helper
 
       - name: Upload artifact
