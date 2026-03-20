@@ -397,15 +397,26 @@ extension PasteboardManager: NSPasteboardItemDataProvider {
 
         Log.info("File data provider: requested file at index \(index)")
 
-        guard let paths = ensureFilesDownloaded(announcement: announcement),
-              index < paths.count else {
-            Log.error("File data provider: no path for index \(index)")
+        guard let paths = ensureFilesDownloaded(announcement: announcement) else {
+            Log.error("File data provider: ensureFilesDownloaded returned nil (download failed or timed out)")
             return
         }
 
-        let url = URL(fileURLWithPath: paths[index])
+        guard index < paths.count else {
+            Log.error("File data provider: index \(index) out of range (have \(paths.count) path(s))")
+            return
+        }
+
+        let filePath = paths[index]
+        let url = URL(fileURLWithPath: filePath)
+
+        // Verify the file actually exists before handing the URL to the OS
+        if !FileManager.default.fileExists(atPath: filePath) {
+            Log.error("File data provider: file does not exist at path: \(filePath)")
+        }
+
         item.setString(url.absoluteString, forType: .fileURL)
-        Log.info("Provided file URL: \(paths[index])")
+        Log.info("Provided file URL: \(filePath)")
     }
 
     func pasteboardFinishedWithDataProvider(_ pasteboard: NSPasteboard) {
