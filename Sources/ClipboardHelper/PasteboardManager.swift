@@ -126,6 +126,12 @@ final class PasteboardManager: NSObject {
         lastSetHash = announcement.contentHash
         renderedData = nil
 
+        // Drain any stale semaphore signals from a previous announcement whose
+        // PROVIDE_DATA arrived after we timed out. Without this, the next
+        // provideDataForType returns immediately with renderedData=nil and the
+        // paste silently produces nothing.
+        while renderSemaphore.wait(timeout: .now()) == .success {}
+
         var types: [NSPasteboard.PasteboardType] = []
         switch announcement.contentType {
         case .text:
@@ -201,6 +207,18 @@ final class PasteboardManager: NSObject {
     // MARK: - Provide Data (response from parent)
 
     func provideData(_ data: Leviathan_HelperProvideData) {
+        // Drop data that doesn't match the current pending announcement.
+        // Otherwise a late response from a previous request would either
+        // wedge a stale signal in the semaphore or clobber the next paste
+        // with the wrong content.
+        if let pending = pendingAnnouncement, pending.contentHash != data.contentHash {
+            Log.warning("Discarding PROVIDE_DATA: hash=\(data.contentHash) does not match pending=\(pending.contentHash)")
+            return
+        }
+        if pendingAnnouncement == nil {
+            Log.warning("Discarding PROVIDE_DATA: no pending announcement (hash=\(data.contentHash))")
+            return
+        }
         renderedData = data.data
         renderSemaphore.signal()
         Log.info("Data provided: \(data.data.count) bytes for hash=\(data.contentHash)")
@@ -236,8 +254,10 @@ final class PasteboardManager: NSObject {
         request.contentType = announcement.contentType
         onDataRequest?(request)
 
-        // Block waiting for PROVIDE_DATA response (timeout 30s)
-        let result = renderSemaphore.wait(timeout: .now() + 30)
+        // Block waiting for PROVIDE_DATA. Matches the parent-side wait budget
+        // (120s in shen's handle_data_request_data) so we don't give up early
+        // on slow networks and let a late response wedge the semaphore.
+        let result = renderSemaphore.wait(timeout: .now() + 120)
 
         if result == .timedOut {
             Log.error("Timed out waiting for data from parent (type=\(announcement.contentType))")
@@ -256,6 +276,8 @@ final class PasteboardManager: NSObject {
         Log.info("Pasteboard ownership lost")
         pendingAnnouncement = nil
         renderedData = nil
+        // Drop any residual signal so the next announcement starts clean.
+        while renderSemaphore.wait(timeout: .now()) == .success {}
     }
 
     // MARK: - Private
