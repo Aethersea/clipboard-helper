@@ -247,8 +247,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
                 let fileSize = (try? FileManager.default.attributesOfItem(atPath: localURL.path))?[.size] as? UInt64 ?? 0
 
-                if offset >= fileSize && fileSize > 0 {
-                    // Past EOF — send empty last chunk
+                // Past EOF (or empty file at offset 0): send a terminal
+                // empty chunk so the client's pipeline can complete its
+                // accounting and tear the transfer down.  The previous
+                // `&& fileSize > 0` guard misrouted 0-byte files into
+                // the seek/read path, where `min(chunkSize, fileSize -
+                // offset)` becomes 0 and an empty read still works, but
+                // it relies on UInt64 underflow not happening (offset 0
+                // - fileSize 0 is fine, larger offsets aren't) — the
+                // explicit branch is safer.
+                if offset >= fileSize {
                     self.sendFileChunk(
                         transferID: req.transferID, fileID: req.fileID,
                         offset: offset, data: Data(), isLast: true)
@@ -256,7 +264,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
 
                 try fh.seek(toOffset: offset)
-                let toRead = min(chunkSize, Int(fileSize - offset))
+                // Order the min as `min(UInt64, UInt64)` *before*
+                // narrowing to Int so that an absurdly large `fileSize -
+                // offset` (e.g. on theoretical >Int.max files) can't
+                // trap on the Int() conversion.  In practice APFS caps
+                // at 8 EB which fits in Int.max (9 EB), but the cheaper
+                // form is also the safer one.
+                let remaining = fileSize - offset
+                let toRead = Int(min(UInt64(chunkSize), remaining))
                 let data = fh.readData(ofLength: toRead)
                 let isLast = (offset + UInt64(data.count)) >= fileSize
 

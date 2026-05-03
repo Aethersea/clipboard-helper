@@ -4,6 +4,17 @@ import Foundation
 /// Default chunk size: 256 KB — balances IPC frame size vs. round-trip overhead.
 private let kDefaultChunkSize: UInt32 = 256 * 1024
 
+/// Maximum number of FILE_CHUNK_REQUEST messages with no FILE_CHUNK_DATA
+/// reply yet — the pipeline depth that hides the per-chunk Unix-socket
+/// round trip.  4 × 256 KB = 1 MB of in-flight data per file, which
+/// tracks well with macOS pasteboard transfer rates without stressing
+/// the helper's process-wide socket frame buffer when many files are
+/// downloaded in parallel.  Strict serial (depth=1) was the previous
+/// behaviour and made any non-trivial file feel like it was throttled
+/// to RTT-bound throughput; depth=4 reaches steady-state TCP-like
+/// throughput on a Unix socket without unbounded buffering.
+private let kPipelineDepth: Int = 4
+
 // MARK: - FileTransferCoordinator
 
 /// Coordinates file downloads from the parent process using chunked IPC transfers.
@@ -12,9 +23,15 @@ private let kDefaultChunkSize: UInt32 = 256 * 1024
 ///   1. `registerAnnouncement(_:)` is called when ANNOUNCE_DELAYED arrives with files.
 ///   2. `PasteboardManager` writes `NSFilePromiseProvider` objects to the pasteboard.
 ///   3. When the user drops/pastes into Finder, `startFileDownload(...)` is called.
-///   4. We send sequential `FILE_CHUNK_REQUEST` messages to the parent process.
-///   5. The parent responds with `FILE_CHUNK_DATA` messages; we write them to disk.
+///   4. We send up to `kPipelineDepth` `FILE_CHUNK_REQUEST` messages concurrently
+///      to the parent process — pipelined to hide IPC round-trip latency.
+///   5. The parent responds with `FILE_CHUNK_DATA` messages (possibly out of
+///      order with respect to the original request order); we seek + write
+///      each one to its own offset.
 ///   6. `NSProgress` is updated each chunk — Finder shows the native progress dialog.
+///   7. The download finishes when `receivedBytes == fileSize`, NOT when an
+///      `isLast=true` chunk arrives — pipelined replies can deliver the
+///      terminal chunk before earlier ones complete.
 ///
 /// Flow (server mode — serving local files to the parent Go process):
 ///   The clipboard-helper itself owns the local file URLs (from `readPasteboard`).
@@ -91,13 +108,27 @@ final class FileTransferCoordinator {
         completion: @escaping (Error?) -> Void
     ) {
         let key = "\(transferID)/\(fileID)"
+
+        // Wrap the caller's completion so the task is removed from the
+        // downloads dict when (and ONLY when) FileDownloadTask itself
+        // decides it's done.  Removing on `chunk.isLast` is wrong under
+        // pipelining: the terminal chunk can arrive before earlier
+        // ones, and dropping the task there would discard the still-
+        // in-flight chunks and leave holes on disk.
+        let wrappedCompletion: (Error?) -> Void = { [weak self] error in
+            self?.queue.async { [weak self] in
+                self?.downloads.removeValue(forKey: key)
+            }
+            completion(error)
+        }
+
         let task = FileDownloadTask(
             transferID: transferID,
             fileID: fileID,
             fileSize: fileSize,
             destURL: destURL,
             parentProgress: parentProgress,
-            completion: completion
+            completion: wrappedCompletion
         )
 
         queue.async { [weak self] in
@@ -112,15 +143,19 @@ final class FileTransferCoordinator {
     // MARK: - Incoming chunk data
 
     /// Handle a `FILE_CHUNK_DATA` message arriving from the parent process.
+    ///
+    /// Does NOT inspect `chunk.isLast` — under the pipelined download
+    /// model the terminal chunk can arrive before earlier chunks are
+    /// processed, so the chunk flag is unreliable as a "task complete"
+    /// signal.  The task is removed from the dict only via the wrapped
+    /// completion in `startFileDownload`, which fires when the task's
+    /// own `finish()` runs (after all in-flight requests have been
+    /// reconciled).
     func handleChunkData(_ chunk: Leviathan_HelperFileChunkData) {
         let key = "\(chunk.transferID)/\(chunk.fileID)"
         queue.async { [weak self] in
             guard let self else { return }
-            let task = self.downloads[key]
-            if chunk.isLast || !chunk.error.isEmpty {
-                self.downloads.removeValue(forKey: key)
-            }
-            task?.handleChunkData(chunk)
+            self.downloads[key]?.handleChunkData(chunk)
         }
     }
 
@@ -176,7 +211,15 @@ private enum FileDownloadError: Error, LocalizedError {
     }
 }
 
-/// Manages a single file download: sends chunk requests, writes data, reports progress.
+/// Manages a single file download: pipelines chunk requests, writes data,
+/// reports progress.
+///
+/// Concurrency model: every method on this class is invoked on the
+/// FileTransferCoordinator's serial dispatch queue.  Mutations to
+/// `inFlight`, `nextRequestOffset`, `receivedBytes`, `isCancelled`,
+/// `isFinished`, and `fileHandle` are therefore safe without explicit
+/// locking.  The completion callback is hopped to the main queue so
+/// callers don't have to be queue-aware.
 private final class FileDownloadTask {
     let transferID: String
     let fileID: String
@@ -187,7 +230,28 @@ private final class FileDownloadTask {
     private let progress: Progress
     private var fileHandle: FileHandle?
     private var receivedBytes: UInt64 = 0
+
+    /// Offset of the next FILE_CHUNK_REQUEST we'll send.  Advances by
+    /// exactly `kDefaultChunkSize` per request — the server may return
+    /// a smaller terminal chunk for the tail of the file, but never
+    /// overshoots, so request offsets are always in step with the
+    /// chunked grid.
+    private var nextRequestOffset: UInt64 = 0
+
+    /// FILE_CHUNK_REQUESTs sent without a FILE_CHUNK_DATA reply yet.
+    /// Bounded by `kPipelineDepth` so the helper doesn't enqueue
+    /// unbounded work into the parent's IPC frame buffer.
+    private var inFlight: Int = 0
+
     private var isCancelled = false
+
+    /// Idempotency guard for `finish` — both `handleChunkData` (success
+    /// path) and `cancel` (external interruption) can race to invoke
+    /// `finish`, and without this flag the completion callback would
+    /// fire twice and `closeFile` would be called on a torn-down
+    /// handle.  Set true on first entry; subsequent calls are no-ops.
+    private var isFinished = false
+
     private var sendRequest: ((UInt64) -> Void)?
 
     init(
@@ -212,20 +276,61 @@ private final class FileDownloadTask {
     func start(sendRequest: @escaping (UInt64) -> Void) {
         self.sendRequest = sendRequest
 
-        // Create (or truncate) the destination file
+        Log.info("[FileTransfer] Starting download → \(destURL.lastPathComponent) (\(fileSize) B, pipeline=\(kPipelineDepth))")
+
+        // Touch the destination path.  NSFilePromiseProvider promised
+        // this URL to Finder before any chunks were requested, so the
+        // file must exist (even at 0 bytes) by the time we report
+        // success.  FileHandle(forWritingTo:) below also requires the
+        // path to already exist.
         FileManager.default.createFile(atPath: destURL.path, contents: nil)
+
+        // Empty file: no IPC round trip needed; the createFile above
+        // is sufficient to satisfy the promise.
+        if fileSize == 0 {
+            finish(error: nil)
+            return
+        }
+
+        // Open for writing.  Cleaning up the 0-byte stub we just
+        // touched on open-failure prevents the user from seeing an
+        // orphan empty file in Finder when the helper hits a sandbox
+        // or permission error during a download attempt.
         guard let fh = try? FileHandle(forWritingTo: destURL) else {
-            completion(FileDownloadError.createFailed(destURL.path))
+            try? FileManager.default.removeItem(at: destURL)
+            finish(error: FileDownloadError.createFailed(destURL.path))
             return
         }
         fileHandle = fh
 
-        Log.info("[FileTransfer] Starting download → \(destURL.lastPathComponent) (\(fileSize) B)")
-        sendRequest(0)
+        primeRequests()
+    }
+
+    /// Top up the in-flight pipeline.  Called once at start to fill the
+    /// initial window, and again after every successful chunk to keep
+    /// the window full as long as there's more file to fetch.  No-op
+    /// once the entire file has been requested.
+    private func primeRequests() {
+        guard let sendRequest else { return }
+        while inFlight < kPipelineDepth && nextRequestOffset < fileSize {
+            sendRequest(nextRequestOffset)
+            // Plain `+=` on UInt64 traps on overflow.  Wrapping
+            // (.partialValue) would silently restart from byte 0 and
+            // corrupt the file in any unlikely failure scenario; for
+            // a clipboard helper a crash is preferable to data
+            // corruption.  Hitting overflow requires a >18 EB file —
+            // not realistic — so the trap is purely defensive.
+            nextRequestOffset += UInt64(kDefaultChunkSize)
+            inFlight += 1
+        }
     }
 
     func handleChunkData(_ chunk: Leviathan_HelperFileChunkData) {
-        guard !isCancelled else { return }
+        guard !isCancelled, !isFinished else { return }
+
+        // Decrement in-flight regardless of error vs success — the server
+        // returned a frame for one of our outstanding requests.
+        if inFlight > 0 { inFlight -= 1 }
 
         if !chunk.error.isEmpty {
             finish(error: FileDownloadError.serverError(chunk.error))
@@ -233,8 +338,14 @@ private final class FileDownloadTask {
         }
 
         do {
+            // seek + write must be on the same queue (they are: the
+            // coordinator queue serializes all FileDownloadTask calls).
+            // `write(contentsOf:)` is the modern throwing variant — the
+            // legacy `write(_:)` swallows disk-full and other I/O errors
+            // by crashing the process, which is unacceptable for a
+            // helper that needs to report failures back to the parent.
             try fileHandle?.seek(toOffset: chunk.offset)
-            fileHandle?.write(chunk.data)
+            try fileHandle?.write(contentsOf: chunk.data)
         } catch {
             finish(error: FileDownloadError.writeFailed(error.localizedDescription))
             return
@@ -243,12 +354,25 @@ private final class FileDownloadTask {
         receivedBytes += UInt64(chunk.data.count)
         progress.completedUnitCount = Int64(receivedBytes)
 
-        if chunk.isLast {
+        // Done when *both*: every byte has been requested, and every
+        // outstanding request has been answered.  Trusting
+        // `chunk.isLast` would close the file mid-write because
+        // pipelined replies can deliver the terminal chunk before
+        // earlier ones complete.  Trusting `receivedBytes == fileSize`
+        // would falsely succeed if the server ever duplicated a chunk
+        // (e.g. internal retransmit) — `receivedBytes` would hit
+        // `fileSize` while the on-disk byte range still has a hole.
+        // The (offset, in-flight) pair is the source of truth: every
+        // chunk grid slot has been requested AND every reply has been
+        // processed.
+        if nextRequestOffset >= fileSize && inFlight == 0 {
             finish(error: nil)
-        } else {
-            let nextOffset = chunk.offset + UInt64(chunk.data.count)
-            sendRequest?(nextOffset)
+            return
         }
+
+        // Otherwise top up the pipeline so we always have kPipelineDepth
+        // requests outstanding until we've requested the whole file.
+        primeRequests()
     }
 
     func cancel() {
@@ -257,6 +381,14 @@ private final class FileDownloadTask {
     }
 
     private func finish(error: Error?) {
+        // Idempotent: handleChunkData(isLast) and cancel() can both reach
+        // here for the same task.  Without this guard, the completion
+        // callback would fire twice (once with success, once with
+        // cancelled), and the second closeFile would target an already-
+        // torn-down handle.
+        if isFinished { return }
+        isFinished = true
+
         fileHandle?.closeFile()
         fileHandle = nil
         if error == nil {
