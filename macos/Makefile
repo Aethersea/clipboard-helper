@@ -1,8 +1,12 @@
-.PHONY: build build-release build-universal clean generate-proto
+.PHONY: build build-release build-universal clean generate-proto test
 
 # Debug build
 build:
 	swift build
+
+# Run unit tests
+test:
+	swift test
 
 # Release build (current arch)
 build-release:
