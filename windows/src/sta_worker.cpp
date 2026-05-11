@@ -28,6 +28,7 @@ StaWorker::~StaWorker() {
 }
 
 void StaWorker::SetOnClipboardChanged(OnClipboardChanged cb) {
+    std::lock_guard<std::mutex> lock(callback_mu_);
     on_clipboard_changed_ = std::move(cb);
 }
 
@@ -57,7 +58,6 @@ void StaWorker::Stop() {
     thread_.join();
     thread_id_.store(0);
     hwnd_atom_.store(nullptr);
-    hwnd_ = nullptr;
 }
 
 void StaWorker::PostTask(std::function<void()> task) {
@@ -104,15 +104,23 @@ LRESULT StaWorker::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_LEVIATHAN_WORK:
             DrainWorkQueue();
             return 0;
-        case WM_CLIPBOARDUPDATE:
-            if (on_clipboard_changed_) {
+        case WM_CLIPBOARDUPDATE: {
+            // Snapshot the callback under the lock so a concurrent setter
+            // cannot tear the std::function we are about to invoke.
+            OnClipboardChanged cb;
+            {
+                std::lock_guard<std::mutex> lock(callback_mu_);
+                cb = on_clipboard_changed_;
+            }
+            if (cb) {
                 try {
-                    on_clipboard_changed_();
+                    cb();
                 } catch (...) {
                     LH_LOG_ERROR("Exception in OnClipboardChanged (swallowed)");
                 }
             }
             return 0;
+        }
         default:
             return ::DefWindowProcW(hwnd, msg, wp, lp);
     }
@@ -177,7 +185,6 @@ void StaWorker::ThreadMain() {
         signal_init(false);
         return;
     }
-    hwnd_ = hwnd;
     hwnd_atom_.store(hwnd);
 
     // Subscribe to clipboard change notifications. The notifications arrive
@@ -191,11 +198,11 @@ void StaWorker::ThreadMain() {
 
     PumpMessages();
 
-    // Tear down.
+    // Tear down. Clear the public atom *before* DestroyWindow so any thread
+    // currently in HwndOwner() cannot hold a dangling HWND for long.
+    hwnd_atom_.store(nullptr);
     ::RemoveClipboardFormatListener(hwnd);
     ::DestroyWindow(hwnd);
-    hwnd_       = nullptr;
-    hwnd_atom_.store(nullptr);
     ::OleUninitialize();
     LH_LOG_INFO("StaWorker exited");
 }

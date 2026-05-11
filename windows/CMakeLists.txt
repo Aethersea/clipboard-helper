@@ -35,6 +35,7 @@ add_executable(leviathan-clipboard-helper
     src/dispatch.cpp
     src/sta_worker.cpp
     src/clipboard_ops.cpp
+    src/wic_image.cpp
 )
 
 target_include_directories(leviathan-clipboard-helper PRIVATE
@@ -68,6 +69,7 @@ target_link_libraries(leviathan-clipboard-helper PRIVATE
     shell32
     shlwapi
     uuid
+    windowscodecs   # WIC: image decode/encode (PNG <-> BGRA <-> DIB)
 )
 
 set_target_properties(leviathan-clipboard-helper PROPERTIES

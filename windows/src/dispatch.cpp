@@ -59,9 +59,12 @@ std::vector<std::uint8_t> EncodeClipboardData(const ClipboardSnapshot& snap) {
             break;
         }
         case ClipboardContentType::Image:
+            w.WriteBytesField(proto::kCDFieldPayload,
+                              snap.image_png.data(), snap.image_png.size());
+            break;
         case ClipboardContentType::Files:
         case ClipboardContentType::Unspecified:
-            // Phase 3b/4 will fill these in.
+            // Phase 4 will fill these in.
             break;
     }
     return w.take();
@@ -190,21 +193,33 @@ std::vector<std::uint8_t> Dispatcher::Handle(const std::vector<std::uint8_t>& re
             if (!ParseClipboardData(in.clipboard_data_ptr, in.clipboard_data_len, pcd)) {
                 return EncodeError("SET_CLIPBOARD clipboard_data parse failed");
             }
-            if (pcd.content_type != ClipboardContentType::Text) {
-                LH_LOG_INFO("SET_CLIPBOARD non-text content received; Phase 3b will handle image/files");
-                return {};
-            }
-            std::string utf8(reinterpret_cast<const char*>(pcd.payload_ptr), pcd.payload_len);
-            std::wstring wide = Utf8ToWide(utf8);
-
             const HWND owner = sta_->HwndOwner();
-            const bool ok = sta_->RunSync([owner, &wide]() {
-                return WriteClipboardText(owner, wide);
-            });
-            if (!ok) {
-                return EncodeError("WriteClipboardText failed");
+
+            switch (pcd.content_type) {
+                case ClipboardContentType::Text: {
+                    std::string utf8(reinterpret_cast<const char*>(pcd.payload_ptr), pcd.payload_len);
+                    std::wstring wide = Utf8ToWide(utf8);
+                    const bool ok = sta_->RunSync([owner, &wide]() {
+                        return WriteClipboardText(owner, wide);
+                    });
+                    if (!ok) return EncodeError("WriteClipboardText failed");
+                    return {};
+                }
+                case ClipboardContentType::Image: {
+                    const std::uint8_t* png  = pcd.payload_ptr;
+                    const std::size_t   plen = pcd.payload_len;
+                    const bool ok = sta_->RunSync([owner, png, plen]() {
+                        return WriteClipboardImagePng(owner, png, plen);
+                    });
+                    if (!ok) return EncodeError("WriteClipboardImagePng failed");
+                    return {};
+                }
+                case ClipboardContentType::Files:
+                case ClipboardContentType::Unspecified:
+                default:
+                    LH_LOG_INFO("SET_CLIPBOARD files content received; Phase 4 will handle it");
+                    return {};
             }
-            return {};
         }
 
         case HelperMessageType::GetClipboard: {

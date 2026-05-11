@@ -73,7 +73,11 @@ public:
     // The HWND of the worker's hidden message-only window. Returns nullptr
     // before Start() completes successfully. Useful for callers that need
     // to advertise an OLE clipboard owner (delayed rendering, drag/drop).
-    HWND HwndOwner() const { return hwnd_; }
+    //
+    // Reads via the atomic so callers on threads other than the STA worker
+    // see a coherent value during the brief windows where ThreadMain is
+    // creating or destroying the window.
+    HWND HwndOwner() const { return hwnd_atom_.load(); }
 
     // The DWORD thread ID of the STA worker, or 0 if not running. Used by
     // callers that want to PostThreadMessage directly.
@@ -90,8 +94,10 @@ private:
 
     std::thread          thread_;
     std::atomic<DWORD>   thread_id_{0};
+    // The published HWND. Visible to other threads via HwndOwner() once
+    // ThreadMain has assigned it; ThreadMain clears it before destroying
+    // the window so callers do not see a dangling handle.
     std::atomic<HWND>    hwnd_atom_{nullptr};
-    HWND                 hwnd_{nullptr};
 
     // Synchronizes Start completion (caller blocks until ready or failure).
     std::mutex                  init_mu_;
@@ -104,6 +110,12 @@ private:
     std::mutex                          queue_mu_;
     std::deque<std::function<void()>>   queue_;
 
+    // on_clipboard_changed_ is set by external threads (SetOnClipboardChanged)
+    // and read by the STA thread inside WndProc when WM_CLIPBOARDUPDATE
+    // fires. The mutex prevents a torn read of the std::function during a
+    // concurrent setter, even though the typical lifecycle (set once at
+    // boot, never reassigned) makes the contention vanishingly rare.
+    std::mutex           callback_mu_;
     OnClipboardChanged   on_clipboard_changed_;
     std::atomic<bool>    stopping_{false};
 };

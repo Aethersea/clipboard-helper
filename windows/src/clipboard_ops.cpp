@@ -4,6 +4,7 @@
 #include <cstring>
 
 #include "log.h"
+#include "wic_image.h"
 
 namespace leviathan::clipboard_helper {
 
@@ -71,6 +72,106 @@ std::string WideToUtf8(const std::wstring& w) {
     return out;
 }
 
+namespace {
+
+// Read CF_DIBV5 (preferred) or CF_DIB into a BgraImage. CF_DIB is just
+// BITMAPINFOHEADER + (optional palette) + pixel rows, with rows bottom-up
+// by default and 4-byte-aligned stride. We canonicalize to top-down 32bpp
+// BGRA so the WIC encoder can ingest pixels directly.
+bool ReadClipboardDibToBgra(BgraImage& out) {
+    HANDLE h = ::GetClipboardData(CF_DIBV5);
+    UINT format = CF_DIBV5;
+    if (h == nullptr) {
+        h = ::GetClipboardData(CF_DIB);
+        format = CF_DIB;
+    }
+    if (h == nullptr) return false;
+
+    auto* base = static_cast<const std::uint8_t*>(::GlobalLock(h));
+    if (base == nullptr) return false;
+    const SIZE_T blob_size = ::GlobalSize(h);
+
+    // Both CF_DIB and CF_DIBV5 begin with biSize so we can read it before
+    // committing to a specific header type.
+    if (blob_size < sizeof(BITMAPINFOHEADER)) {
+        ::GlobalUnlock(h);
+        return false;
+    }
+    const auto* bih = reinterpret_cast<const BITMAPINFOHEADER*>(base);
+    if (bih->biSize < sizeof(BITMAPINFOHEADER) || bih->biSize > blob_size) {
+        ::GlobalUnlock(h);
+        return false;
+    }
+
+    const int width  = bih->biWidth;
+    const int height = bih->biHeight < 0 ? -bih->biHeight : bih->biHeight;
+    const bool top_down = bih->biHeight < 0;
+    if (width <= 0 || height <= 0) {
+        ::GlobalUnlock(h);
+        return false;
+    }
+
+    // For 24bpp / 32bpp uncompressed (or BI_BITFIELDS) DIBs we can pull the
+    // raw pixels and convert. Compressed formats (BI_RLE*, JPEG, PNG via
+    // DIB) we skip — uncommon for clipboard contents.
+    if (bih->biCompression != BI_RGB && bih->biCompression != BI_BITFIELDS) {
+        ::GlobalUnlock(h);
+        return false;
+    }
+    if (bih->biBitCount != 24 && bih->biBitCount != 32) {
+        ::GlobalUnlock(h);
+        return false;
+    }
+
+    // Locate pixel start. Header is biSize bytes; BI_BITFIELDS adds 3
+    // RGBQUAD-sized masks (for V5 the masks live inside the header, so
+    // skip the supplemental masks).
+    std::size_t header_bytes = bih->biSize;
+    if (bih->biCompression == BI_BITFIELDS && bih->biSize == sizeof(BITMAPINFOHEADER)) {
+        header_bytes += 3 * sizeof(DWORD);
+    }
+    if (header_bytes > blob_size) {
+        ::GlobalUnlock(h);
+        return false;
+    }
+
+    const std::uint8_t* src_pixels = base + header_bytes;
+    const int  bytes_per_pixel = bih->biBitCount / 8;
+    const std::size_t src_stride = (static_cast<std::size_t>(width) * bytes_per_pixel + 3) & ~std::size_t(3);
+    const std::size_t needed = src_stride * height;
+    if (header_bytes + needed > blob_size) {
+        ::GlobalUnlock(h);
+        return false;
+    }
+
+    out.width  = width;
+    out.height = height;
+    out.pixels.assign(static_cast<std::size_t>(width) * height * 4, 0);
+
+    for (int y = 0; y < height; ++y) {
+        const int src_y = top_down ? y : (height - 1 - y);
+        const std::uint8_t* src_row = src_pixels + static_cast<std::size_t>(src_y) * src_stride;
+        std::uint8_t* dst_row = out.pixels.data() + static_cast<std::size_t>(y) * width * 4;
+        if (bytes_per_pixel == 4) {
+            std::memcpy(dst_row, src_row, static_cast<std::size_t>(width) * 4);
+        } else {
+            // 24bpp BGR → 32bpp BGRA with alpha=0xFF.
+            for (int x = 0; x < width; ++x) {
+                dst_row[x * 4 + 0] = src_row[x * 3 + 0];
+                dst_row[x * 4 + 1] = src_row[x * 3 + 1];
+                dst_row[x * 4 + 2] = src_row[x * 3 + 2];
+                dst_row[x * 4 + 3] = 0xFF;
+            }
+        }
+    }
+
+    ::GlobalUnlock(h);
+    (void)format;
+    return true;
+}
+
+}  // namespace
+
 bool ReadClipboard(HWND owner, ClipboardSnapshot& out) {
     ClipboardScope scope(owner);
     if (!scope) {
@@ -92,10 +193,18 @@ bool ReadClipboard(HWND owner, ClipboardSnapshot& out) {
             }
         }
     }
-    // Other formats (CF_DIB, CF_HDROP, CFSTR_FILEDESCRIPTORW, …) belong
-    // to Phase 3b/4. Return false and let the dispatcher decide what to
-    // do (typically: send an empty ClipboardData, equivalent to "nothing
-    // we know how to ship").
+
+    if (::IsClipboardFormatAvailable(CF_DIB) || ::IsClipboardFormatAvailable(CF_DIBV5)) {
+        BgraImage img;
+        if (ReadClipboardDibToBgra(img)) {
+            if (BgraToPng(img, out.image_png)) {
+                out.content_type = proto::ClipboardContentType::Image;
+                return true;
+            }
+        }
+    }
+
+    // CF_HDROP and CFSTR_FILEDESCRIPTORW belong to Phase 4.
     return false;
 }
 
@@ -137,6 +246,78 @@ bool WriteClipboardText(HWND owner, const std::wstring& text) {
         ::GlobalFree(hglobal);
         char buf[96];
         std::snprintf(buf, sizeof(buf), "SetClipboardData(CF_UNICODETEXT) failed: lastError=%lu",
+                      ::GetLastError());
+        LH_LOG_ERROR(buf);
+        return false;
+    }
+    return true;
+}
+
+bool WriteClipboardImagePng(HWND owner, const std::uint8_t* png, std::size_t png_len) {
+    // Decode PNG → 32bpp BGRA top-down outside the clipboard lock so any
+    // WIC error doesn't strand an empty clipboard.
+    BgraImage img;
+    if (!PngToBgra(png, png_len, img)) {
+        return false;
+    }
+
+    // Construct a CF_DIBV5 buffer: BITMAPV5HEADER followed by pixel rows.
+    // BITMAPV5HEADER carries alpha-channel and color-space hints, so apps
+    // that respect transparency (Office, modern Windows shell viewers)
+    // composite correctly. The image is laid out top-down (biHeight < 0)
+    // and 4-byte-aligned because we're 32bpp.
+    const std::size_t stride = static_cast<std::size_t>(img.width) * 4;
+    const std::size_t pixel_bytes = stride * img.height;
+    const std::size_t total = sizeof(BITMAPV5HEADER) + pixel_bytes;
+
+    HGLOBAL hglobal = ::GlobalAlloc(GMEM_MOVEABLE, total);
+    if (hglobal == nullptr) {
+        LH_LOG_ERROR("GlobalAlloc(CF_DIBV5) failed");
+        return false;
+    }
+    auto* base = static_cast<std::uint8_t*>(::GlobalLock(hglobal));
+    if (base == nullptr) {
+        ::GlobalFree(hglobal);
+        LH_LOG_ERROR("GlobalLock(CF_DIBV5) failed");
+        return false;
+    }
+
+    auto* hdr = reinterpret_cast<BITMAPV5HEADER*>(base);
+    std::memset(hdr, 0, sizeof(*hdr));
+    hdr->bV5Size        = sizeof(BITMAPV5HEADER);
+    hdr->bV5Width       = img.width;
+    hdr->bV5Height      = -img.height;  // top-down
+    hdr->bV5Planes      = 1;
+    hdr->bV5BitCount    = 32;
+    hdr->bV5Compression = BI_BITFIELDS;
+    hdr->bV5SizeImage   = static_cast<DWORD>(pixel_bytes);
+    hdr->bV5RedMask     = 0x00FF0000;
+    hdr->bV5GreenMask   = 0x0000FF00;
+    hdr->bV5BlueMask    = 0x000000FF;
+    hdr->bV5AlphaMask   = 0xFF000000;
+    hdr->bV5CSType      = 0x73524742;  // 'sRGB'
+    hdr->bV5Intent      = LCS_GM_GRAPHICS;
+
+    std::memcpy(base + sizeof(BITMAPV5HEADER), img.pixels.data(), pixel_bytes);
+    ::GlobalUnlock(hglobal);
+
+    // EmptyClipboard + SetClipboardData both require the clipboard to be
+    // open; we open it here just before the OS-mutating block so the
+    // expensive WIC decode above does not run with the clipboard locked.
+    ClipboardScope scope(owner);
+    if (!scope) {
+        ::GlobalFree(hglobal);
+        return false;
+    }
+    if (!::EmptyClipboard()) {
+        ::GlobalFree(hglobal);
+        LH_LOG_WARN("EmptyClipboard failed before image SetClipboardData");
+        return false;
+    }
+    if (::SetClipboardData(CF_DIBV5, hglobal) == nullptr) {
+        ::GlobalFree(hglobal);
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "SetClipboardData(CF_DIBV5) failed: lastError=%lu",
                       ::GetLastError());
         LH_LOG_ERROR(buf);
         return false;
