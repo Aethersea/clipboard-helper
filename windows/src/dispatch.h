@@ -71,6 +71,14 @@ private:
     std::string                pending_hash_;
     proto::ClipboardContentType pending_type_{proto::ClipboardContentType::Unspecified};
     std::vector<std::uint8_t>  pending_response_;
+    // Cache of the most-recent successfully-rendered response for the
+    // current announcement. Lets a second WM_RENDERFORMAT for the same
+    // announcement (e.g. an app asks for CF_DIBV5 then CF_DIB, or
+    // WM_RENDERALLFORMATS fans out) reuse the bytes we already fetched
+    // instead of issuing another DATA_REQUEST + 120 s round-trip.
+    // Cleared whenever HandleAnnounceDelayed replaces pending_hash_.
+    std::vector<std::uint8_t>  cached_response_;
+    bool                       cached_valid_{false};
     HANDLE                     render_event_{nullptr};  // manual-reset
 };
 

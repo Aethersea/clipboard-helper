@@ -266,12 +266,22 @@ std::vector<std::uint8_t> Dispatcher::OnConnect() {
 }
 
 void Dispatcher::OnClipboardChanged() {
-    // Invoked on the STA thread. Snapshot the current clipboard right here
-    // (we're already on the only thread allowed to call OpenClipboard) and
-    // push a CLIPBOARD_CHANGED frame out through the pipe.
+    // Invoked on the STA thread. Skip the read if WE are the current
+    // clipboard owner — that means the change was caused by our own
+    // ANNOUNCE_DELAYED / SET_CLIPBOARD call, and reading right now would
+    // either (a) re-trigger our own WM_RENDERFORMAT (since the delayed
+    // slot is empty), defeating the entire point of lazy paste, or (b)
+    // bounce content we just wrote back to the parent. The parent already
+    // knows the state it asked us to set; only changes initiated by
+    // OTHER apps should be relayed.
+    const HWND owner = sta_->HwndOwner();
+    if (::GetClipboardOwner() == owner) {
+        return;
+    }
+
     ClipboardSnapshot snap;
-    if (!ReadClipboard(sta_->HwndOwner(), snap)) {
-        // Nothing readable (empty clipboard or Phase-3b+ format only) — no
+    if (!ReadClipboard(owner, snap)) {
+        // Nothing readable (empty clipboard or Phase-4+ format only) — no
         // CLIPBOARD_CHANGED to ship.
         return;
     }
@@ -393,11 +403,20 @@ void Dispatcher::HandleAnnounceDelayed(const std::vector<std::uint8_t>& sub_payl
     // delayed format, so a fast WM_RENDERFORMAT (which can fire while
     // AnnounceDelayedFormatsForType is still inside its OpenClipboard
     // window) can find a matching hash.
+    //
+    // ResetEvent + cache-invalidate happen ONLY here, not inside
+    // OnRenderFormat. Otherwise a fast PROVIDE_DATA arriving between
+    // two WM_RENDERFORMAT invocations for the same announcement (e.g. an
+    // app asking for CF_DIBV5 then CF_DIB) would lose its signal — the
+    // second WM_RENDERFORMAT would ResetEvent after PROVIDE_DATA had
+    // already SetEvent'd it.
     {
         std::lock_guard<std::mutex> lock(render_mu_);
         pending_hash_     = ann.content_hash;
         pending_type_     = ann.content_type;
         pending_response_.clear();
+        cached_response_.clear();
+        cached_valid_ = false;
         if (render_event_) ::ResetEvent(render_event_);
     }
 
@@ -462,82 +481,116 @@ void Dispatcher::OnRenderFormat(unsigned int format) {
         return;
     }
 
-    // Snapshot the pending announcement so we know which hash to send and
-    // can sanity-check the type. We hold the lock only long enough to copy.
+    // Snapshot the pending announcement under render_mu_; if we already
+    // have a cached response from a prior render for this same hash (e.g.
+    // because an app just asked us for CF_DIBV5 and is now asking for
+    // CF_DIB), reuse the bytes without going back to the parent. This
+    // short-circuit is what keeps WM_RENDERALLFORMATS from burning a
+    // 120 s wait per advertised format on the way out.
     std::string hash;
     ClipboardContentType pending_type = ClipboardContentType::Unspecified;
+    std::vector<std::uint8_t> response;
+    bool have_data = false;
     {
         std::lock_guard<std::mutex> lock(render_mu_);
         hash         = pending_hash_;
         pending_type = pending_type_;
-        pending_response_.clear();
-        if (render_event_) ::ResetEvent(render_event_);
-    }
-    if (hash.empty()) {
-        LH_LOG_WARN("WM_RENDERFORMAT but no pending announcement; leaving slot empty");
-        return;
-    }
-    if (pending_type != requested) {
-        char buf[160];
-        std::snprintf(buf, sizeof(buf),
-                      "WM_RENDERFORMAT type mismatch: format=0x%x asks type=%d, pending=%d",
-                      format, static_cast<int>(requested), static_cast<int>(pending_type));
-        LH_LOG_WARN(buf);
-        return;
-    }
-
-    // Send DATA_REQUEST to the parent. PipeServer::SendFrame is safe from
-    // any thread; the STA thread we are on is fine.
-    const auto frame = EncodeDataRequest(hash, requested);
-    if (!pipe_->SendFrame(frame)) {
-        LH_LOG_WARN("WM_RENDERFORMAT: DATA_REQUEST send failed (no active client)");
-        return;
-    }
-
-    if (render_event_ == nullptr) return;
-
-    // Wait via MsgWaitForMultipleObjects so the STA still pumps window
-    // messages — OLE marshaling occasionally needs to round-trip through
-    // our window proc during clipboard read/write inside the calling app.
-    // A plain WaitForSingleObject here would deadlock those scenarios.
-    const DWORD start = ::GetTickCount();
-    while (true) {
-        const DWORD elapsed = ::GetTickCount() - start;
-        if (elapsed >= kRenderTimeoutMs) {
-            LH_LOG_WARN("WM_RENDERFORMAT: timed out waiting for PROVIDE_DATA");
+        if (hash.empty()) {
+            LH_LOG_WARN("WM_RENDERFORMAT but no pending announcement; leaving slot empty");
             return;
         }
-        const DWORD remaining = kRenderTimeoutMs - elapsed;
-        const DWORD wait_result = ::MsgWaitForMultipleObjects(
-            1, &render_event_, FALSE, remaining, QS_ALLINPUT);
-        if (wait_result == WAIT_OBJECT_0) {
-            break;  // event signaled — response is in pending_response_
+        if (pending_type != requested) {
+            char buf[160];
+            std::snprintf(buf, sizeof(buf),
+                          "WM_RENDERFORMAT type mismatch: format=0x%x asks type=%d, pending=%d",
+                          format, static_cast<int>(requested), static_cast<int>(pending_type));
+            LH_LOG_WARN(buf);
+            return;
         }
-        if (wait_result == WAIT_OBJECT_0 + 1) {
-            // Window message arrived; pump and continue waiting.
-            MSG msg{};
-            while (::PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-                ::TranslateMessage(&msg);
-                ::DispatchMessageW(&msg);
+        if (cached_valid_) {
+            response = cached_response_;
+            have_data = true;
+        } else if (!pending_response_.empty()) {
+            // PROVIDE_DATA arrived BEFORE the OS sent us WM_RENDERFORMAT
+            // (rare but possible). Adopt the response now and skip the
+            // round-trip.
+            response = std::move(pending_response_);
+            cached_response_ = response;
+            cached_valid_ = true;
+            have_data = true;
+        }
+    }
+
+    if (!have_data) {
+        // Send DATA_REQUEST to the parent. PipeServer::SendFrame is
+        // safe from any thread; the STA thread we are on is fine.
+        const auto frame = EncodeDataRequest(hash, requested);
+        if (!pipe_->SendFrame(frame)) {
+            LH_LOG_WARN("WM_RENDERFORMAT: DATA_REQUEST send failed (no active client)");
+            return;
+        }
+
+        if (render_event_ == nullptr) return;
+
+        // Wait via MsgWaitForMultipleObjects so the STA still pumps
+        // window messages. The event is set by HandleProvideData on the
+        // pipe thread, which means by the time we wake we may have to
+        // share the response with a re-entrant WM_RENDERFORMAT that ran
+        // during DispatchMessage — that's exactly why we cache.
+        const DWORD start = ::GetTickCount();
+        while (true) {
+            const DWORD elapsed = ::GetTickCount() - start;
+            if (elapsed >= kRenderTimeoutMs) {
+                LH_LOG_WARN("WM_RENDERFORMAT: timed out waiting for PROVIDE_DATA");
+                return;
             }
-            continue;
-        }
-        if (wait_result == WAIT_TIMEOUT) {
-            LH_LOG_WARN("WM_RENDERFORMAT: timed out waiting for PROVIDE_DATA");
+            const DWORD remaining = kRenderTimeoutMs - elapsed;
+            const DWORD wait_result = ::MsgWaitForMultipleObjects(
+                1, &render_event_, FALSE, remaining, QS_ALLINPUT);
+            if (wait_result == WAIT_OBJECT_0) {
+                break;
+            }
+            if (wait_result == WAIT_OBJECT_0 + 1) {
+                MSG msg{};
+                while (::PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                    ::TranslateMessage(&msg);
+                    ::DispatchMessageW(&msg);
+                }
+                // After the pump runs, a nested WM_RENDERFORMAT may have
+                // adopted pending_response_ into cached_response_ already
+                // — check before sleeping again.
+                std::lock_guard<std::mutex> lock(render_mu_);
+                if (cached_valid_) {
+                    response = cached_response_;
+                    have_data = true;
+                    break;
+                }
+                continue;
+            }
+            if (wait_result == WAIT_TIMEOUT) {
+                LH_LOG_WARN("WM_RENDERFORMAT: timed out waiting for PROVIDE_DATA");
+                return;
+            }
+            char buf[96];
+            std::snprintf(buf, sizeof(buf),
+                          "MsgWaitForMultipleObjects failed: 0x%lx", wait_result);
+            LH_LOG_ERROR(buf);
             return;
         }
-        char buf[96];
-        std::snprintf(buf, sizeof(buf),
-                      "MsgWaitForMultipleObjects failed: 0x%lx", wait_result);
-        LH_LOG_ERROR(buf);
-        return;
-    }
 
-    // Got data — materialize it into the requested format.
-    std::vector<std::uint8_t> response;
-    {
-        std::lock_guard<std::mutex> lock(render_mu_);
-        response = std::move(pending_response_);
+        if (!have_data) {
+            std::lock_guard<std::mutex> lock(render_mu_);
+            if (!pending_response_.empty()) {
+                response = std::move(pending_response_);
+                cached_response_ = response;
+                cached_valid_ = true;
+            } else if (cached_valid_) {
+                response = cached_response_;
+            } else {
+                LH_LOG_WARN("WM_RENDERFORMAT: event signaled but no response in flight");
+                return;
+            }
+        }
     }
 
     switch (requested) {
