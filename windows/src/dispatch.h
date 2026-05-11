@@ -27,6 +27,10 @@ class PipeServer;
 class Dispatcher {
 public:
     Dispatcher(StaWorker* sta, PipeServer* pipe);
+    ~Dispatcher();
+
+    Dispatcher(const Dispatcher&) = delete;
+    Dispatcher& operator=(const Dispatcher&) = delete;
 
     // Inbound frame handler installed on PipeServer.
     std::vector<std::uint8_t> Handle(const std::vector<std::uint8_t>& request);

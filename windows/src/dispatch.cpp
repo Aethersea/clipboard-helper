@@ -336,6 +336,24 @@ Dispatcher::Dispatcher(StaWorker* sta, PipeServer* pipe)
     }
 }
 
+Dispatcher::~Dispatcher() {
+    // Release any cached virtual IDataObject. The COM object lives in the
+    // STA apartment, but Dispatcher destruction happens on whichever
+    // thread owns it (currently main, after StaWorker has already been
+    // stopped — so the IDataObject's apartment is gone too). MSDN allows
+    // Release from any thread for InProc/STA proxies; in our process the
+    // helper holds the only reference so freeing here is the cleanest
+    // best-effort even if the strict apartment rule is bent.
+    if (virtual_data_object_) {
+        ReleaseDataObject(virtual_data_object_);
+        virtual_data_object_ = nullptr;
+    }
+    if (render_event_) {
+        ::CloseHandle(render_event_);
+        render_event_ = nullptr;
+    }
+}
+
 void Dispatcher::CancelPendingRender() {
     if (render_event_) ::SetEvent(render_event_);
 }
@@ -893,6 +911,12 @@ void Dispatcher::HandleFileChunkRequest(const std::vector<std::uint8_t>& sub_pay
                 vdo        = virtual_data_object_;
                 vlindex    = vit->second;
                 is_virtual = true;
+                // Pin the IDataObject under the lock so a concurrent
+                // UpdateVirtualFiles (firing from OnClipboardChanged on
+                // the STA thread) cannot Release it out from under the
+                // RunSync lambda we are about to schedule. We Release
+                // our extra reference after the lambda returns.
+                AddRefDataObject(vdo);
             }
         }
     }
@@ -914,6 +938,10 @@ void Dispatcher::HandleFileChunkRequest(const std::vector<std::uint8_t>& sub_pay
         const bool ok = sta_->RunSync([vdo, vlindex, offset, want_size, &buf, &is_last]() {
             return ReadVirtualFileChunk(vdo, vlindex, offset, want_size, buf, is_last);
         });
+        // Release the AddRef we took inside file_paths_mu_. After this
+        // line `vdo` is invalid for use; the in-flight read has already
+        // completed inside the lambda.
+        ReleaseDataObject(vdo);
         if (!ok) {
             const auto frame = EncodeFileChunkData(req.transfer_id, req.file_id, req.offset,
                                                    nullptr, 0, true, "virtual file read failed");

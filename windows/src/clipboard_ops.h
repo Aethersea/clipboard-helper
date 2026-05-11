@@ -138,6 +138,11 @@ bool ReadVirtualFileChunk(void* data_object, std::uint32_t lindex,
 // to include <unknwn.h> just to call Release().
 void ReleaseDataObject(void* data_object);
 
+// AddRef an IDataObject pointer. Used by the dispatcher to pin a virtual
+// data object snapshot for the duration of a cross-thread RunSync call so
+// the STA worker can't release it out from under us.
+void AddRefDataObject(void* data_object);
+
 // Convert UTF-8 → UTF-16 with MultiByteToWideChar. Lossy on invalid input.
 std::wstring Utf8ToWide(const std::string& s);
 std::string  WideToUtf8(const std::wstring& w);

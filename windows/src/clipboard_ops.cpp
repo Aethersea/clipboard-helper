@@ -747,6 +747,12 @@ void ReleaseDataObject(void* data_object) {
     obj->Release();
 }
 
+void AddRefDataObject(void* data_object) {
+    if (data_object == nullptr) return;
+    auto* obj = static_cast<IDataObject*>(data_object);
+    obj->AddRef();
+}
+
 bool RenderFilesDuringWmRenderFormat(const std::uint8_t* utf8_paths, std::size_t len) {
     if (len == 0) return false;
     // Payload convention (mirrors macOS clipboard_darwin.go): paths are
