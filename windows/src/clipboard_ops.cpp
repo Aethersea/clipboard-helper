@@ -103,10 +103,28 @@ bool ReadClipboardDibToBgra(BgraImage& out) {
         return false;
     }
 
-    const int width  = bih->biWidth;
-    const int height = bih->biHeight < 0 ? -bih->biHeight : bih->biHeight;
-    const bool top_down = bih->biHeight < 0;
-    if (width <= 0 || height <= 0) {
+    const LONG raw_w = bih->biWidth;
+    const LONG raw_h = bih->biHeight;
+    // Reject LONG_MIN explicitly — negating LONG_MIN is signed-overflow UB.
+    if (raw_w <= 0 || raw_h == LONG_MIN) {
+        ::GlobalUnlock(h);
+        return false;
+    }
+    const bool top_down = raw_h < 0;
+    const std::int64_t abs_h = top_down ? -static_cast<std::int64_t>(raw_h)
+                                        :  static_cast<std::int64_t>(raw_h);
+    if (raw_w > kMaxImageDimension || abs_h > kMaxImageDimension) {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf),
+                      "ReadClipboardDibToBgra: rejecting oversized DIB %ldx%lld (cap=%d)",
+                      raw_w, static_cast<long long>(abs_h), kMaxImageDimension);
+        LH_LOG_WARN(buf);
+        ::GlobalUnlock(h);
+        return false;
+    }
+    const int width  = static_cast<int>(raw_w);
+    const int height = static_cast<int>(abs_h);
+    if (height <= 0) {
         ::GlobalUnlock(h);
         return false;
     }

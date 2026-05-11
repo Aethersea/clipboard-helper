@@ -20,6 +20,12 @@ using Microsoft::WRL::ComPtr;
 // per clipboard op. The factory pointer is per-thread-of-call because
 // WICImagingFactory is registered as InProc + apartment-threaded — and we
 // always use it from the same STA worker thread.
+//
+// Lifetime caveat: thread_local destructors run *after* OleUninitialize
+// in our STA worker because OleUninitialize is called by ThreadMain's
+// own logic before the C++ runtime tears down thread_local storage.
+// Releasing a COM interface against a deinitialized apartment is UB, so
+// callers must invoke ResetWicFactoryForThread() before OleUninitialize.
 ComPtr<IWICImagingFactory>& Factory() {
     static thread_local ComPtr<IWICImagingFactory> g_factory;
     if (g_factory == nullptr) {
@@ -36,6 +42,10 @@ ComPtr<IWICImagingFactory>& Factory() {
 }
 
 }  // namespace
+
+void ResetWicFactoryForThread() {
+    Factory().Reset();
+}
 
 bool PngToBgra(const std::uint8_t* data, std::size_t len, BgraImage& out) {
     auto& factory = Factory();
@@ -74,6 +84,15 @@ bool PngToBgra(const std::uint8_t* data, std::size_t len, BgraImage& out) {
     UINT width = 0, height = 0;
     hr = frame->GetSize(&width, &height);
     if (FAILED(hr) || width == 0 || height == 0) return false;
+    if (width > static_cast<UINT>(kMaxImageDimension) ||
+        height > static_cast<UINT>(kMaxImageDimension)) {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf),
+                      "PngToBgra: rejecting oversized image %ux%u (cap=%d)",
+                      width, height, kMaxImageDimension);
+        LH_LOG_WARN(buf);
+        return false;
+    }
 
     // Convert into a canonical 32bpp BGRA layout, mirroring the format the
     // DIB encoder will expect later.
@@ -106,6 +125,14 @@ bool PngToBgra(const std::uint8_t* data, std::size_t len, BgraImage& out) {
 
 bool BgraToPng(const BgraImage& in, std::vector<std::uint8_t>& out_png) {
     if (in.width <= 0 || in.height <= 0 || in.pixels.empty()) {
+        return false;
+    }
+    if (in.width > kMaxImageDimension || in.height > kMaxImageDimension) {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf),
+                      "BgraToPng: rejecting oversized image %dx%d (cap=%d)",
+                      in.width, in.height, kMaxImageDimension);
+        LH_LOG_WARN(buf);
         return false;
     }
     auto& factory = Factory();

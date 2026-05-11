@@ -37,4 +37,18 @@ bool PngToBgra(const std::uint8_t* data, std::size_t len, BgraImage& out);
 // resized to fit. Returns false on any WIC error.
 bool BgraToPng(const BgraImage& in, std::vector<std::uint8_t>& out_png);
 
+// Release the cached IWICImagingFactory pointer for the calling thread.
+// Must be called *before* OleUninitialize on that thread, otherwise the
+// thread_local destructor runs against a torn-down COM apartment and the
+// IWICImagingFactory Release() invokes UB. The STA worker calls this
+// during shutdown.
+void ResetWicFactoryForThread();
+
+// Maximum image dimension we accept on either side of the conversion.
+// 16384 covers every realistic clipboard scenario (a typical screen capture
+// at 4 K UHD is 3840 × 2160; a 16K × 16K BGRA bitmap is ~1 GiB already).
+// Larger dimensions are almost always attacker-crafted PNG headers and we
+// reject them before allocating to avoid OOM or integer overflow paths.
+constexpr int kMaxImageDimension = 16384;
+
 }  // namespace leviathan::clipboard_helper

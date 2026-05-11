@@ -5,6 +5,7 @@
 #include <cstdio>
 
 #include "log.h"
+#include "wic_image.h"
 
 namespace leviathan::clipboard_helper {
 
@@ -203,6 +204,11 @@ void StaWorker::ThreadMain() {
     hwnd_atom_.store(nullptr);
     ::RemoveClipboardFormatListener(hwnd);
     ::DestroyWindow(hwnd);
+    // Drop the cached WIC factory while COM is still initialized on this
+    // thread; otherwise the thread_local destructor in wic_image.cpp would
+    // run after OleUninitialize and release a COM interface against a
+    // torn-down apartment (UB).
+    ResetWicFactoryForThread();
     ::OleUninitialize();
     LH_LOG_INFO("StaWorker exited");
 }
