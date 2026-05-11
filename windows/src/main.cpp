@@ -93,6 +93,21 @@ DWORD ParseParentPid(int argc, wchar_t** argv) {
     return 0;
 }
 
+// Returns the optional override for the pipe name, or an empty string when
+// no --pipe-name= flag was passed. Empty falls back to the session-derived
+// default. Used so multiple parents (leviathan + shen) can coexist in the
+// same Windows session without colliding on the default pipe name.
+std::wstring ParsePipeNameOverride(int argc, wchar_t** argv) {
+    constexpr std::wstring_view kFlag = L"--pipe-name=";
+    for (int i = 1; i < argc; ++i) {
+        std::wstring_view arg(argv[i]);
+        if (arg.rfind(kFlag, 0) == 0) {
+            return std::wstring(arg.substr(kFlag.size()));
+        }
+    }
+    return {};
+}
+
 // Watchdog state shared between wmain and the watchdog thread. The cancel
 // event lets wmain unblock the thread cleanly so it can be joined.
 struct Watchdog {
@@ -133,12 +148,17 @@ int wmain(int argc, wchar_t** argv) {
     leviathan::clipboard_helper::LogInit(L"leviathan-clipboard-helper");
 
     const DWORD session_id = leviathan::clipboard_helper::GetCurrentSessionId();
-    const std::wstring pipe_name = leviathan::clipboard_helper::DefaultPipeName(session_id);
+    std::wstring pipe_name = ParsePipeNameOverride(argc, argv);
+    const bool pipe_name_overridden = !pipe_name.empty();
+    if (!pipe_name_overridden) {
+        pipe_name = leviathan::clipboard_helper::DefaultPipeName(session_id);
+    }
 
     char banner[256];
     std::snprintf(banner, sizeof(banner),
-                  "leviathan-clipboard-helper starting (session=%lu)",
-                  session_id);
+                  "leviathan-clipboard-helper starting (session=%lu, pipe=%s)",
+                  session_id,
+                  pipe_name_overridden ? "override" : "default");
     LH_LOG_INFO(banner);
 
     // STA worker hosts OLE clipboard ops + delayed rendering + clipboard
