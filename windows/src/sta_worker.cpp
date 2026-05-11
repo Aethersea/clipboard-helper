@@ -161,7 +161,7 @@ LRESULT StaWorker::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 cb = on_render_format_;
             }
             if (cb) {
-                const unsigned int fmts[] = { CF_UNICODETEXT, CF_DIBV5, CF_DIB };
+                const unsigned int fmts[] = { CF_UNICODETEXT, CF_DIBV5, CF_DIB, CF_HDROP };
                 ::OpenClipboard(hwnd);
                 for (unsigned int fmt : fmts) {
                     if (::IsClipboardFormatAvailable(fmt)) {

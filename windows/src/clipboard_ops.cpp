@@ -1,5 +1,8 @@
 #include "clipboard_ops.h"
 
+#include <shellapi.h>  // DragQueryFileW, HDROP, DROPFILES
+#include <shlobj.h>
+
 #include <cstdio>
 #include <cstring>
 
@@ -222,7 +225,38 @@ bool ReadClipboard(HWND owner, ClipboardSnapshot& out) {
         }
     }
 
-    // CF_HDROP and CFSTR_FILEDESCRIPTORW belong to Phase 4.
+    // CF_HDROP — physical-file copies (Explorer, file-manager apps).
+    if (::IsClipboardFormatAvailable(CF_HDROP)) {
+        HANDLE h = ::GetClipboardData(CF_HDROP);
+        if (h != nullptr) {
+            HDROP drop = static_cast<HDROP>(::GlobalLock(h));
+            if (drop != nullptr) {
+                // DragQueryFileW with iFile=0xFFFFFFFF returns the count.
+                const UINT count = ::DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+                out.file_paths.reserve(count);
+                for (UINT i = 0; i < count; ++i) {
+                    const UINT len = ::DragQueryFileW(drop, i, nullptr, 0);
+                    if (len == 0) continue;
+                    std::wstring path(static_cast<std::size_t>(len), L'\0');
+                    // The returned size excludes the NUL but DragQueryFileW
+                    // needs space for it, hence len+1.
+                    const UINT got = ::DragQueryFileW(drop, i, path.data(),
+                                                      static_cast<UINT>(len + 1));
+                    if (got == 0) continue;
+                    path.resize(got);
+                    out.file_paths.push_back(std::move(path));
+                }
+                ::GlobalUnlock(h);
+                if (!out.file_paths.empty()) {
+                    out.content_type = proto::ClipboardContentType::Files;
+                    return true;
+                }
+            }
+        }
+    }
+
+    // CFSTR_FILEDESCRIPTORW (virtual files: Outlook attachments, zip
+    // entries) belongs to Phase 4c.
     return false;
 }
 
@@ -343,6 +377,67 @@ bool WriteClipboardImagePng(HWND owner, const std::uint8_t* png, std::size_t png
     return true;
 }
 
+bool WriteClipboardFiles(HWND owner, const std::vector<std::wstring>& paths) {
+    if (paths.empty()) return false;
+
+    // CF_HDROP wire layout:
+    //   DROPFILES { pFiles=sizeof(DROPFILES), fWide=TRUE, pt={0,0}, fNC=0 }
+    //   <path0> NUL <path1> NUL ... <pathN-1> NUL NUL
+    //
+    // The double NUL ends the list. All paths share a single NUL each
+    // and the buffer is terminated by an extra NUL — DragQueryFileW
+    // walks the buffer by that convention.
+    std::size_t total_wchars = 0;
+    for (const auto& p : paths) total_wchars += p.size() + 1;  // +1 for per-path NUL
+    total_wchars += 1;  // final double-NUL terminator
+
+    const std::size_t total_bytes = sizeof(DROPFILES) + total_wchars * sizeof(wchar_t);
+    HGLOBAL hglobal = ::GlobalAlloc(GMEM_MOVEABLE, total_bytes);
+    if (hglobal == nullptr) {
+        LH_LOG_ERROR("GlobalAlloc(CF_HDROP) failed");
+        return false;
+    }
+    auto* base = static_cast<std::uint8_t*>(::GlobalLock(hglobal));
+    if (base == nullptr) {
+        ::GlobalFree(hglobal);
+        LH_LOG_ERROR("GlobalLock(CF_HDROP) failed");
+        return false;
+    }
+    auto* df = reinterpret_cast<DROPFILES*>(base);
+    std::memset(df, 0, sizeof(*df));
+    df->pFiles = sizeof(DROPFILES);
+    df->fWide  = TRUE;
+
+    auto* dst = reinterpret_cast<wchar_t*>(base + sizeof(DROPFILES));
+    for (const auto& p : paths) {
+        std::memcpy(dst, p.data(), p.size() * sizeof(wchar_t));
+        dst += p.size();
+        *dst++ = L'\0';
+    }
+    *dst = L'\0';
+    ::GlobalUnlock(hglobal);
+
+    ClipboardScope scope(owner);
+    if (!scope) {
+        ::GlobalFree(hglobal);
+        return false;
+    }
+    if (!::EmptyClipboard()) {
+        ::GlobalFree(hglobal);
+        LH_LOG_WARN("EmptyClipboard failed before CF_HDROP SetClipboardData");
+        return false;
+    }
+    if (::SetClipboardData(CF_HDROP, hglobal) == nullptr) {
+        ::GlobalFree(hglobal);
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "SetClipboardData(CF_HDROP) failed: lastError=%lu",
+                      ::GetLastError());
+        LH_LOG_ERROR(buf);
+        return false;
+    }
+    return true;
+}
+
 // ─── Delayed rendering (Phase 3c) ────────────────────────────────────────
 
 bool AnnounceDelayedFormatsForType(HWND owner, proto::ClipboardContentType type) {
@@ -389,9 +484,14 @@ bool AnnounceDelayedFormatsForType(HWND owner, proto::ClipboardContentType type)
             return dibv5_ok;
         }
         case proto::ClipboardContentType::Files:
+            // Phase 4: physical-file lazy paste via CF_HDROP. The parent
+            // provides the actual file paths on demand via PROVIDE_DATA
+            // (with the payload encoded as NUL-separated absolute paths,
+            // matching the existing macOS helper's convention).
+            return announce_delayed(CF_HDROP, "CF_HDROP");
         case proto::ClipboardContentType::Unspecified:
         default:
-            LH_LOG_WARN("AnnounceDelayedFormatsForType: unsupported type (Phase 4 will add Files)");
+            LH_LOG_WARN("AnnounceDelayedFormatsForType: unsupported type");
             return false;
     }
 }
@@ -472,6 +572,59 @@ bool RenderImageDuringWmRenderFormat(UINT format, const std::uint8_t* png, std::
         return false;
     }
     if (::SetClipboardData(format, hglobal) == nullptr) {
+        ::GlobalFree(hglobal);
+        return false;
+    }
+    return true;
+}
+
+bool RenderFilesDuringWmRenderFormat(const std::uint8_t* utf8_paths, std::size_t len) {
+    if (len == 0) return false;
+    // Payload convention (mirrors macOS clipboard_darwin.go): paths are
+    // joined by '\n' as a single UTF-8 byte stream. Split into individual
+    // paths and convert each to UTF-16 for the CF_HDROP DROPFILES body.
+    std::string s(reinterpret_cast<const char*>(utf8_paths), len);
+    std::vector<std::wstring> paths;
+    std::size_t start = 0;
+    for (std::size_t i = 0; i <= s.size(); ++i) {
+        if (i == s.size() || s[i] == '\n') {
+            if (i > start) {
+                paths.push_back(Utf8ToWide(s.substr(start, i - start)));
+            }
+            start = i + 1;
+        }
+    }
+    if (paths.empty()) return false;
+
+    // Reuse the CF_HDROP serialization layout from WriteClipboardFiles, but
+    // SetClipboardData WITHOUT opening the clipboard (the OS already has
+    // it open inside the WM_RENDERFORMAT dispatch we are inside of).
+    std::size_t total_wchars = 0;
+    for (const auto& p : paths) total_wchars += p.size() + 1;
+    total_wchars += 1;
+    const std::size_t total_bytes = sizeof(DROPFILES) + total_wchars * sizeof(wchar_t);
+
+    HGLOBAL hglobal = ::GlobalAlloc(GMEM_MOVEABLE, total_bytes);
+    if (hglobal == nullptr) return false;
+    auto* base = static_cast<std::uint8_t*>(::GlobalLock(hglobal));
+    if (base == nullptr) {
+        ::GlobalFree(hglobal);
+        return false;
+    }
+    auto* df = reinterpret_cast<DROPFILES*>(base);
+    std::memset(df, 0, sizeof(*df));
+    df->pFiles = sizeof(DROPFILES);
+    df->fWide  = TRUE;
+    auto* dst = reinterpret_cast<wchar_t*>(base + sizeof(DROPFILES));
+    for (const auto& p : paths) {
+        std::memcpy(dst, p.data(), p.size() * sizeof(wchar_t));
+        dst += p.size();
+        *dst++ = L'\0';
+    }
+    *dst = L'\0';
+    ::GlobalUnlock(hglobal);
+
+    if (::SetClipboardData(CF_HDROP, hglobal) == nullptr) {
         ::GlobalFree(hglobal);
         return false;
     }

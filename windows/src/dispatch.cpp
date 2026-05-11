@@ -46,6 +46,45 @@ std::vector<std::uint8_t> EncodeError(std::string_view message) {
     return w.take();
 }
 
+// FileMetadata field numbers (from Proto/clipboard.proto). Encoded as the
+// repeated `files` sub-message of ClipboardData.
+constexpr std::uint32_t kFMFieldFileId       = 1;
+constexpr std::uint32_t kFMFieldFilename     = 2;
+constexpr std::uint32_t kFMFieldRelativePath = 3;
+constexpr std::uint32_t kFMFieldFileSize     = 4;
+
+// Encode a single FileMetadata sub-message for a CF_HDROP-derived path.
+// We populate file_id (the index), filename (basename), relative_path
+// (full path, so the parent can later issue FILE_CHUNK_REQUEST against it
+// in Phase 4b), and file_size when we can stat() the file.
+std::vector<std::uint8_t> EncodeFileMetadata(std::uint32_t index, const std::wstring& full_path) {
+    const std::string id_str = std::to_string(index);
+    const std::string utf8_full = WideToUtf8(full_path);
+    // basename: keep everything after the last '\\' or '/'.
+    std::wstring basename = full_path;
+    const auto slash = full_path.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) {
+        basename = full_path.substr(slash + 1);
+    }
+    const std::string utf8_base = WideToUtf8(basename);
+
+    std::uint64_t file_size = 0;
+    WIN32_FILE_ATTRIBUTE_DATA info{};
+    if (::GetFileAttributesExW(full_path.c_str(), GetFileExInfoStandard, &info)) {
+        ULARGE_INTEGER sz{};
+        sz.LowPart  = info.nFileSizeLow;
+        sz.HighPart = info.nFileSizeHigh;
+        file_size = sz.QuadPart;
+    }
+
+    Writer w;
+    w.WriteStringField(kFMFieldFileId, id_str);
+    w.WriteStringField(kFMFieldFilename, utf8_base);
+    w.WriteStringField(kFMFieldRelativePath, utf8_full);
+    w.WriteUint64Field(kFMFieldFileSize, file_size);
+    return w.take();
+}
+
 // Encode a ClipboardData submessage given an already-decoded snapshot.
 std::vector<std::uint8_t> EncodeClipboardData(const ClipboardSnapshot& snap) {
     Writer w;
@@ -63,8 +102,16 @@ std::vector<std::uint8_t> EncodeClipboardData(const ClipboardSnapshot& snap) {
                               snap.image_png.data(), snap.image_png.size());
             break;
         case ClipboardContentType::Files:
+            // Repeated FileMetadata via field tag = (kCDFieldFiles<<3) | 2.
+            // payload stays empty for Files (the parent uses FILE_CHUNK_REQUEST
+            // to fetch bytes in Phase 4b).
+            for (std::size_t i = 0; i < snap.file_paths.size(); ++i) {
+                w.WriteSubMessageField(proto::kCDFieldFiles,
+                                       EncodeFileMetadata(static_cast<std::uint32_t>(i),
+                                                          snap.file_paths[i]));
+            }
+            break;
         case ClipboardContentType::Unspecified:
-            // Phase 4 will fill these in.
             break;
     }
     return w.take();
@@ -335,10 +382,37 @@ std::vector<std::uint8_t> Dispatcher::Handle(const std::vector<std::uint8_t>& re
                     if (!ok) return EncodeError("WriteClipboardImagePng failed");
                     return {};
                 }
-                case ClipboardContentType::Files:
+                case ClipboardContentType::Files: {
+                    // For SET_CLIPBOARD Files we currently only honour the
+                    // FileMetadata-derived paths if the parent embedded them
+                    // in payload (newline-separated UTF-8). The common
+                    // case for Files is delayed rendering via
+                    // ANNOUNCE_DELAYED + WM_RENDERFORMAT instead.
+                    std::string utf8(reinterpret_cast<const char*>(pcd.payload_ptr), pcd.payload_len);
+                    std::vector<std::wstring> paths;
+                    std::size_t start = 0;
+                    for (std::size_t i = 0; i <= utf8.size(); ++i) {
+                        if (i == utf8.size() || utf8[i] == '\n') {
+                            if (i > start) paths.push_back(Utf8ToWide(utf8.substr(start, i - start)));
+                            start = i + 1;
+                        }
+                    }
+                    if (paths.empty()) {
+                        // Empty payload — treat as "advertise no files",
+                        // which is a no-op. Phase 4c (virtual files) will
+                        // route through a separate code path.
+                        LH_LOG_INFO("SET_CLIPBOARD files: empty payload, skipping");
+                        return {};
+                    }
+                    const bool ok = sta_->RunSync([owner, &paths]() {
+                        return WriteClipboardFiles(owner, paths);
+                    });
+                    if (!ok) return EncodeError("WriteClipboardFiles failed");
+                    return {};
+                }
                 case ClipboardContentType::Unspecified:
                 default:
-                    LH_LOG_INFO("SET_CLIPBOARD files content received; Phase 4 will handle it");
+                    LH_LOG_INFO("SET_CLIPBOARD unknown content type; ignoring");
                     return {};
             }
         }
@@ -474,6 +548,8 @@ void Dispatcher::OnRenderFormat(unsigned int format) {
         requested = ClipboardContentType::Text;
     } else if (format == CF_DIBV5 || format == CF_DIB) {
         requested = ClipboardContentType::Image;
+    } else if (format == CF_HDROP) {
+        requested = ClipboardContentType::Files;
     } else {
         char buf[96];
         std::snprintf(buf, sizeof(buf), "WM_RENDERFORMAT: unsupported format 0x%x", format);
@@ -605,6 +681,11 @@ void Dispatcher::OnRenderFormat(unsigned int format) {
         case ClipboardContentType::Image:
             if (!RenderImageDuringWmRenderFormat(format, response.data(), response.size())) {
                 LH_LOG_WARN("RenderImageDuringWmRenderFormat failed");
+            }
+            break;
+        case ClipboardContentType::Files:
+            if (!RenderFilesDuringWmRenderFormat(response.data(), response.size())) {
+                LH_LOG_WARN("RenderFilesDuringWmRenderFormat failed");
             }
             break;
         default:

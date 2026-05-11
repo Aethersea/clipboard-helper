@@ -25,6 +25,11 @@ struct ClipboardSnapshot {
     proto::ClipboardContentType content_type{proto::ClipboardContentType::Unspecified};
     std::wstring                text;       // valid when content_type == Text
     std::vector<std::uint8_t>   image_png;  // valid when content_type == Image
+    // Absolute paths of real on-disk files, valid when content_type == Files.
+    // Filled by reading CF_HDROP via DragQueryFileW. Virtual files
+    // (CFSTR_FILEDESCRIPTORW) belong to Phase 4c and route through a
+    // different path.
+    std::vector<std::wstring>   file_paths;
 };
 
 // Returns true when content_type was populated. False means the clipboard
@@ -43,6 +48,12 @@ bool WriteClipboardText(HWND owner, const std::wstring& text);
 // phases may additionally publish a CF_PNG registered format for apps
 // that prefer the original PNG bytes.
 bool WriteClipboardImagePng(HWND owner, const std::uint8_t* png, std::size_t png_len);
+
+// Write a list of absolute file paths to the clipboard as CF_HDROP.
+// The HGLOBAL layout is the DROPFILES header (with pFiles offset + fWide=TRUE)
+// followed by each path as UTF-16 with a NUL terminator, ending with a
+// final additional NUL ("double-NUL" terminated list per CF_HDROP spec).
+bool WriteClipboardFiles(HWND owner, const std::vector<std::wstring>& paths);
 
 // ─── Delayed rendering (Phase 3c) ────────────────────────────────────────
 //
@@ -69,6 +80,12 @@ bool RenderTextDuringWmRenderFormat(const std::wstring& text);
 // inside a WM_RENDERFORMAT handler. `format` is the Win32 clipboard
 // format code that the OS asked us to render (CF_DIB or CF_DIBV5).
 bool RenderImageDuringWmRenderFormat(UINT format, const std::uint8_t* png, std::size_t png_len);
+
+// RenderFilesDuringWmRenderFormat writes a CF_HDROP HGLOBAL built from a
+// newline-separated UTF-8 path list (matching the macOS helper's
+// PROVIDE_DATA payload convention for ContentFiles) WITHOUT opening the
+// clipboard. Call ONLY from inside a WM_RENDERFORMAT handler.
+bool RenderFilesDuringWmRenderFormat(const std::uint8_t* utf8_paths, std::size_t len);
 
 // Convert UTF-8 → UTF-16 with MultiByteToWideChar. Lossy on invalid input.
 std::wstring Utf8ToWide(const std::string& s);
