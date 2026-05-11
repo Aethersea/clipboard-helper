@@ -83,6 +83,10 @@ PipeServer::~PipeServer() {
     }
 }
 
+void PipeServer::SetOnConnect(OnConnectHandler on_connect) {
+    on_connect_ = std::move(on_connect);
+}
+
 void PipeServer::Stop() {
     stop_.store(true);
     if (stop_event_) {
@@ -347,6 +351,21 @@ void PipeServer::Run() {
         if (!ConnectClient(pipe)) {
             ::CloseHandle(pipe);
             continue;
+        }
+
+        // Push the on-connect frame (e.g. READY handshake) before we start
+        // pulling requests. A failure here is fatal for this client only.
+        if (on_connect_) {
+            auto initial = on_connect_();
+            if (!initial.empty()) {
+                if (!WriteFrame(pipe, initial)) {
+                    LH_LOG_WARN("on-connect frame write failed; dropping client");
+                    ::FlushFileBuffers(pipe);
+                    ::DisconnectNamedPipe(pipe);
+                    ::CloseHandle(pipe);
+                    continue;
+                }
+            }
         }
 
         ServeOneClient(pipe);

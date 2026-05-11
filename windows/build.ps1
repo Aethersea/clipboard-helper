@@ -105,6 +105,9 @@ Write-Host "==> Configuring leviathan-clipboard-helper ($Config) at $buildDir"
 # Ninja Multi-Config is the only single-pass generator that survives CMake 4.3's
 # `unscanned_$Config` rule emission with clang-cl. The plain "Ninja" generator
 # leaves `$Config` literally in rule names and ninja rejects the build graph.
+#
+# We do NOT use vcpkg / libprotobuf. The helper hand-rolls a minimal protobuf
+# wire codec in src/proto_wire.* — see CMakeLists.txt for the rationale.
 & cmake -S $scriptDir -B $buildDir `
     -G 'Ninja Multi-Config' `
     -DCMAKE_CXX_COMPILER=clang-cl `

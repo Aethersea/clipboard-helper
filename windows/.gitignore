@@ -1,4 +1,6 @@
 build/
+.vcpkg/
+vcpkg_installed/
 *.exe
 *.lib
 *.obj

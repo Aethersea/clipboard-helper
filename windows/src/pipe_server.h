@@ -15,6 +15,11 @@ namespace leviathan::clipboard_helper {
 // reply for this message.
 using MessageHandler = std::function<std::vector<std::uint8_t>(const std::vector<std::uint8_t>&)>;
 
+// OnConnectHandler is invoked once each time a client connects, before any
+// request is read. It returns an optional frame to push to the client (e.g. a
+// HELPER_MESSAGE_TYPE_READY handshake). Return an empty vector to send nothing.
+using OnConnectHandler = std::function<std::vector<std::uint8_t>()>;
+
 class PipeServer {
 public:
     PipeServer(std::wstring pipe_name, MessageHandler handler);
@@ -22,6 +27,10 @@ public:
 
     PipeServer(const PipeServer&) = delete;
     PipeServer& operator=(const PipeServer&) = delete;
+
+    // Optionally install a handler that produces a frame to push immediately
+    // after each client connects (before reading the first request).
+    void SetOnConnect(OnConnectHandler on_connect);
 
     // Runs the accept→serve loop until Stop() is called or the parent disappears.
     // Single-client at a time; reconnects after each disconnect.
@@ -55,6 +64,7 @@ private:
 
     std::wstring        pipe_name_;
     MessageHandler      handler_;
+    OnConnectHandler    on_connect_;
     std::atomic<bool>   stop_{false};
 
     // Manual-reset event. CreateEvent failure leaves this NULL; Run() checks.

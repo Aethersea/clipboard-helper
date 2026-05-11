@@ -22,6 +22,7 @@
 #include <thread>
 #include <vector>
 
+#include "dispatch.h"
 #include "log.h"
 #include "pipe_server.h"
 #include "session.h"
@@ -36,19 +37,19 @@ using leviathan::clipboard_helper::PipeServer;
 // call after the loop has already exited, the worst case is a no-op.
 std::atomic<PipeServer*> g_server{nullptr};
 
-// Phase 1 message handler: echo back the payload with a 1-byte preamble (0x01)
-// so the parent can confirm both directions of framing. Later phases will
-// dispatch by protobuf type instead.
-std::vector<std::uint8_t> EchoHandler(const std::vector<std::uint8_t>& req) {
-    char buf[64];
-    std::snprintf(buf, sizeof(buf), "EchoHandler: %zu bytes received", req.size());
-    LH_LOG_INFO(buf);
+// Phase 2a message handler: parse each frame as a HelperMessage protobuf and
+// dispatch by HelperMessageType. Most handlers are still stubs; later phases
+// will fill them in with the OLE/STA bridge and file transfer.
+std::vector<std::uint8_t> ProtoMessageHandler(const std::vector<std::uint8_t>& req) {
+    return leviathan::clipboard_helper::HandleHelperMessage(req);
+}
 
-    std::vector<std::uint8_t> reply;
-    reply.reserve(req.size() + 1);
-    reply.push_back(0x01);
-    reply.insert(reply.end(), req.begin(), req.end());
-    return reply;
+// OnConnect handler — pushes a HELPER_MESSAGE_TYPE_READY frame the moment the
+// parent connects so it can observe the helper is alive before issuing any
+// request.
+std::vector<std::uint8_t> OnConnectReady() {
+    LH_LOG_INFO("Sending READY frame to new client");
+    return leviathan::clipboard_helper::MakeReadyFrame();
 }
 
 BOOL WINAPI ConsoleCtrlHandler(DWORD ctrl_type) {
@@ -131,7 +132,8 @@ int wmain(int argc, wchar_t** argv) {
                   session_id);
     LH_LOG_INFO(banner);
 
-    PipeServer server(pipe_name, &EchoHandler);
+    PipeServer server(pipe_name, &ProtoMessageHandler);
+    server.SetOnConnect(&OnConnectReady);
     g_server.store(&server);
 
     ::SetConsoleCtrlHandler(&ConsoleCtrlHandler, TRUE);

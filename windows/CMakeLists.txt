@@ -18,11 +18,21 @@ if(NOT MSVC)
     message(FATAL_ERROR "leviathan-clipboard-helper requires clang-cl or MSVC (got compiler: ${CMAKE_CXX_COMPILER_ID})")
 endif()
 
+# ─── Helper executable ─────────────────────────────────────────────────────
+#
+# We deliberately do NOT depend on libprotobuf. The HelperMessage schema has a
+# small enough surface (~12 message types, varint + length-delim only) that
+# hand-rolled wire-format primitives (src/proto_wire.*) keep the helper free
+# of external C++ runtime dependencies and vcvarsall.bat / vcpkg toolchain
+# headaches.
+
 add_executable(leviathan-clipboard-helper
     src/main.cpp
     src/pipe_server.cpp
     src/log.cpp
     src/session.cpp
+    src/proto_wire.cpp
+    src/dispatch.cpp
 )
 
 target_include_directories(leviathan-clipboard-helper PRIVATE
