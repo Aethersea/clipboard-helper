@@ -226,11 +226,16 @@ bool ParseHelperMessage(const std::vector<std::uint8_t>& in, ParsedHelperMessage
 }
 
 // Parse just enough of a ClipboardData sub-message to extract the content
-// type and the payload bytes (UTF-8 text in Phase 3a).
+// type, the payload bytes (text + image), and any embedded FileMetadata
+// sub-messages (used by SET_CLIPBOARD when content_type=Files; the Go
+// side encodes paths via the repeated `files` field, not `payload`).
 struct ParsedClipboardData {
     ClipboardContentType content_type{ClipboardContentType::Unspecified};
     const std::uint8_t*  payload_ptr{nullptr};
     std::size_t          payload_len{0};
+    // repeated FileMetadata files = 4: we collect each sub-message's
+    // (pointer, length) and let the SET path decode them on demand.
+    std::vector<std::pair<const std::uint8_t*, std::size_t>> files;
 };
 
 struct ParsedAnnouncement {
@@ -308,9 +313,38 @@ bool ParseClipboardData(const std::uint8_t* data, std::size_t len, ParsedClipboa
             if (!r.ReadLengthDelim(out.payload_ptr, out.payload_len)) return false;
             continue;
         }
+        if (field == proto::kCDFieldFiles && wire == WireType::LengthDelim) {
+            const std::uint8_t* p = nullptr;
+            std::size_t         n = 0;
+            if (!r.ReadLengthDelim(p, n)) return false;
+            out.files.emplace_back(p, n);
+            continue;
+        }
         if (!r.SkipField(wire)) return false;
     }
     return true;
+}
+
+// Extract FileMetadata.relative_path (field 3, string) from a sub-message
+// payload. Used by SET_CLIPBOARD content_type=Files to recover the
+// absolute Win32 paths the Go side encoded.
+bool ExtractRelativePath(const std::uint8_t* data, std::size_t len, std::string& out) {
+    Reader r(data, len);
+    while (!r.eof()) {
+        std::uint32_t field = 0;
+        WireType      wire  = WireType::Varint;
+        if (!r.ReadTag(field, wire)) return false;
+        // FileMetadata field 3 = relative_path (string).
+        if (field == 3 && wire == WireType::LengthDelim) {
+            const std::uint8_t* p = nullptr;
+            std::size_t         n = 0;
+            if (!r.ReadLengthDelim(p, n)) return false;
+            out.assign(reinterpret_cast<const char*>(p), n);
+            return true;
+        }
+        if (!r.SkipField(wire)) return false;
+    }
+    return false;
 }
 
 }  // namespace
@@ -476,25 +510,22 @@ std::vector<std::uint8_t> Dispatcher::Handle(const std::vector<std::uint8_t>& re
                     return {};
                 }
                 case ClipboardContentType::Files: {
-                    // For SET_CLIPBOARD Files we currently only honour the
-                    // FileMetadata-derived paths if the parent embedded them
-                    // in payload (newline-separated UTF-8). The common
-                    // case for Files is delayed rendering via
-                    // ANNOUNCE_DELAYED + WM_RENDERFORMAT instead.
-                    std::string utf8(reinterpret_cast<const char*>(pcd.payload_ptr), pcd.payload_len);
+                    // SET_CLIPBOARD content_type=Files: paths arrive as the
+                    // repeated `files` FileMetadata sub-messages, NOT in
+                    // `payload`. (Matches macOS clipboard_darwin.go's
+                    // contentToProto output and our own EncodeFileMetadata
+                    // on the GET reply side.) For each file we take
+                    // relative_path (field 3) as the absolute Win32 path.
                     std::vector<std::wstring> paths;
-                    std::size_t start = 0;
-                    for (std::size_t i = 0; i <= utf8.size(); ++i) {
-                        if (i == utf8.size() || utf8[i] == '\n') {
-                            if (i > start) paths.push_back(Utf8ToWide(utf8.substr(start, i - start)));
-                            start = i + 1;
+                    paths.reserve(pcd.files.size());
+                    for (const auto& [ptr, len] : pcd.files) {
+                        std::string rel;
+                        if (ExtractRelativePath(ptr, len, rel) && !rel.empty()) {
+                            paths.push_back(Utf8ToWide(rel));
                         }
                     }
                     if (paths.empty()) {
-                        // Empty payload — treat as "advertise no files",
-                        // which is a no-op. Phase 4c (virtual files) will
-                        // route through a separate code path.
-                        LH_LOG_INFO("SET_CLIPBOARD files: empty payload, skipping");
+                        LH_LOG_INFO("SET_CLIPBOARD files: no usable file metadata, skipping");
                         return {};
                     }
                     const bool ok = sta_->RunSync([owner, &paths]() {
