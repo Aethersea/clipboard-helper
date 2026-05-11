@@ -1,93 +1,82 @@
 # clipboard-helper
 
-A macOS helper process that manages `NSPasteboard` with a proper `NSApplication` run loop, communicating with parent processes via Unix domain socket + length-prefixed protobuf messages.
+Multi-platform helper processes that manage system clipboards (macOS `NSPasteboard` and Windows OLE), communicating with parent processes via length-prefixed protobuf messages.
 
-## Problem
+This repository provides separate implementations for macOS and Windows, as both platforms require an active event loop and specific API handling to support advanced features like delayed rendering (lazy clipboard transfer).
 
-On macOS, `declareTypes:owner:` (delayed/lazy clipboard rendering) requires an active `NSApplication` run loop. Without it, Universal Clipboard / Handoff immediately steals pasteboard ownership, causing the delayed rendering callback to never fire.
+## Platforms
 
-This helper solves the problem by running as a separate process with its own `NSApplication` event loop, acting as the pasteboard owner on behalf of the parent process.
+- **macos/**: Swift + AppKit implementation for macOS 13+. Uses an `NSApplication` run loop to handle `declareTypes:owner:` callbacks.
+- **windows/**: C++17 + clang-cl implementation for Windows 10/11. Manages OLE/COM clipboard operations in the interactive session.
+
+## Shared Wire Protocol
+
+Both implementations speak the same length-prefixed `HelperMessage` protobuf protocol over a local socket (Unix domain socket on macOS, Named Pipe on Windows).
+
+- **Wire format**: 4-byte little-endian length prefix + serialized protobuf.
+- **Schema**: [Proto/clipboard_helper.proto](Proto/clipboard_helper.proto).
 
 ## Architecture
 
 ```
-┌──────────────────┐   Unix Socket   ┌────────────────────────────┐
-│  Go server       │ ◄──────────────► │  clipboard-helper (Swift)  │
-│  (leviathan)     │   protobuf IPC  │  - NSApplication run loop  │
-└──────────────────┘                  │  - NSPasteboard owner      │
-                                      │  - declareTypes:owner:     │
-┌──────────────────┐   Unix Socket   │  - pasteboard polling      │
+┌──────────────────┐      IPC        ┌────────────────────────────┐
+│  Go server       │ ◄──────────────► │  clipboard-helper          │
+│  (leviathan)     │   protobuf IPC  │  - Event loop / Run loop   │
+└──────────────────┘                  │  - OS Clipboard owner      │
+                                      │  - Delayed rendering       │
+┌──────────────────┐      IPC        │  - Clipboard polling       │
 │  Electron client │ ◄──────────────► │                            │
 │  (Rust + Node)   │   protobuf IPC  └────────────────────────────┘
 └──────────────────┘
 ```
 
-## IPC Protocol
-
-Wire format: 4-byte little-endian length prefix + serialized protobuf (`HelperMessage`).
-
-See [Proto/clipboard_helper.proto](Proto/clipboard_helper.proto) for message definitions.
-
 ## Building
 
-```bash
-# Debug build
-make build
-
-# Release build (current architecture)
-make build-release
-
-# Universal binary (arm64 + x86_64)
-make build-universal
-
-# Regenerate protobuf Swift sources (requires protoc + swift-protobuf)
-make generate-proto
-```
+Refer to platform-specific instructions:
+- [macOS Building](macos/Makefile)
+- [Windows Building](windows/README.md)
 
 ## Usage
 
+### macOS
 ```bash
-clipboard-helper --socket /tmp/clipboard-helper.sock [--mode server|client] [--verbose]
+macos/ClipboardHelper --socket /tmp/clipboard-helper.sock [--mode server|client] [--verbose]
 ```
 
-### Options
-
-- `--socket <path>` — Path to the Unix domain socket (required)
-- `--mode <server|client>` — Operating mode (default: `server`)
-  - `server`: Connected to Go server — polls local pasteboard, reports changes
-  - `client`: Connected to Electron client — receives remote content
-- `--verbose` — Enable debug logging to stderr
+### Windows
+```bash
+windows/leviathan-clipboard-helper.exe --parent-pid <pid>
+```
 
 ## Message Flow
 
 ### Setting clipboard directly
 ```
 Parent → SET_CLIPBOARD(ClipboardData) → Helper
-Helper writes data to NSPasteboard
+Helper writes data to OS Clipboard
 ```
 
 ### Delayed rendering (lazy transfer)
 ```
 Parent → ANNOUNCE_DELAYED(ClipboardAnnouncement) → Helper
-Helper calls declareTypes:owner: on NSPasteboard
+Helper announces availability to OS
 
 [User pastes in another app]
 
 Helper → DATA_REQUEST(ClipboardDataRequest) → Parent
 Parent → PROVIDE_DATA(HelperProvideData) → Helper
-Helper provides data to NSPasteboard (pasteboard:provideDataForType:)
+Helper provides data to requesting app
 ```
 
 ### Local clipboard change detection
 ```
 [User copies in another app]
 
-Helper detects change via polling
+Helper detects change via polling or OS events
 Helper → CLIPBOARD_CHANGED(ClipboardData) → Parent
 ```
 
-## Dependencies
+## Related Projects
 
-- [apple/swift-protobuf](https://github.com/apple/swift-protobuf) — Protocol Buffers for Swift
-- [apple/swift-argument-parser](https://github.com/apple/swift-argument-parser) — CLI argument parsing
-- macOS 13+ (Ventura)
+- [leviathan](https://github.com/aethersea/leviathan) — Go server
+- [shen](https://github.com/aethersea/shen) — Electron client

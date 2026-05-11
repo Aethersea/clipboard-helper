@@ -4,14 +4,16 @@
 #
 # Install: brew install swift-protobuf
 #
-# Usage: ./Scripts/generate-proto.sh
+# Usage: ./macos/Scripts/generate-proto.sh   (from repo root)
+#        ./Scripts/generate-proto.sh         (from macos/)
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-PROTO_DIR="$PROJECT_DIR/Proto"
-OUT_DIR="$PROJECT_DIR/Sources/ClipboardHelper/Generated"
+MACOS_DIR="$(dirname "$SCRIPT_DIR")"
+REPO_ROOT="$(dirname "$MACOS_DIR")"
+PROTO_DIR="$REPO_ROOT/Proto"
+OUT_DIR="$MACOS_DIR/Sources/ClipboardHelper/Generated"
 
 mkdir -p "$OUT_DIR"
 

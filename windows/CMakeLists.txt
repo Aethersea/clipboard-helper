@@ -1,0 +1,64 @@
+cmake_minimum_required(VERSION 3.20)
+
+project(leviathan-clipboard-helper
+    VERSION 0.1.0
+    LANGUAGES CXX
+)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+# We don't use C++20 modules. The CMake 4.3 + Ninja single-config combo emits
+# a malformed `unscanned_$Config` rule name when module scanning is implicitly
+# enabled. Disable scanning to keep rule generation legible to ninja.
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
+
+if(NOT MSVC)
+    message(FATAL_ERROR "leviathan-clipboard-helper requires clang-cl or MSVC (got compiler: ${CMAKE_CXX_COMPILER_ID})")
+endif()
+
+add_executable(leviathan-clipboard-helper
+    src/main.cpp
+    src/pipe_server.cpp
+    src/log.cpp
+    src/session.cpp
+)
+
+target_include_directories(leviathan-clipboard-helper PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+target_compile_definitions(leviathan-clipboard-helper PRIVATE
+    UNICODE
+    _UNICODE
+    NOMINMAX
+    WIN32_LEAN_AND_MEAN
+    _WIN32_WINNT=0x0A00
+)
+
+target_compile_options(leviathan-clipboard-helper PRIVATE
+    /W4
+    /WX
+    /permissive-
+    /utf-8
+    /EHsc
+    $<$<CONFIG:Release>:/O2>
+    $<$<CONFIG:Debug>:/Od /Zi>
+)
+
+target_link_libraries(leviathan-clipboard-helper PRIVATE
+    ole32
+    oleaut32
+    user32
+    advapi32
+    wtsapi32
+    shell32
+    shlwapi
+    uuid
+)
+
+set_target_properties(leviathan-clipboard-helper PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+    OUTPUT_NAME leviathan-clipboard-helper
+)
