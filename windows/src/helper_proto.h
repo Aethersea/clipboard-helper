@@ -37,6 +37,14 @@ enum class HelperMessageType : std::int32_t {
     FileTransferProgress   = 17,
 };
 
+// Wire values for ClipboardContentType (Proto/clipboard.proto).
+enum class ClipboardContentType : std::int32_t {
+    Unspecified = 0,
+    Text        = 1,
+    Image       = 2,
+    Files       = 3,
+};
+
 // HelperMessage field numbers
 constexpr std::uint32_t kFieldType                  = 1;
 constexpr std::uint32_t kFieldClipboardData         = 2;
@@ -48,5 +56,12 @@ constexpr std::uint32_t kFieldTimestamp             = 7;
 constexpr std::uint32_t kFieldFileChunkRequest      = 8;
 constexpr std::uint32_t kFieldFileChunkData         = 9;
 constexpr std::uint32_t kFieldFileTransferProgress  = 10;
+
+// ClipboardData field numbers (from Proto/clipboard.proto).
+constexpr std::uint32_t kCDFieldContentType  = 1;
+constexpr std::uint32_t kCDFieldPayload      = 2;
+constexpr std::uint32_t kCDFieldContentHash  = 3;
+constexpr std::uint32_t kCDFieldFiles        = 4;
+constexpr std::uint32_t kCDFieldTransferId   = 5;
 
 }  // namespace leviathan::clipboard_helper::proto

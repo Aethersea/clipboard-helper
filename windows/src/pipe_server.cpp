@@ -301,6 +301,11 @@ bool PipeServer::WriteFrame(HANDLE pipe, const std::vector<std::uint8_t>& payloa
         return false;
     }
     const std::uint32_t len_le = static_cast<std::uint32_t>(payload.size());
+    // Serialize all writes onto active_pipe_. Both the accept loop's reply
+    // path (ServeOneClient) and external threads pushing unsolicited frames
+    // (SendFrame) funnel through here, so the lock is the single point that
+    // prevents byte-level interleaving of distinct frames.
+    std::lock_guard<std::mutex> lock(write_mu_);
     if (!WriteExactOverlapped(pipe, &len_le, sizeof(len_le))) {
         return false;
     }
@@ -313,9 +318,23 @@ bool PipeServer::WriteFrame(HANDLE pipe, const std::vector<std::uint8_t>& payloa
 bool PipeServer::ServeOneClient(HANDLE pipe) {
     LH_LOG_INFO("Pipe client connected");
 
+    // Publish the live pipe so SendFrame can push unsolicited frames from
+    // other threads (e.g. the STA worker pushing CLIPBOARD_CHANGED on user
+    // copy). The handle is owned by Run() and remains valid until we
+    // return from this function and Run() disconnects/closes it.
+    {
+        std::lock_guard<std::mutex> lock(active_pipe_mu_);
+        active_pipe_ = pipe;
+    }
+    auto clear_active = [this]() {
+        std::lock_guard<std::mutex> lock(active_pipe_mu_);
+        active_pipe_ = nullptr;
+    };
+
     while (!stop_.load()) {
         std::vector<std::uint8_t> req;
         if (!ReadFrame(pipe, req)) {
+            clear_active();
             return false;
         }
 
@@ -326,11 +345,30 @@ bool PipeServer::ServeOneClient(HANDLE pipe) {
 
         if (!reply.empty()) {
             if (!WriteFrame(pipe, reply)) {
+                clear_active();
                 return false;
             }
         }
     }
+    clear_active();
     return true;
+}
+
+bool PipeServer::SendFrame(const std::vector<std::uint8_t>& payload) {
+    // Snapshot the active pipe; WriteFrame internally grabs write_mu_ to
+    // serialize against any concurrent ServeOneClient reply. If the snapshot
+    // is null we have no client; if it changes between snapshot and the
+    // actual write the WriteFile call will fail with a closed-handle error
+    // and the launcher's auto-restart path will recover.
+    HANDLE pipe = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(active_pipe_mu_);
+        pipe = active_pipe_;
+    }
+    if (pipe == nullptr) {
+        return false;
+    }
+    return WriteFrame(pipe, payload);
 }
 
 void PipeServer::Run() {

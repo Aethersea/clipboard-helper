@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -42,6 +43,16 @@ public:
     // so blocking I/O is canceled cooperatively rather than left hanging.
     void Stop();
 
+    // SendFrame writes an unsolicited length-prefixed payload on the currently
+    // connected client pipe. Safe to call from any thread; concurrent reads on
+    // the same overlapped pipe handle are fine, and writes are serialized
+    // internally so two callers cannot interleave bytes mid-frame.
+    //
+    // Returns false if there is no active client or the write failed (the
+    // helper's PipeServer::Run loop will tear down the broken pipe and start
+    // listening for a fresh client).
+    bool SendFrame(const std::vector<std::uint8_t>& payload);
+
 private:
     enum class WaitResult {
         Io,        // overlapped operation completed
@@ -69,6 +80,15 @@ private:
 
     // Manual-reset event. CreateEvent failure leaves this NULL; Run() checks.
     HANDLE              stop_event_{nullptr};
+
+    // Currently-active client pipe. Set inside ServeOneClient, cleared on
+    // disconnect. Read by SendFrame via active_pipe_mu_ + write_mu_.
+    HANDLE              active_pipe_{nullptr};
+    std::mutex          active_pipe_mu_;
+    // Serializes all WriteFile calls onto active_pipe_. The reader runs on
+    // the accept loop's thread; the writer is shared between that thread
+    // (for request replies) and any thread that calls SendFrame.
+    std::mutex          write_mu_;
 };
 
 }  // namespace leviathan::clipboard_helper

@@ -26,6 +26,7 @@
 #include "log.h"
 #include "pipe_server.h"
 #include "session.h"
+#include "sta_worker.h"
 
 namespace {
 
@@ -37,11 +38,17 @@ using leviathan::clipboard_helper::PipeServer;
 // call after the loop has already exited, the worst case is a no-op.
 std::atomic<PipeServer*> g_server{nullptr};
 
-// Phase 2a message handler: parse each frame as a HelperMessage protobuf and
-// dispatch by HelperMessageType. Most handlers are still stubs; later phases
-// will fill them in with the OLE/STA bridge and file transfer.
+// The dispatcher instance is constructed in wmain after StaWorker + PipeServer
+// are wired, and published here so the static PipeServer callbacks can route
+// through it. Cleared during teardown.
+std::atomic<leviathan::clipboard_helper::Dispatcher*> g_dispatcher{nullptr};
+
+// PipeServer message handler. Forwards to the Dispatcher; if the dispatcher
+// is not yet (or no longer) installed, drop the frame silently.
 std::vector<std::uint8_t> ProtoMessageHandler(const std::vector<std::uint8_t>& req) {
-    return leviathan::clipboard_helper::HandleHelperMessage(req);
+    auto* d = g_dispatcher.load();
+    if (d == nullptr) return {};
+    return d->Handle(req);
 }
 
 // OnConnect handler — pushes a HELPER_MESSAGE_TYPE_READY frame the moment the
@@ -49,7 +56,9 @@ std::vector<std::uint8_t> ProtoMessageHandler(const std::vector<std::uint8_t>& r
 // request.
 std::vector<std::uint8_t> OnConnectReady() {
     LH_LOG_INFO("Sending READY frame to new client");
-    return leviathan::clipboard_helper::MakeReadyFrame();
+    auto* d = g_dispatcher.load();
+    if (d == nullptr) return {};
+    return d->OnConnect();
 }
 
 BOOL WINAPI ConsoleCtrlHandler(DWORD ctrl_type) {
@@ -132,9 +141,23 @@ int wmain(int argc, wchar_t** argv) {
                   session_id);
     LH_LOG_INFO(banner);
 
+    // STA worker hosts OLE clipboard ops + delayed rendering + clipboard
+    // change notifications. Must be initialized before the Dispatcher so the
+    // dispatcher can hand off WriteClipboard / ReadClipboard work synchronously.
+    leviathan::clipboard_helper::StaWorker sta;
+    if (!sta.Start()) {
+        LH_LOG_ERROR("StaWorker failed to initialize; exiting");
+        leviathan::clipboard_helper::LogShutdown();
+        return 1;
+    }
+
     PipeServer server(pipe_name, &ProtoMessageHandler);
     server.SetOnConnect(&OnConnectReady);
     g_server.store(&server);
+
+    leviathan::clipboard_helper::Dispatcher dispatcher(&sta, &server);
+    g_dispatcher.store(&dispatcher);
+    sta.SetOnClipboardChanged([&dispatcher]() { dispatcher.OnClipboardChanged(); });
 
     ::SetConsoleCtrlHandler(&ConsoleCtrlHandler, TRUE);
 
@@ -185,6 +208,12 @@ int wmain(int argc, wchar_t** argv) {
         ::CloseHandle(wd.cancel_event);
         wd.cancel_event = nullptr;
     }
+
+    // Order matters: clear g_dispatcher BEFORE shutting StaWorker down so
+    // any late inbound frame the pipe handler is still draining cannot
+    // dereference a dead dispatcher.
+    g_dispatcher.store(nullptr);
+    sta.Stop();
 
     g_server.store(nullptr);
     // Drop the console handler so a late Ctrl-C signal doesn't reach into a

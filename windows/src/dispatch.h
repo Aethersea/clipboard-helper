@@ -3,29 +3,37 @@
 #include <cstdint>
 #include <vector>
 
-namespace leviathan {
+namespace leviathan::clipboard_helper {
 
-// Forward declaration of the generated message, kept out of the header so the
-// public surface stays free of protobuf-generated includes (the pipe_server
-// layer only sees opaque byte buffers).
-class HelperMessage;
+class StaWorker;
+class PipeServer;
 
-namespace clipboard_helper {
-
-// MakeReadyFrame builds an outbound HELPER_MESSAGE_TYPE_READY frame so the
-// pipe server can ship a handshake message immediately after a client
-// connects. Returns the marshaled length-prefix payload (already serialized;
-// the pipe_server adds the uint32 LE length prefix on top).
-std::vector<std::uint8_t> MakeReadyFrame();
-
-// HandleHelperMessage parses an incoming length-prefix payload as a
-// HelperMessage and dispatches by type. In Phase 2a most handlers are stubs
-// that log the receipt and return an empty reply; later phases will fill them
-// in with actual clipboard/OLE work.
+// Dispatcher owns the wiring between inbound HelperMessage frames (parsed by
+// HandleHelperMessage) and the STA worker that runs the actual clipboard
+// operations. It also pushes unsolicited HELPER_MESSAGE_TYPE_CLIPBOARD_CHANGED
+// frames out through the pipe whenever the STA worker observes a clipboard
+// sequence change.
 //
-// Returns the bytes to write back, or an empty vector if no reply is
-// warranted for this message.
-std::vector<std::uint8_t> HandleHelperMessage(const std::vector<std::uint8_t>& request);
+// Lifetime: constructed by main.cpp after both StaWorker and PipeServer are
+// ready. The Dispatcher does not own either dependency.
+class Dispatcher {
+public:
+    Dispatcher(StaWorker* sta, PipeServer* pipe);
 
-}  // namespace clipboard_helper
-}  // namespace leviathan
+    // Inbound frame handler installed on PipeServer.
+    std::vector<std::uint8_t> Handle(const std::vector<std::uint8_t>& request);
+
+    // Frame to push to a new client right after they connect (READY).
+    std::vector<std::uint8_t> OnConnect();
+
+    // Reads the current clipboard via the STA worker and, if anything readable
+    // is present, ships HELPER_MESSAGE_TYPE_CLIPBOARD_CHANGED back through the
+    // pipe. Invoked from the STA thread on WM_CLIPBOARDUPDATE.
+    void OnClipboardChanged();
+
+private:
+    StaWorker*  sta_;
+    PipeServer* pipe_;
+};
+
+}  // namespace leviathan::clipboard_helper

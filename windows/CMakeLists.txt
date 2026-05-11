@@ -33,6 +33,8 @@ add_executable(leviathan-clipboard-helper
     src/session.cpp
     src/proto_wire.cpp
     src/dispatch.cpp
+    src/sta_worker.cpp
+    src/clipboard_ops.cpp
 )
 
 target_include_directories(leviathan-clipboard-helper PRIVATE
