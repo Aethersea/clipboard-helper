@@ -44,6 +44,32 @@ bool WriteClipboardText(HWND owner, const std::wstring& text);
 // that prefer the original PNG bytes.
 bool WriteClipboardImagePng(HWND owner, const std::uint8_t* png, std::size_t png_len);
 
+// ─── Delayed rendering (Phase 3c) ────────────────────────────────────────
+//
+// AnnounceDelayedFormatsForType opens the clipboard, empties it, and
+// advertises the relevant Win32 format(s) for the requested content type
+// with `SetClipboardData(format, NULL)`. The OS records us as the owner;
+// when another app calls GetClipboardData on the advertised format, our
+// window's WndProc receives WM_RENDERFORMAT and is expected to materialize
+// the bytes by calling SetClipboardData(format, hglobal) WITHOUT opening
+// the clipboard (the OS already has it open).
+//
+// For Text: announces CF_UNICODETEXT.
+// For Image: announces CF_DIBV5 + CF_DIB (both, so apps that only ask for
+//            the older format work too — the WM_RENDERFORMAT handler
+//            materializes the same DIB for both).
+bool AnnounceDelayedFormatsForType(HWND owner, proto::ClipboardContentType type);
+
+// RenderTextDuringWmRenderFormat writes CF_UNICODETEXT to the clipboard
+// WITHOUT opening it. Call ONLY from inside a WM_RENDERFORMAT handler.
+bool RenderTextDuringWmRenderFormat(const std::wstring& text);
+
+// RenderImageDuringWmRenderFormat writes CF_DIBV5 (or CF_DIB, depending
+// on the requested format) WITHOUT opening the clipboard. Call ONLY from
+// inside a WM_RENDERFORMAT handler. `format` is the Win32 clipboard
+// format code that the OS asked us to render (CF_DIB or CF_DIBV5).
+bool RenderImageDuringWmRenderFormat(UINT format, const std::uint8_t* png, std::size_t png_len);
+
 // Convert UTF-8 → UTF-16 with MultiByteToWideChar. Lossy on invalid input.
 std::wstring Utf8ToWide(const std::string& s);
 std::string  WideToUtf8(const std::wstring& w);

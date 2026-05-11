@@ -64,4 +64,19 @@ constexpr std::uint32_t kCDFieldContentHash  = 3;
 constexpr std::uint32_t kCDFieldFiles        = 4;
 constexpr std::uint32_t kCDFieldTransferId   = 5;
 
+// ClipboardAnnouncement field numbers (from Proto/clipboard.proto). Only the
+// fields we actually consume on the helper side are listed.
+constexpr std::uint32_t kAnnFieldContentType = 1;
+constexpr std::uint32_t kAnnFieldContentHash = 2;
+
+// ClipboardDataRequest field numbers (the outbound DATA_REQUEST we send when
+// the OS fires WM_RENDERFORMAT and we need the parent to materialize data).
+constexpr std::uint32_t kReqFieldContentHash = 1;
+constexpr std::uint32_t kReqFieldContentType = 2;
+
+// HelperProvideData field numbers (inbound PROVIDE_DATA replying to a
+// DATA_REQUEST we previously sent).
+constexpr std::uint32_t kPDFieldContentHash  = 1;
+constexpr std::uint32_t kPDFieldData         = 2;
+
 }  // namespace leviathan::clipboard_helper::proto

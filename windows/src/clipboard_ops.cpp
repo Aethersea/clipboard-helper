@@ -343,4 +343,139 @@ bool WriteClipboardImagePng(HWND owner, const std::uint8_t* png, std::size_t png
     return true;
 }
 
+// ─── Delayed rendering (Phase 3c) ────────────────────────────────────────
+
+bool AnnounceDelayedFormatsForType(HWND owner, proto::ClipboardContentType type) {
+    ClipboardScope scope(owner);
+    if (!scope) {
+        return false;
+    }
+    if (!::EmptyClipboard()) {
+        char buf[96];
+        std::snprintf(buf, sizeof(buf),
+                      "EmptyClipboard failed in AnnounceDelayedFormatsForType: lastError=%lu",
+                      ::GetLastError());
+        LH_LOG_WARN(buf);
+        return false;
+    }
+    // Helper: SetClipboardData(fmt, NULL) for delayed rendering returns NULL
+    // on BOTH success and failure (there is no handle to return). The only
+    // reliable success check is GetLastError() == ERROR_SUCCESS after
+    // clearing it. Without this we would log spurious failures and the
+    // caller would think it had to give up.
+    auto announce_delayed = [](UINT fmt, const char* fmt_name) -> bool {
+        ::SetLastError(ERROR_SUCCESS);
+        ::SetClipboardData(fmt, nullptr);
+        const DWORD err = ::GetLastError();
+        if (err != ERROR_SUCCESS) {
+            char buf[128];
+            std::snprintf(buf, sizeof(buf),
+                          "SetClipboardData(%s, NULL) failed: lastError=%lu",
+                          fmt_name, err);
+            LH_LOG_WARN(buf);
+            return false;
+        }
+        return true;
+    };
+
+    switch (type) {
+        case proto::ClipboardContentType::Text:
+            return announce_delayed(CF_UNICODETEXT, "CF_UNICODETEXT");
+        case proto::ClipboardContentType::Image: {
+            const bool dibv5_ok = announce_delayed(CF_DIBV5, "CF_DIBV5");
+            // Best-effort CF_DIB for older apps; failure here is non-fatal
+            // because CF_DIBV5 already covers modern consumers.
+            (void)announce_delayed(CF_DIB, "CF_DIB");
+            return dibv5_ok;
+        }
+        case proto::ClipboardContentType::Files:
+        case proto::ClipboardContentType::Unspecified:
+        default:
+            LH_LOG_WARN("AnnounceDelayedFormatsForType: unsupported type (Phase 4 will add Files)");
+            return false;
+    }
+}
+
+bool RenderTextDuringWmRenderFormat(const std::wstring& text) {
+    // The clipboard is already open (the OS opened it before posting
+    // WM_RENDERFORMAT); we MUST NOT call OpenClipboard or EmptyClipboard.
+    const std::size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+    HGLOBAL hglobal = ::GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (hglobal == nullptr) return false;
+    auto* dst = static_cast<wchar_t*>(::GlobalLock(hglobal));
+    if (dst == nullptr) {
+        ::GlobalFree(hglobal);
+        return false;
+    }
+    std::memcpy(dst, text.data(), text.size() * sizeof(wchar_t));
+    dst[text.size()] = L'\0';
+    ::GlobalUnlock(hglobal);
+    if (::SetClipboardData(CF_UNICODETEXT, hglobal) == nullptr) {
+        ::GlobalFree(hglobal);
+        return false;
+    }
+    return true;
+}
+
+namespace {
+
+// Build a CF_DIBV5-shaped HGLOBAL from PNG bytes via WIC. Returns nullptr
+// on failure. Shared between the Open/Close write path and the
+// WM_RENDERFORMAT render path.
+HGLOBAL BuildDibV5HGlobalFromPng(const std::uint8_t* png, std::size_t png_len) {
+    BgraImage img;
+    if (!PngToBgra(png, png_len, img)) {
+        return nullptr;
+    }
+    const std::size_t stride      = static_cast<std::size_t>(img.width) * 4;
+    const std::size_t pixel_bytes = stride * img.height;
+    const std::size_t total       = sizeof(BITMAPV5HEADER) + pixel_bytes;
+
+    HGLOBAL hglobal = ::GlobalAlloc(GMEM_MOVEABLE, total);
+    if (hglobal == nullptr) return nullptr;
+    auto* base = static_cast<std::uint8_t*>(::GlobalLock(hglobal));
+    if (base == nullptr) {
+        ::GlobalFree(hglobal);
+        return nullptr;
+    }
+    auto* hdr = reinterpret_cast<BITMAPV5HEADER*>(base);
+    std::memset(hdr, 0, sizeof(*hdr));
+    hdr->bV5Size        = sizeof(BITMAPV5HEADER);
+    hdr->bV5Width       = img.width;
+    hdr->bV5Height      = -img.height;  // top-down
+    hdr->bV5Planes      = 1;
+    hdr->bV5BitCount    = 32;
+    hdr->bV5Compression = BI_BITFIELDS;
+    hdr->bV5SizeImage   = static_cast<DWORD>(pixel_bytes);
+    hdr->bV5RedMask     = 0x00FF0000;
+    hdr->bV5GreenMask   = 0x0000FF00;
+    hdr->bV5BlueMask    = 0x000000FF;
+    hdr->bV5AlphaMask   = 0xFF000000;
+    hdr->bV5CSType      = 0x73524742;  // 'sRGB'
+    hdr->bV5Intent      = LCS_GM_GRAPHICS;
+    std::memcpy(base + sizeof(BITMAPV5HEADER), img.pixels.data(), pixel_bytes);
+    ::GlobalUnlock(hglobal);
+    return hglobal;
+}
+
+}  // namespace
+
+bool RenderImageDuringWmRenderFormat(UINT format, const std::uint8_t* png, std::size_t png_len) {
+    HGLOBAL hglobal = BuildDibV5HGlobalFromPng(png, png_len);
+    if (hglobal == nullptr) return false;
+    // CF_DIBV5 is a strict superset of CF_DIB in our top-down 32bpp BGRA
+    // layout (the first sizeof(BITMAPINFOHEADER) bytes of BITMAPV5HEADER
+    // ARE a valid BITMAPINFOHEADER plus the BI_BITFIELDS masks). Apps
+    // that only know CF_DIB will read the prefix happily.
+    if (format != CF_DIB && format != CF_DIBV5) {
+        ::GlobalFree(hglobal);
+        return false;
+    }
+    if (::SetClipboardData(format, hglobal) == nullptr) {
+        ::GlobalFree(hglobal);
+        return false;
+    }
+    return true;
+}
+
 }  // namespace leviathan::clipboard_helper

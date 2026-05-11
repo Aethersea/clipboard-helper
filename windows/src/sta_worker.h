@@ -35,6 +35,14 @@ namespace leviathan::clipboard_helper {
 // heavy work (e.g. encoding image to PNG) to a different thread.
 using OnClipboardChanged = std::function<void()>;
 
+// OnRenderFormat fires on the STA thread when the OS asks us to materialize
+// delayed-render data we previously advertised via SetClipboardData(fmt, NULL).
+// The callback runs *inside* the WM_RENDERFORMAT handler — the clipboard is
+// already open, and the callback is expected to call SetClipboardData(fmt, ...)
+// before returning. The Win32 parameter is the requested clipboard format
+// (CF_UNICODETEXT, CF_DIBV5, etc).
+using OnRenderFormat = std::function<void(unsigned int /*format*/)>;
+
 class StaWorker {
 public:
     StaWorker();
@@ -52,6 +60,12 @@ public:
 
     // Registers the change callback. Safe to set before or after Start.
     void SetOnClipboardChanged(OnClipboardChanged cb);
+
+    // Registers the WM_RENDERFORMAT handler. Safe to set before or after
+    // Start. The handler runs ON THE STA THREAD inside the OS-driven
+    // WM_RENDERFORMAT dispatch; the clipboard is already open and the
+    // handler is expected to call SetClipboardData synchronously.
+    void SetOnRenderFormat(OnRenderFormat cb);
 
     // Schedules `fn` to run on the STA thread and returns once it completes.
     // Throwing from `fn` is forwarded to the caller via the future.
@@ -117,6 +131,7 @@ private:
     // boot, never reassigned) makes the contention vanishingly rare.
     std::mutex           callback_mu_;
     OnClipboardChanged   on_clipboard_changed_;
+    OnRenderFormat       on_render_format_;
     std::atomic<bool>    stopping_{false};
 };
 

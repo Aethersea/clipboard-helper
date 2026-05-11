@@ -33,6 +33,11 @@ void StaWorker::SetOnClipboardChanged(OnClipboardChanged cb) {
     on_clipboard_changed_ = std::move(cb);
 }
 
+void StaWorker::SetOnRenderFormat(OnRenderFormat cb) {
+    std::lock_guard<std::mutex> lock(callback_mu_);
+    on_render_format_ = std::move(cb);
+}
+
 bool StaWorker::Start() {
     if (thread_.joinable()) {
         return true;  // already running
@@ -119,6 +124,52 @@ LRESULT StaWorker::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 } catch (...) {
                     LH_LOG_ERROR("Exception in OnClipboardChanged (swallowed)");
                 }
+            }
+            return 0;
+        }
+        case WM_RENDERFORMAT: {
+            // The OS opened the clipboard before posting this message and
+            // expects us to call SetClipboardData(format, hglobal) before
+            // returning. The handler does ALL the round-tripping (issue
+            // DATA_REQUEST, wait for PROVIDE_DATA, materialize). If the
+            // handler is unset we leave the format slot empty — paste in
+            // the remote app will see "no data" which is the least-broken
+            // outcome.
+            OnRenderFormat cb;
+            {
+                std::lock_guard<std::mutex> lock(callback_mu_);
+                cb = on_render_format_;
+            }
+            if (cb) {
+                try {
+                    cb(static_cast<unsigned int>(wp));
+                } catch (...) {
+                    LH_LOG_ERROR("Exception in OnRenderFormat (swallowed)");
+                }
+            }
+            return 0;
+        }
+        case WM_RENDERALLFORMATS: {
+            // Fired when the system is about to deliver our advertised
+            // formats to another process and we are about to lose ownership.
+            // We render every format we previously advertised by re-invoking
+            // OnRenderFormat per format. Phase 3c only advertises text and
+            // image; loop over those.
+            OnRenderFormat cb;
+            {
+                std::lock_guard<std::mutex> lock(callback_mu_);
+                cb = on_render_format_;
+            }
+            if (cb) {
+                const unsigned int fmts[] = { CF_UNICODETEXT, CF_DIBV5, CF_DIB };
+                ::OpenClipboard(hwnd);
+                for (unsigned int fmt : fmts) {
+                    if (::IsClipboardFormatAvailable(fmt)) {
+                        try { cb(fmt); }
+                        catch (...) { LH_LOG_ERROR("OnRenderFormat threw in WM_RENDERALLFORMATS"); }
+                    }
+                }
+                ::CloseClipboard();
             }
             return 0;
         }

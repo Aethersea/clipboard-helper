@@ -158,6 +158,7 @@ int wmain(int argc, wchar_t** argv) {
     leviathan::clipboard_helper::Dispatcher dispatcher(&sta, &server);
     g_dispatcher.store(&dispatcher);
     sta.SetOnClipboardChanged([&dispatcher]() { dispatcher.OnClipboardChanged(); });
+    sta.SetOnRenderFormat([&dispatcher](unsigned int fmt) { dispatcher.OnRenderFormat(fmt); });
 
     ::SetConsoleCtrlHandler(&ConsoleCtrlHandler, TRUE);
 
