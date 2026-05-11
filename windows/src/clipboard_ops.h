@@ -21,15 +21,31 @@ namespace leviathan::clipboard_helper {
 
 // Snapshot of one of the clipboard slots, decoded into native types that
 // the dispatcher can re-serialize as a ClipboardData protobuf.
+//
+// For Files content the snapshot can carry two flavors:
+//   * Physical files (CF_HDROP) — file_paths has absolute Win32 paths
+//     and virtual_files is empty.
+//   * Virtual files (CFSTR_FILEDESCRIPTORW + CFSTR_FILECONTENTS) —
+//     virtual_files holds per-file metadata, file_paths is empty. The
+//     IDataObject pointer that owns the file streams is parked in
+//     virtual_data_object so a later FILE_CHUNK_REQUEST can pull bytes
+//     via IDataObject::GetData(CFSTR_FILECONTENTS, lindex).
+struct VirtualFileEntry {
+    std::wstring  name;
+    std::uint64_t size{0};
+    std::uint32_t lindex{0};  // formatetc.lindex for CFSTR_FILECONTENTS
+};
+
 struct ClipboardSnapshot {
-    proto::ClipboardContentType content_type{proto::ClipboardContentType::Unspecified};
-    std::wstring                text;       // valid when content_type == Text
-    std::vector<std::uint8_t>   image_png;  // valid when content_type == Image
-    // Absolute paths of real on-disk files, valid when content_type == Files.
-    // Filled by reading CF_HDROP via DragQueryFileW. Virtual files
-    // (CFSTR_FILEDESCRIPTORW) belong to Phase 4c and route through a
-    // different path.
-    std::vector<std::wstring>   file_paths;
+    proto::ClipboardContentType  content_type{proto::ClipboardContentType::Unspecified};
+    std::wstring                 text;       // valid when content_type == Text
+    std::vector<std::uint8_t>    image_png;  // valid when content_type == Image
+    std::vector<std::wstring>    file_paths;
+    std::vector<VirtualFileEntry> virtual_files;
+    // Caller-owned IDataObject reference (AddRef'd on success). The
+    // dispatcher takes ownership and Releases when superseded. Read code
+    // sets this *only* when virtual_files is non-empty.
+    void*                        virtual_data_object{nullptr};
 };
 
 // Returns true when content_type was populated. False means the clipboard
@@ -86,6 +102,41 @@ bool RenderImageDuringWmRenderFormat(UINT format, const std::uint8_t* png, std::
 // PROVIDE_DATA payload convention for ContentFiles) WITHOUT opening the
 // clipboard. Call ONLY from inside a WM_RENDERFORMAT handler.
 bool RenderFilesDuringWmRenderFormat(const std::uint8_t* utf8_paths, std::size_t len);
+
+// ─── Virtual files via CFSTR_FILEDESCRIPTORW (Phase 4c) ──────────────────
+//
+// One-time registration of the CFSTR_FILEDESCRIPTORW / CFSTR_FILECONTENTS
+// clipboard format atoms. The atoms are process-wide, so we cache them
+// after the first lookup. Safe to call multiple times from the STA thread.
+UINT GetCfFileDescriptor();
+UINT GetCfFileContents();
+
+// Read virtual files (drag-from-Outlook, zip preview, etc.) off the
+// current clipboard via OleGetClipboard + GetData(CFSTR_FILEDESCRIPTORW).
+// On success, out.virtual_files is populated with per-file metadata and
+// out.virtual_data_object holds an AddRef'd IDataObject pointer the caller
+// must Release when finished. Returns false when the clipboard doesn't
+// advertise CFSTR_FILEDESCRIPTORW or the parse fails.
+//
+// Must be called on the STA worker thread (uses OleGetClipboard).
+bool ReadVirtualFiles(ClipboardSnapshot& out);
+
+// Read one chunk of a virtual file via IDataObject::GetData(
+// CFSTR_FILECONTENTS, lindex). `data_object` is the pointer the snapshot
+// returned; `lindex` matches VirtualFileEntry::lindex. On success out_data
+// is resized to the chunk length actually read and out_is_last reflects
+// EOF.
+//
+// Must be called on the STA worker thread.
+bool ReadVirtualFileChunk(void* data_object, std::uint32_t lindex,
+                          std::uint64_t offset, std::uint32_t size,
+                          std::vector<std::uint8_t>& out_data,
+                          bool& out_is_last);
+
+// Release an IDataObject pointer previously held in
+// ClipboardSnapshot::virtual_data_object. Wrapper so callers don't have
+// to include <unknwn.h> just to call Release().
+void ReleaseDataObject(void* data_object);
 
 // Convert UTF-8 → UTF-16 with MultiByteToWideChar. Lossy on invalid input.
 std::wstring Utf8ToWide(const std::string& s);

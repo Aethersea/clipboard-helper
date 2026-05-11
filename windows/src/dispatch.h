@@ -67,6 +67,11 @@ private:
     // just received.
     void UpdateFilePaths(const std::vector<std::wstring>& paths);
 
+    // Like UpdateFilePaths but for the virtual-file path (CFSTR_FILEDESCRIPTORW).
+    // The IDataObject pointer is AddRef'd by the caller and we take
+    // ownership — Release happens here when superseded or on Close.
+    void UpdateVirtualFiles(void* data_object, std::vector<std::uint32_t> lindex_by_id);
+
     StaWorker*  sta_;
     PipeServer* pipe_;
 
@@ -100,6 +105,14 @@ private:
     // decimal index as a string (matches EncodeFileMetadata in dispatch.cpp).
     std::mutex                                    file_paths_mu_;
     std::unordered_map<std::string, std::wstring> file_paths_;
+
+    // Virtual-file state (CFSTR_FILEDESCRIPTORW). Lives in the same mutex
+    // as file_paths_ since the two are mutually exclusive — the latest
+    // ReadClipboard snapshot updates one or the other, never both.
+    //   virtual_data_object_ — AddRef'd IDataObject pointer, owned by us.
+    //   virtual_lindex_      — file_id → lindex for IDataObject::GetData.
+    void*                                          virtual_data_object_{nullptr};
+    std::unordered_map<std::string, std::uint32_t> virtual_lindex_;
 };
 
 }  // namespace leviathan::clipboard_helper

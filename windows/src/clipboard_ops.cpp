@@ -1,8 +1,10 @@
 #include "clipboard_ops.h"
 
-#include <shellapi.h>  // DragQueryFileW, HDROP, DROPFILES
-#include <shlobj.h>
+#include <ole2.h>        // OleGetClipboard, IDataObject, STGMEDIUM
+#include <shellapi.h>    // DragQueryFileW, HDROP, DROPFILES
+#include <shlobj.h>      // FILEDESCRIPTORW, FILEGROUPDESCRIPTORW, CFSTR_*
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 
@@ -256,7 +258,16 @@ bool ReadClipboard(HWND owner, ClipboardSnapshot& out) {
     }
 
     // CFSTR_FILEDESCRIPTORW (virtual files: Outlook attachments, zip
-    // entries) belongs to Phase 4c.
+    // entries). The advertised format is a registered (non-built-in)
+    // clipboard format, so IsClipboardFormatAvailable + GetClipboardData
+    // are usable, but the producer typically exposes the bytes via
+    // CFSTR_FILECONTENTS through IDataObject only. Use the OLE entry
+    // point for both detection and later chunk fetches.
+    if (::IsClipboardFormatAvailable(GetCfFileDescriptor())) {
+        if (ReadVirtualFiles(out)) {
+            return true;
+        }
+    }
     return false;
 }
 
@@ -576,6 +587,164 @@ bool RenderImageDuringWmRenderFormat(UINT format, const std::uint8_t* png, std::
         return false;
     }
     return true;
+}
+
+// ─── Virtual files via CFSTR_FILEDESCRIPTORW (Phase 4c) ──────────────────
+
+UINT GetCfFileDescriptor() {
+    static UINT cf = ::RegisterClipboardFormatW(CFSTR_FILEDESCRIPTORW);
+    return cf;
+}
+
+UINT GetCfFileContents() {
+    static UINT cf = ::RegisterClipboardFormatW(CFSTR_FILECONTENTS);
+    return cf;
+}
+
+bool ReadVirtualFiles(ClipboardSnapshot& out) {
+    out.virtual_files.clear();
+    out.virtual_data_object = nullptr;
+
+    IDataObject* obj = nullptr;
+    HRESULT hr = ::OleGetClipboard(&obj);
+    if (FAILED(hr) || obj == nullptr) {
+        return false;
+    }
+
+    const UINT cf_descriptor = GetCfFileDescriptor();
+    if (cf_descriptor == 0) {
+        obj->Release();
+        return false;
+    }
+
+    FORMATETC fe{};
+    fe.cfFormat = static_cast<CLIPFORMAT>(cf_descriptor);
+    fe.dwAspect = DVASPECT_CONTENT;
+    fe.lindex   = -1;
+    fe.tymed    = TYMED_HGLOBAL;
+
+    STGMEDIUM sm{};
+    hr = obj->GetData(&fe, &sm);
+    if (FAILED(hr) || sm.tymed != TYMED_HGLOBAL || sm.hGlobal == nullptr) {
+        obj->Release();
+        return false;
+    }
+
+    auto* fg = static_cast<FILEGROUPDESCRIPTORW*>(::GlobalLock(sm.hGlobal));
+    if (fg == nullptr) {
+        ::ReleaseStgMedium(&sm);
+        obj->Release();
+        return false;
+    }
+
+    const UINT count = fg->cItems;
+    out.virtual_files.reserve(count);
+    for (UINT i = 0; i < count; ++i) {
+        const FILEDESCRIPTORW& fd = fg->fgd[i];
+        VirtualFileEntry e{};
+        e.name = fd.cFileName;
+        if (fd.dwFlags & FD_FILESIZE) {
+            ULARGE_INTEGER sz{};
+            sz.LowPart  = fd.nFileSizeLow;
+            sz.HighPart = fd.nFileSizeHigh;
+            e.size = sz.QuadPart;
+        }
+        e.lindex = i;
+        out.virtual_files.push_back(std::move(e));
+    }
+
+    ::GlobalUnlock(sm.hGlobal);
+    ::ReleaseStgMedium(&sm);
+
+    // Hand the IDataObject pointer ownership to the snapshot — the caller
+    // (Dispatcher) is responsible for ReleaseDataObject when superseded.
+    out.virtual_data_object = obj;
+    out.content_type = proto::ClipboardContentType::Files;
+    return true;
+}
+
+bool ReadVirtualFileChunk(void* data_object, std::uint32_t lindex,
+                          std::uint64_t offset, std::uint32_t size,
+                          std::vector<std::uint8_t>& out_data,
+                          bool& out_is_last) {
+    out_data.clear();
+    out_is_last = false;
+    if (data_object == nullptr || size == 0) return false;
+
+    const UINT cf_contents = GetCfFileContents();
+    if (cf_contents == 0) return false;
+
+    auto* obj = static_cast<IDataObject*>(data_object);
+
+    // Prefer TYMED_ISTREAM (random access; the producer typically backs
+    // these by a stream). Fall back to TYMED_HGLOBAL when the producer
+    // only supplies an HGLOBAL blob. TYMED_FILE (path to a temp file on
+    // disk) is the rarest case and not handled here yet.
+    FORMATETC fe{};
+    fe.cfFormat = static_cast<CLIPFORMAT>(cf_contents);
+    fe.dwAspect = DVASPECT_CONTENT;
+    fe.lindex   = static_cast<LONG>(lindex);
+    fe.tymed    = TYMED_ISTREAM | TYMED_HGLOBAL;
+
+    STGMEDIUM sm{};
+    HRESULT hr = obj->GetData(&fe, &sm);
+    if (FAILED(hr)) {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf),
+                      "GetData(CFSTR_FILECONTENTS, lindex=%u) failed: hr=0x%08lx",
+                      lindex, hr);
+        LH_LOG_WARN(buf);
+        return false;
+    }
+
+    bool ok = false;
+    if (sm.tymed == TYMED_ISTREAM && sm.pstm != nullptr) {
+        // Seek to offset, read `size` bytes. We rely on the producer's
+        // IStream being seekable; for the few that aren't this fails
+        // cleanly with E_NOTIMPL and the parent retries.
+        LARGE_INTEGER li{};
+        li.QuadPart = static_cast<LONGLONG>(offset);
+        ULARGE_INTEGER pos{};
+        hr = sm.pstm->Seek(li, STREAM_SEEK_SET, &pos);
+        if (SUCCEEDED(hr)) {
+            out_data.resize(size);
+            ULONG got = 0;
+            hr = sm.pstm->Read(out_data.data(), size, &got);
+            if (SUCCEEDED(hr)) {
+                out_data.resize(got);
+                out_is_last = (got < size);
+                ok = true;
+            }
+        }
+    } else if (sm.tymed == TYMED_HGLOBAL && sm.hGlobal != nullptr) {
+        const SIZE_T total = ::GlobalSize(sm.hGlobal);
+        if (offset < total) {
+            auto* src = static_cast<const std::uint8_t*>(::GlobalLock(sm.hGlobal));
+            if (src != nullptr) {
+                const std::size_t avail = static_cast<std::size_t>(total - offset);
+                const std::size_t take  = std::min<std::size_t>(avail, size);
+                out_data.assign(src + offset, src + offset + take);
+                ::GlobalUnlock(sm.hGlobal);
+                out_is_last = (offset + take >= total);
+                ok = true;
+            }
+        } else {
+            // offset past EOF — empty chunk, is_last=true.
+            out_is_last = true;
+            ok = true;
+        }
+    } else {
+        LH_LOG_WARN("CFSTR_FILECONTENTS returned an unsupported TYMED");
+    }
+
+    ::ReleaseStgMedium(&sm);
+    return ok;
+}
+
+void ReleaseDataObject(void* data_object) {
+    if (data_object == nullptr) return;
+    auto* obj = static_cast<IDataObject*>(data_object);
+    obj->Release();
 }
 
 bool RenderFilesDuringWmRenderFormat(const std::uint8_t* utf8_paths, std::size_t len) {

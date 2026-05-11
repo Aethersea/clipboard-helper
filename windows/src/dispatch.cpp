@@ -85,6 +85,24 @@ std::vector<std::uint8_t> EncodeFileMetadata(std::uint32_t index, const std::wst
     return w.take();
 }
 
+// Encode a single FileMetadata sub-message for a CFSTR_FILEDESCRIPTORW-
+// derived virtual file. We don't have an on-disk path, so relative_path
+// stays empty; the parent must use the file_id when issuing
+// FILE_CHUNK_REQUEST.
+std::vector<std::uint8_t> EncodeVirtualFileMetadata(std::uint32_t index,
+                                                    const VirtualFileEntry& entry) {
+    const std::string id_str   = std::to_string(index);
+    const std::string utf8_name = WideToUtf8(entry.name);
+
+    Writer w;
+    w.WriteStringField(kFMFieldFileId, id_str);
+    w.WriteStringField(kFMFieldFilename, utf8_name);
+    // relative_path intentionally empty for virtual files; parent should
+    // not try to dereference it as a local FS path.
+    w.WriteUint64Field(kFMFieldFileSize, entry.size);
+    return w.take();
+}
+
 // Encode a ClipboardData submessage given an already-decoded snapshot.
 std::vector<std::uint8_t> EncodeClipboardData(const ClipboardSnapshot& snap) {
     Writer w;
@@ -103,12 +121,18 @@ std::vector<std::uint8_t> EncodeClipboardData(const ClipboardSnapshot& snap) {
             break;
         case ClipboardContentType::Files:
             // Repeated FileMetadata via field tag = (kCDFieldFiles<<3) | 2.
-            // payload stays empty for Files (the parent uses FILE_CHUNK_REQUEST
-            // to fetch bytes in Phase 4b).
+            // Physical (CF_HDROP) and virtual (CFSTR_FILEDESCRIPTORW)
+            // entries share the same wire field; only one of file_paths /
+            // virtual_files is populated per snapshot.
             for (std::size_t i = 0; i < snap.file_paths.size(); ++i) {
                 w.WriteSubMessageField(proto::kCDFieldFiles,
                                        EncodeFileMetadata(static_cast<std::uint32_t>(i),
                                                           snap.file_paths[i]));
+            }
+            for (std::size_t i = 0; i < snap.virtual_files.size(); ++i) {
+                w.WriteSubMessageField(proto::kCDFieldFiles,
+                                       EncodeVirtualFileMetadata(static_cast<std::uint32_t>(i),
+                                                                  snap.virtual_files[i]));
             }
             break;
         case ClipboardContentType::Unspecified:
@@ -340,11 +364,18 @@ void Dispatcher::OnClipboardChanged() {
         // CLIPBOARD_CHANGED to ship.
         return;
     }
-    // Cache the file paths so FILE_CHUNK_REQUESTs that arrive next can
-    // resolve file_id="N" → absolute path on disk. UpdateFilePaths is
-    // also called from GET_CLIPBOARD's Files reply path.
+    // Cache the file paths / virtual-file IDataObject so subsequent
+    // FILE_CHUNK_REQUESTs can resolve file_id="N" to either an on-disk
+    // path or an IDataObject + lindex.
     if (snap.content_type == ClipboardContentType::Files) {
-        UpdateFilePaths(snap.file_paths);
+        if (!snap.virtual_files.empty()) {
+            std::vector<std::uint32_t> lindex;
+            lindex.reserve(snap.virtual_files.size());
+            for (const auto& v : snap.virtual_files) lindex.push_back(v.lindex);
+            UpdateVirtualFiles(snap.virtual_data_object, std::move(lindex));
+        } else {
+            UpdateFilePaths(snap.file_paths);
+        }
     }
     const auto inner = EncodeClipboardData(snap);
     const auto frame = EncodeClipboardEnvelope(HelperMessageType::ClipboardChanged, inner);
@@ -358,6 +389,28 @@ void Dispatcher::UpdateFilePaths(const std::vector<std::wstring>& paths) {
     file_paths_.clear();
     for (std::size_t i = 0; i < paths.size(); ++i) {
         file_paths_[std::to_string(static_cast<std::uint64_t>(i))] = paths[i];
+    }
+    // Releasing the previous virtual IDataObject (if any) is the
+    // responsibility of UpdateVirtualFiles when the new snapshot is
+    // virtual instead. When the new snapshot is physical, clear too.
+    if (virtual_data_object_) {
+        ReleaseDataObject(virtual_data_object_);
+        virtual_data_object_ = nullptr;
+    }
+    virtual_lindex_.clear();
+}
+
+void Dispatcher::UpdateVirtualFiles(void* data_object, std::vector<std::uint32_t> lindex_by_id) {
+    std::lock_guard<std::mutex> lock(file_paths_mu_);
+    // A virtual snapshot supersedes any physical one — clear paths.
+    file_paths_.clear();
+    if (virtual_data_object_) {
+        ReleaseDataObject(virtual_data_object_);
+    }
+    virtual_data_object_ = data_object;  // ownership transferred in
+    virtual_lindex_.clear();
+    for (std::size_t i = 0; i < lindex_by_id.size(); ++i) {
+        virtual_lindex_[std::to_string(static_cast<std::uint64_t>(i))] = lindex_by_id[i];
     }
 }
 
@@ -452,7 +505,14 @@ std::vector<std::uint8_t> Dispatcher::Handle(const std::vector<std::uint8_t>& re
                 return EncodeClipboardEnvelope(HelperMessageType::ClipboardContent, {});
             }
             if (snap.content_type == ClipboardContentType::Files) {
-                UpdateFilePaths(snap.file_paths);
+                if (!snap.virtual_files.empty()) {
+                    std::vector<std::uint32_t> lindex;
+                    lindex.reserve(snap.virtual_files.size());
+                    for (const auto& v : snap.virtual_files) lindex.push_back(v.lindex);
+                    UpdateVirtualFiles(snap.virtual_data_object, std::move(lindex));
+                } else {
+                    UpdateFilePaths(snap.file_paths);
+                }
             }
             const auto inner = EncodeClipboardData(snap);
             return EncodeClipboardEnvelope(HelperMessageType::ClipboardContent, inner);
@@ -813,23 +873,55 @@ void Dispatcher::HandleFileChunkRequest(const std::vector<std::uint8_t>& sub_pay
     if (want == 0)        want = kDefaultChunkSize;
     if (want > kMaxChunkSize) want = kMaxChunkSize;
 
-    // Resolve file_id → absolute path. The map is populated by ReadClipboard
-    // → UpdateFilePaths, which runs whenever we hand the parent a Files
-    // snapshot. A miss here means the parent asked for a file we never
-    // advertised; reply with an error frame so the parent can fail the
-    // transfer cleanly.
+    // Resolve file_id. Two backing kinds:
+    //   - Physical: file_paths_ has an absolute Win32 path. Read off disk
+    //     from any thread.
+    //   - Virtual: virtual_data_object_ + virtual_lindex_. Must call
+    //     IDataObject::GetData on the STA thread.
     std::wstring path;
+    void*        vdo = nullptr;
+    std::uint32_t vlindex = 0;
+    bool is_virtual = false;
     {
         std::lock_guard<std::mutex> lock(file_paths_mu_);
         auto it = file_paths_.find(req.file_id);
-        if (it != file_paths_.end()) path = it->second;
+        if (it != file_paths_.end()) {
+            path = it->second;
+        } else {
+            auto vit = virtual_lindex_.find(req.file_id);
+            if (vit != virtual_lindex_.end() && virtual_data_object_ != nullptr) {
+                vdo        = virtual_data_object_;
+                vlindex    = vit->second;
+                is_virtual = true;
+            }
+        }
     }
-    if (path.empty()) {
+    if (!is_virtual && path.empty()) {
         char buf[128];
         std::snprintf(buf, sizeof(buf), "FILE_CHUNK_REQUEST: unknown file_id=%s", req.file_id.c_str());
         LH_LOG_WARN(buf);
         const auto frame = EncodeFileChunkData(req.transfer_id, req.file_id, req.offset,
                                                nullptr, 0, true, "unknown file_id");
+        (void)pipe_->SendFrame(frame);
+        return;
+    }
+
+    if (is_virtual) {
+        std::vector<std::uint8_t> buf;
+        bool is_last = false;
+        const std::uint64_t offset = req.offset;
+        const std::uint32_t want_size = want;
+        const bool ok = sta_->RunSync([vdo, vlindex, offset, want_size, &buf, &is_last]() {
+            return ReadVirtualFileChunk(vdo, vlindex, offset, want_size, buf, is_last);
+        });
+        if (!ok) {
+            const auto frame = EncodeFileChunkData(req.transfer_id, req.file_id, req.offset,
+                                                   nullptr, 0, true, "virtual file read failed");
+            (void)pipe_->SendFrame(frame);
+            return;
+        }
+        const auto frame = EncodeFileChunkData(req.transfer_id, req.file_id, req.offset,
+                                               buf.data(), buf.size(), is_last, {});
         (void)pipe_->SendFrame(frame);
         return;
     }
