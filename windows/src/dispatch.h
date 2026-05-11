@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "helper_proto.h"
@@ -54,6 +55,18 @@ private:
     void HandleAnnounceDelayed(const std::vector<std::uint8_t>& sub_payload);
     void HandleProvideData(const std::vector<std::uint8_t>& sub_payload);
 
+    // Handles FILE_CHUNK_REQUEST from the parent. Opens the file currently
+    // mapped to (file_id) under file_paths_mu_, reads the requested chunk
+    // off disk, and ships FILE_CHUNK_DATA back through PipeServer::SendFrame.
+    // Runs on the pipe-accept thread; file I/O is independent of the STA.
+    void HandleFileChunkRequest(const std::vector<std::uint8_t>& sub_payload);
+
+    // Refresh the local file path table whenever ReadClipboard reports
+    // ContentFiles. file_paths_[i] is the absolute path matching
+    // FileMetadata.file_id="i" in the CLIPBOARD_CHANGED frame the parent
+    // just received.
+    void UpdateFilePaths(const std::vector<std::wstring>& paths);
+
     StaWorker*  sta_;
     PipeServer* pipe_;
 
@@ -80,6 +93,13 @@ private:
     std::vector<std::uint8_t>  cached_response_;
     bool                       cached_valid_{false};
     HANDLE                     render_event_{nullptr};  // manual-reset
+
+    // Map of file_id → absolute Win32 path. Populated from CLIPBOARD_CHANGED
+    // / GET_CLIPBOARD snapshots; consumed by HandleFileChunkRequest when
+    // the parent fetches file bytes for outbound transfer. file_id is the
+    // decimal index as a string (matches EncodeFileMetadata in dispatch.cpp).
+    std::mutex                                    file_paths_mu_;
+    std::unordered_map<std::string, std::wstring> file_paths_;
 };
 
 }  // namespace leviathan::clipboard_helper

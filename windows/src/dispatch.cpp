@@ -156,6 +156,8 @@ struct ParsedHelperMessage {
     std::size_t         announcement_len{0};
     const std::uint8_t* provide_data_ptr{nullptr};
     std::size_t         provide_data_len{0};
+    const std::uint8_t* file_chunk_request_ptr{nullptr};
+    std::size_t         file_chunk_request_len{0};
 };
 
 bool ParseHelperMessage(const std::vector<std::uint8_t>& in, ParsedHelperMessage& out) {
@@ -184,6 +186,12 @@ bool ParseHelperMessage(const std::vector<std::uint8_t>& in, ParsedHelperMessage
         }
         if (field == proto::kFieldProvideData && wire == WireType::LengthDelim) {
             if (!r.ReadLengthDelim(out.provide_data_ptr, out.provide_data_len)) {
+                return false;
+            }
+            continue;
+        }
+        if (field == proto::kFieldFileChunkRequest && wire == WireType::LengthDelim) {
+            if (!r.ReadLengthDelim(out.file_chunk_request_ptr, out.file_chunk_request_len)) {
                 return false;
             }
             continue;
@@ -332,10 +340,24 @@ void Dispatcher::OnClipboardChanged() {
         // CLIPBOARD_CHANGED to ship.
         return;
     }
+    // Cache the file paths so FILE_CHUNK_REQUESTs that arrive next can
+    // resolve file_id="N" → absolute path on disk. UpdateFilePaths is
+    // also called from GET_CLIPBOARD's Files reply path.
+    if (snap.content_type == ClipboardContentType::Files) {
+        UpdateFilePaths(snap.file_paths);
+    }
     const auto inner = EncodeClipboardData(snap);
     const auto frame = EncodeClipboardEnvelope(HelperMessageType::ClipboardChanged, inner);
     if (!pipe_->SendFrame(frame)) {
         LH_LOG_WARN("CLIPBOARD_CHANGED frame dropped: no active client");
+    }
+}
+
+void Dispatcher::UpdateFilePaths(const std::vector<std::wstring>& paths) {
+    std::lock_guard<std::mutex> lock(file_paths_mu_);
+    file_paths_.clear();
+    for (std::size_t i = 0; i < paths.size(); ++i) {
+        file_paths_[std::to_string(static_cast<std::uint64_t>(i))] = paths[i];
     }
 }
 
@@ -429,6 +451,9 @@ std::vector<std::uint8_t> Dispatcher::Handle(const std::vector<std::uint8_t>& re
                 // "no clipboard" from "no helper response".
                 return EncodeClipboardEnvelope(HelperMessageType::ClipboardContent, {});
             }
+            if (snap.content_type == ClipboardContentType::Files) {
+                UpdateFilePaths(snap.file_paths);
+            }
             const auto inner = EncodeClipboardData(snap);
             return EncodeClipboardEnvelope(HelperMessageType::ClipboardContent, inner);
         }
@@ -451,10 +476,19 @@ std::vector<std::uint8_t> Dispatcher::Handle(const std::vector<std::uint8_t>& re
                                           in.provide_data_ptr + in.provide_data_len));
             return {};
         }
-        case HelperMessageType::FileChunkRequest:
+        case HelperMessageType::FileChunkRequest: {
+            if (in.file_chunk_request_ptr == nullptr) {
+                return EncodeError("FILE_CHUNK_REQUEST missing file_chunk_request payload");
+            }
+            HandleFileChunkRequest(
+                std::vector<std::uint8_t>(in.file_chunk_request_ptr,
+                                          in.file_chunk_request_ptr + in.file_chunk_request_len));
+            return {};
+        }
         case HelperMessageType::FileTransferProgress:
-            // Phase 4 work.
-            LH_LOG_INFO("Phase-3c stub: file-side handler not implemented yet");
+            // Parent → Helper progress notification; helper currently has
+            // nowhere to surface it. Phase 4c may use it for a tray UI.
+            LH_LOG_INFO("FILE_TRANSFER_PROGRESS received; UI surface pending");
             return {};
 
         case HelperMessageType::Shutdown:
@@ -691,6 +725,167 @@ void Dispatcher::OnRenderFormat(unsigned int format) {
         default:
             break;
     }
+}
+
+namespace {
+
+struct ParsedFileChunkRequest {
+    std::string   transfer_id;
+    std::string   file_id;
+    std::uint64_t offset{0};
+    std::uint32_t size{0};
+};
+
+bool ParseFileChunkRequest(const std::uint8_t* data, std::size_t len, ParsedFileChunkRequest& out) {
+    Reader r(data, len);
+    while (!r.eof()) {
+        std::uint32_t field = 0;
+        WireType      wire  = WireType::Varint;
+        if (!r.ReadTag(field, wire)) return false;
+        switch (field) {
+            case proto::kFCReqFieldTransferId:
+                if (wire != WireType::LengthDelim) { if (!r.SkipField(wire)) return false; continue; }
+                { const std::uint8_t* p=nullptr; std::size_t n=0;
+                  if (!r.ReadLengthDelim(p, n)) return false;
+                  out.transfer_id.assign(reinterpret_cast<const char*>(p), n); }
+                continue;
+            case proto::kFCReqFieldFileId:
+                if (wire != WireType::LengthDelim) { if (!r.SkipField(wire)) return false; continue; }
+                { const std::uint8_t* p=nullptr; std::size_t n=0;
+                  if (!r.ReadLengthDelim(p, n)) return false;
+                  out.file_id.assign(reinterpret_cast<const char*>(p), n); }
+                continue;
+            case proto::kFCReqFieldOffset:
+                if (wire != WireType::Varint) { if (!r.SkipField(wire)) return false; continue; }
+                { std::uint64_t v=0; if (!r.ReadVarint(v)) return false; out.offset = v; }
+                continue;
+            case proto::kFCReqFieldSize:
+                if (wire != WireType::Varint) { if (!r.SkipField(wire)) return false; continue; }
+                { std::uint64_t v=0; if (!r.ReadVarint(v)) return false;
+                  out.size = static_cast<std::uint32_t>(v); }
+                continue;
+            default:
+                if (!r.SkipField(wire)) return false;
+                continue;
+        }
+    }
+    return true;
+}
+
+// Encode an outbound HelperFileChunkData envelope. Returns the full
+// HelperMessage payload (already framed for pipe.SendFrame).
+std::vector<std::uint8_t> EncodeFileChunkData(const std::string& transfer_id,
+                                              const std::string& file_id,
+                                              std::uint64_t offset,
+                                              const std::uint8_t* data,
+                                              std::size_t data_len,
+                                              bool is_last,
+                                              std::string_view error_msg) {
+    Writer inner;
+    inner.WriteStringField(proto::kFCDataFieldTransferId, transfer_id);
+    inner.WriteStringField(proto::kFCDataFieldFileId, file_id);
+    inner.WriteUint64Field(proto::kFCDataFieldOffset, offset);
+    inner.WriteBytesField(proto::kFCDataFieldData, data, data_len);
+    inner.WriteBoolField(proto::kFCDataFieldIsLast, is_last);
+    if (!error_msg.empty()) {
+        inner.WriteStringField(proto::kFCDataFieldError, error_msg);
+    }
+
+    Writer out;
+    out.WriteEnumField(proto::kFieldType, static_cast<std::int32_t>(HelperMessageType::FileChunkData));
+    out.WriteSubMessageField(proto::kFieldFileChunkData, inner.bytes());
+    out.WriteUint64Field(proto::kFieldTimestamp, NowUnixMillis());
+    return out.take();
+}
+
+constexpr std::uint32_t kDefaultChunkSize = 256 * 1024;   // 256 KiB matches macOS helper
+constexpr std::uint32_t kMaxChunkSize     = 4   * 1024 * 1024;  // 4 MiB hard cap
+
+}  // namespace
+
+void Dispatcher::HandleFileChunkRequest(const std::vector<std::uint8_t>& sub_payload) {
+    ParsedFileChunkRequest req;
+    if (!ParseFileChunkRequest(sub_payload.data(), sub_payload.size(), req)) {
+        LH_LOG_WARN("FILE_CHUNK_REQUEST parse failed; dropping");
+        return;
+    }
+    std::uint32_t want = req.size;
+    if (want == 0)        want = kDefaultChunkSize;
+    if (want > kMaxChunkSize) want = kMaxChunkSize;
+
+    // Resolve file_id → absolute path. The map is populated by ReadClipboard
+    // → UpdateFilePaths, which runs whenever we hand the parent a Files
+    // snapshot. A miss here means the parent asked for a file we never
+    // advertised; reply with an error frame so the parent can fail the
+    // transfer cleanly.
+    std::wstring path;
+    {
+        std::lock_guard<std::mutex> lock(file_paths_mu_);
+        auto it = file_paths_.find(req.file_id);
+        if (it != file_paths_.end()) path = it->second;
+    }
+    if (path.empty()) {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "FILE_CHUNK_REQUEST: unknown file_id=%s", req.file_id.c_str());
+        LH_LOG_WARN(buf);
+        const auto frame = EncodeFileChunkData(req.transfer_id, req.file_id, req.offset,
+                                               nullptr, 0, true, "unknown file_id");
+        (void)pipe_->SendFrame(frame);
+        return;
+    }
+
+    // Open shared-read so concurrent paste/preview operations on the same
+    // file don't lock us out. CreateFileW + ReadFile is simpler than
+    // std::ifstream for Win32 paths (handles >MAX_PATH after manifesto and
+    // wide chars natively).
+    HANDLE h = ::CreateFileW(path.c_str(), GENERIC_READ,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                             nullptr, OPEN_EXISTING,
+                             FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        char buf[160];
+        std::snprintf(buf, sizeof(buf),
+                      "FILE_CHUNK_REQUEST: CreateFileW failed: lastError=%lu", ::GetLastError());
+        LH_LOG_WARN(buf);
+        const auto frame = EncodeFileChunkData(req.transfer_id, req.file_id, req.offset,
+                                               nullptr, 0, true, "open failed");
+        (void)pipe_->SendFrame(frame);
+        return;
+    }
+
+    LARGE_INTEGER seek{};
+    seek.QuadPart = static_cast<LONGLONG>(req.offset);
+    if (!::SetFilePointerEx(h, seek, nullptr, FILE_BEGIN)) {
+        ::CloseHandle(h);
+        const auto frame = EncodeFileChunkData(req.transfer_id, req.file_id, req.offset,
+                                               nullptr, 0, true, "seek failed");
+        (void)pipe_->SendFrame(frame);
+        return;
+    }
+
+    std::vector<std::uint8_t> buf(want);
+    DWORD got = 0;
+    const BOOL ok = ::ReadFile(h, buf.data(), want, &got, nullptr);
+    if (!ok) {
+        ::CloseHandle(h);
+        const auto frame = EncodeFileChunkData(req.transfer_id, req.file_id, req.offset,
+                                               nullptr, 0, true, "read failed");
+        (void)pipe_->SendFrame(frame);
+        return;
+    }
+
+    // is_last when ReadFile returned fewer bytes than requested (i.e. we
+    // hit EOF). This is exactly the macOS helper's convention so the Go
+    // FileChunkReader call boundary stays identical.
+    const bool is_last = (got < want);
+    buf.resize(got);
+
+    const auto frame = EncodeFileChunkData(req.transfer_id, req.file_id, req.offset,
+                                           buf.data(), buf.size(), is_last, {});
+    if (!pipe_->SendFrame(frame)) {
+        LH_LOG_WARN("FILE_CHUNK_REQUEST: FILE_CHUNK_DATA send failed (no active client)");
+    }
+    ::CloseHandle(h);
 }
 
 }  // namespace leviathan::clipboard_helper

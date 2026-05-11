@@ -64,6 +64,20 @@ constexpr std::uint32_t kCDFieldContentHash  = 3;
 constexpr std::uint32_t kCDFieldFiles        = 4;
 constexpr std::uint32_t kCDFieldTransferId   = 5;
 
+// HelperFileChunkRequest field numbers (clipboard_helper.proto).
+constexpr std::uint32_t kFCReqFieldTransferId = 1;
+constexpr std::uint32_t kFCReqFieldFileId     = 2;
+constexpr std::uint32_t kFCReqFieldOffset     = 3;
+constexpr std::uint32_t kFCReqFieldSize       = 4;
+
+// HelperFileChunkData field numbers (clipboard_helper.proto).
+constexpr std::uint32_t kFCDataFieldTransferId = 1;
+constexpr std::uint32_t kFCDataFieldFileId     = 2;
+constexpr std::uint32_t kFCDataFieldOffset     = 3;
+constexpr std::uint32_t kFCDataFieldData       = 4;
+constexpr std::uint32_t kFCDataFieldIsLast     = 5;
+constexpr std::uint32_t kFCDataFieldError      = 6;
+
 // ClipboardAnnouncement field numbers (from Proto/clipboard.proto). Only the
 // fields we actually consume on the helper side are listed.
 constexpr std::uint32_t kAnnFieldContentType = 1;
