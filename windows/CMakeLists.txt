@@ -76,3 +76,10 @@ set_target_properties(leviathan-clipboard-helper PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
     OUTPUT_NAME leviathan-clipboard-helper
 )
+
+# ─── Tests ─────────────────────────────────────────────────────────────────
+option(LH_BUILD_TESTS "Build clipboard-helper unit tests" ON)
+if(LH_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()

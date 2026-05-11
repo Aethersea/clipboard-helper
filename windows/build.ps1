@@ -10,7 +10,12 @@ param(
     [ValidateSet('Release', 'Debug')]
     [string]$Config = 'Release',
 
-    [switch]$Clean
+    [switch]$Clean,
+
+    # Run the unit-test suite (clipboard_helper_tests via ctest) after a
+    # successful build. Tests are built by default; pass -RunTests:$false to
+    # skip the post-build invocation only.
+    [switch]$RunTests
 )
 
 $ErrorActionPreference = 'Stop'
@@ -128,3 +133,9 @@ if (-not (Test-Path $bin)) {
 Write-Host ""
 Write-Host "Built: $bin"
 Get-Item $bin | Select-Object Length, LastWriteTime | Format-List
+
+if ($RunTests) {
+    Write-Host "==> Running clipboard_helper_tests ($Config)"
+    & ctest --test-dir $buildDir --build-config $Config --output-on-failure
+    if ($LASTEXITCODE -ne 0) { throw "ctest failed (exit $LASTEXITCODE)" }
+}

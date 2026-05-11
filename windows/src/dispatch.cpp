@@ -601,7 +601,16 @@ std::vector<std::uint8_t> Dispatcher::Handle(const std::vector<std::uint8_t>& re
             return {};
 
         case HelperMessageType::Shutdown:
-            LH_LOG_INFO("SHUTDOWN received; caller will close the pipe");
+            // SHUTDOWN means the parent process is about to close us. Tell
+            // the PipeServer loop to wind down so the helper process exits
+            // promptly instead of hanging around to accept the next pipe
+            // client. Otherwise the parent's subsequent NewClipboardSync
+            // would race the still-alive helper for the
+            // FILE_FLAG_FIRST_PIPE_INSTANCE slot and fall into a 10 s
+            // dial-retry loop — observed end-to-end as a session
+            // reconnect storm on the parent side.
+            LH_LOG_INFO("SHUTDOWN received; stopping helper");
+            if (pipe_) pipe_->Stop();
             return {};
 
         case HelperMessageType::Unspecified:
