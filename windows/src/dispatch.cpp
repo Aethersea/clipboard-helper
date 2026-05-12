@@ -371,14 +371,15 @@ Dispatcher::Dispatcher(StaWorker* sta, PipeServer* pipe)
 }
 
 Dispatcher::~Dispatcher() {
-    // Release any cached virtual IDataObject. The COM object lives in the
-    // STA apartment, but Dispatcher destruction happens on whichever
-    // thread owns it (currently main, after StaWorker has already been
-    // stopped — so the IDataObject's apartment is gone too). MSDN allows
-    // Release from any thread for InProc/STA proxies; in our process the
-    // helper holds the only reference so freeing here is the cleanest
-    // best-effort even if the strict apartment rule is bent.
+    // virtual_data_object_ should already be nullptr by this point because
+    // wmain calls ReleaseStaBoundResources(&sta) before sta.Stop(). If it
+    // is not (e.g. the caller forgot to invoke the explicit hook on the
+    // shutdown path), fall back to releasing here — the IDataObject's STA
+    // is gone, so this risks a bad call, but leaking is worse and the
+    // process is about to exit anyway.
     if (virtual_data_object_) {
+        LH_LOG_WARN("Dispatcher::~Dispatcher releasing IDataObject after STA shutdown — "
+                    "ReleaseStaBoundResources was not called before sta.Stop");
         ReleaseDataObject(virtual_data_object_);
         virtual_data_object_ = nullptr;
     }
@@ -390,6 +391,38 @@ Dispatcher::~Dispatcher() {
 
 void Dispatcher::CancelPendingRender() {
     if (render_event_) ::SetEvent(render_event_);
+}
+
+void Dispatcher::ReleaseStaBoundResources(StaWorker* sta) {
+    if (sta == nullptr) {
+        return;
+    }
+    // Snapshot the pointer under the lock, then Release it from the STA
+    // thread so the COM call happens inside the apartment that owns the
+    // proxy. Clearing virtual_data_object_ before the RunSync prevents a
+    // racing UpdateVirtualFiles from observing the now-released pointer.
+    void* obj = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(file_paths_mu_);
+        obj = virtual_data_object_;
+        virtual_data_object_ = nullptr;
+        virtual_lindex_.clear();
+    }
+    if (obj == nullptr) {
+        return;
+    }
+    try {
+        sta->RunSync([obj]() {
+            ReleaseDataObject(obj);
+        });
+    } catch (const std::future_error& e) {
+        // StaWorker may already have exited (broken_promise) — in that
+        // case there's no apartment to dispatch to and we have no choice
+        // but to release on the current thread. Better leak-free + UB
+        // than guaranteed leak at process exit.
+        LH_LOG_WARN("ReleaseStaBoundResources: STA gone, releasing locally");
+        ReleaseDataObject(obj);
+    }
 }
 
 std::vector<std::uint8_t> Dispatcher::OnConnect() {
@@ -693,7 +726,7 @@ void Dispatcher::HandleProvideData(const std::vector<std::uint8_t>& sub_payload)
     if (render_event_) ::SetEvent(render_event_);
 }
 
-void Dispatcher::OnRenderFormat(unsigned int format) {
+void Dispatcher::OnRenderFormat(unsigned int format, bool cache_only) {
     // Determine which ContentType this Win32 format maps to.
     ClipboardContentType requested = ClipboardContentType::Unspecified;
     if (format == CF_UNICODETEXT) {
@@ -750,6 +783,21 @@ void Dispatcher::OnRenderFormat(unsigned int format) {
     }
 
     if (!have_data) {
+        // WM_RENDERALLFORMATS path: we cannot afford the 120s wait per
+        // advertised format because we are about to lose ownership and
+        // the system clipboard would be frozen for minutes. Skip silently;
+        // apps that paste during the brief ownership-handoff window will
+        // see an empty slot, which is the documented WM_RENDERALLFORMATS
+        // semantics anyway.
+        if (cache_only) {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf),
+                          "WM_RENDERALLFORMATS: no cached data for format 0x%x; leaving slot empty",
+                          format);
+            LH_LOG_INFO(buf);
+            return;
+        }
+
         // Send DATA_REQUEST to the parent. PipeServer::SendFrame is
         // safe from any thread; the STA thread we are on is fine.
         const auto frame = EncodeDataRequest(hash, requested);
@@ -780,14 +828,33 @@ void Dispatcher::OnRenderFormat(unsigned int format) {
             }
             if (wait_result == WAIT_OBJECT_0 + 1) {
                 MSG msg{};
+                bool got_quit = false;
                 while (::PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                    if (msg.message == WM_QUIT) {
+                        // The outer PumpMessages relies on GetMessage
+                        // returning 0 to exit. PeekMessage(PM_REMOVE) on
+                        // WM_QUIT consumes it silently, so we re-post it
+                        // and stop pumping — otherwise sta.Stop() would
+                        // hang up to 120 s waiting for render_event_.
+                        ::PostQuitMessage(static_cast<int>(msg.wParam));
+                        got_quit = true;
+                        break;
+                    }
                     ::TranslateMessage(&msg);
                     ::DispatchMessageW(&msg);
+                }
+                if (got_quit) {
+                    LH_LOG_INFO("WM_RENDERFORMAT: WM_QUIT observed mid-wait; aborting render");
+                    return;
                 }
                 // After the pump runs, a nested WM_RENDERFORMAT may have
                 // adopted pending_response_ into cached_response_ already
                 // — check before sleeping again.
                 std::lock_guard<std::mutex> lock(render_mu_);
+                if (pending_hash_ != hash) {
+                    LH_LOG_WARN("WM_RENDERFORMAT: announcement superseded during wait; aborting");
+                    return;
+                }
                 if (cached_valid_) {
                     response = cached_response_;
                     have_data = true;
@@ -808,6 +875,15 @@ void Dispatcher::OnRenderFormat(unsigned int format) {
 
         if (!have_data) {
             std::lock_guard<std::mutex> lock(render_mu_);
+            // Verify we are still rendering for the announcement we started
+            // with. A racing HandleAnnounceDelayed may have rotated
+            // pending_hash_ and refilled pending_response_ with bytes
+            // intended for a DIFFERENT content — rendering those for our
+            // original format would leak stale content to the paste app.
+            if (pending_hash_ != hash) {
+                LH_LOG_WARN("WM_RENDERFORMAT: announcement superseded after wake; aborting");
+                return;
+            }
             if (!pending_response_.empty()) {
                 response = std::move(pending_response_);
                 cached_response_ = response;

@@ -49,11 +49,23 @@ public:
     // the clipboard open. Runs synchronously inside the WM_RENDERFORMAT
     // dispatch but pumps messages via MsgWaitForMultipleObjects so the STA
     // thread does not deadlock against any nested OLE marshaling.
-    void OnRenderFormat(unsigned int format);
+    //
+    // cache_only=true is set when called from WM_RENDERALLFORMATS. In that
+    // mode we MUST NOT issue a DATA_REQUEST round-trip — the OS is about
+    // to take ownership away and stalling for tens of seconds per format
+    // would freeze the system clipboard. Instead we only render when
+    // pre-cached bytes already exist for the current announcement.
+    void OnRenderFormat(unsigned int format, bool cache_only);
 
     // Called on the helper-side shutdown path to discard any in-flight
     // render wait. Currently only used as a defensive nudge.
     void CancelPendingRender();
+
+    // Releases STA-bound COM resources (virtual file IDataObject) via a
+    // RunSync onto the still-alive STA worker. Must be invoked BEFORE
+    // sta.Stop() so the IDataObject is freed inside the apartment that
+    // owns it. Safe to call multiple times.
+    void ReleaseStaBoundResources(StaWorker* sta);
 
 private:
     void HandleAnnounceDelayed(const std::vector<std::uint8_t>& sub_payload);

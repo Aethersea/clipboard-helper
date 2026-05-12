@@ -3,10 +3,13 @@
 #include <windows.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace leviathan::clipboard_helper {
@@ -43,14 +46,17 @@ public:
     // so blocking I/O is canceled cooperatively rather than left hanging.
     void Stop();
 
-    // SendFrame writes an unsolicited length-prefixed payload on the currently
-    // connected client pipe. Safe to call from any thread; concurrent reads on
-    // the same overlapped pipe handle are fine, and writes are serialized
-    // internally so two callers cannot interleave bytes mid-frame.
+    // SendFrame enqueues a length-prefixed payload for transmission on the
+    // currently connected client pipe. Safe to call from any thread,
+    // including the STA worker on its own message-pump thread: the actual
+    // WriteFile happens on a dedicated writer thread so callers never block
+    // on pipe back-pressure.
     //
-    // Returns false if there is no active client or the write failed (the
-    // helper's PipeServer::Run loop will tear down the broken pipe and start
-    // listening for a fresh client).
+    // Returns false only when there is no active client at enqueue time or
+    // when the server is already stopping; a successful return means the
+    // frame is queued, NOT that the parent has received it. Frames are
+    // emitted to the wire in FIFO order so request replies stay paired with
+    // their requests even when unsolicited frames are pushed concurrently.
     bool SendFrame(const std::vector<std::uint8_t>& payload);
 
 private:
@@ -73,6 +79,16 @@ private:
     // the caller can safely close the handle.
     WaitResult WaitForOverlapped(HANDLE pipe, OVERLAPPED& ov);
 
+    // Body of the writer thread. Pops frames from outbound_ and writes them
+    // to active_pipe_ inline (using the existing overlapped + stop-event
+    // dance). Exits when stop_ is set and outbound_ drains.
+    void WriterThreadMain();
+
+    // Pushes a frame onto outbound_ and wakes the writer thread. Returns
+    // false when stop_ is already set. Internal helper shared by SendFrame
+    // and ServeOneClient's reply path.
+    bool EnqueueOutbound(std::vector<std::uint8_t> payload);
+
     std::wstring        pipe_name_;
     MessageHandler      handler_;
     OnConnectHandler    on_connect_;
@@ -85,10 +101,21 @@ private:
     // disconnect. Read by SendFrame via active_pipe_mu_ + write_mu_.
     HANDLE              active_pipe_{nullptr};
     std::mutex          active_pipe_mu_;
-    // Serializes all WriteFile calls onto active_pipe_. The reader runs on
-    // the accept loop's thread; the writer is shared between that thread
-    // (for request replies) and any thread that calls SendFrame.
+    // Serializes all WriteFile calls onto active_pipe_. Held only by the
+    // writer thread (and the synchronous on-connect path inside Run()
+    // before active_pipe_ is published) so a frame is never split mid-bytes.
     std::mutex          write_mu_;
+
+    // Outbound frame queue + writer thread. Decoupling pipe IO from request
+    // handlers prevents the deadlock where the STA worker blocks inside
+    // WriteFile waiting for the parent to drain, while the parent is itself
+    // waiting for a synchronous reply that needs the STA worker. Every
+    // unsolicited frame (CLIPBOARD_CHANGED, DATA_REQUEST, FILE_CHUNK_DATA)
+    // and every request reply funnels through here.
+    std::deque<std::vector<std::uint8_t>> outbound_;
+    std::mutex                            outbound_mu_;
+    std::condition_variable               outbound_cv_;
+    std::thread                           writer_thread_;
 };
 
 }  // namespace leviathan::clipboard_helper

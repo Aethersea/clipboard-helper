@@ -143,6 +143,32 @@ void ReleaseDataObject(void* data_object);
 // the STA worker can't release it out from under us.
 void AddRefDataObject(void* data_object);
 
+// ─── WM_RENDERFORMAT re-entrancy guard ───────────────────────────────────
+//
+// While the STA worker is dispatching WM_RENDERFORMAT or WM_RENDERALLFORMATS,
+// the OS already holds the clipboard open on behalf of the paste-target app.
+// Any nested OpenClipboard / OleGetClipboard call from a RunSync'd work item
+// (SET_CLIPBOARD, GET_CLIPBOARD, ANNOUNCE_DELAYED) would either burn ~150 ms
+// in OpenClipboard retries OR — worse — succeed and corrupt the in-flight
+// delayed-render handoff.
+//
+// The STA worker wraps its cb() invocation in OsClipboardHeldGuard so any
+// clipboard helper called from the same thread fails fast instead of retrying.
+// This lets the pipe thread's RunSync return promptly with an error rather
+// than wedging for up to kRenderTimeoutMs.
+
+class OsClipboardHeldGuard {
+public:
+    OsClipboardHeldGuard();
+    ~OsClipboardHeldGuard();
+    OsClipboardHeldGuard(const OsClipboardHeldGuard&) = delete;
+    OsClipboardHeldGuard& operator=(const OsClipboardHeldGuard&) = delete;
+};
+
+// Returns true iff the current thread is inside an OsClipboardHeldGuard
+// scope (i.e. inside a WM_RENDERFORMAT / WM_RENDERALLFORMATS dispatch).
+bool IsOsClipboardHeldByThisThread();
+
 // Convert UTF-8 → UTF-16 with MultiByteToWideChar. Lossy on invalid input.
 std::wstring Utf8ToWide(const std::string& s);
 std::string  WideToUtf8(const std::wstring& w);

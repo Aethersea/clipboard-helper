@@ -178,7 +178,9 @@ int wmain(int argc, wchar_t** argv) {
     leviathan::clipboard_helper::Dispatcher dispatcher(&sta, &server);
     g_dispatcher.store(&dispatcher);
     sta.SetOnClipboardChanged([&dispatcher]() { dispatcher.OnClipboardChanged(); });
-    sta.SetOnRenderFormat([&dispatcher](unsigned int fmt) { dispatcher.OnRenderFormat(fmt); });
+    sta.SetOnRenderFormat([&dispatcher](unsigned int fmt, bool cache_only) {
+        dispatcher.OnRenderFormat(fmt, cache_only);
+    });
 
     ::SetConsoleCtrlHandler(&ConsoleCtrlHandler, TRUE);
 
@@ -232,8 +234,12 @@ int wmain(int argc, wchar_t** argv) {
 
     // Order matters: clear g_dispatcher BEFORE shutting StaWorker down so
     // any late inbound frame the pipe handler is still draining cannot
-    // dereference a dead dispatcher.
+    // dereference a dead dispatcher. Then drop the STA-bound COM proxy
+    // (virtual file IDataObject) by dispatching the Release onto the STA
+    // thread while the apartment is still alive — releasing it after
+    // OleUninitialize would be undefined behavior.
     g_dispatcher.store(nullptr);
+    dispatcher.ReleaseStaBoundResources(&sta);
     sta.Stop();
 
     g_server.store(nullptr);

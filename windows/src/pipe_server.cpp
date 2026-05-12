@@ -77,6 +77,16 @@ PipeServer::PipeServer(std::wstring pipe_name, MessageHandler handler)
 }
 
 PipeServer::~PipeServer() {
+    // Run() is responsible for joining writer_thread_, but if the caller
+    // destroyed us before Run() returned (or Run() was never called yet
+    // a thread happened to be spawned, e.g. via a future direct API), we
+    // must avoid std::terminate from a joinable-thread destructor.
+    if (writer_thread_.joinable()) {
+        stop_.store(true);
+        outbound_cv_.notify_all();
+        if (stop_event_) ::SetEvent(stop_event_);
+        writer_thread_.join();
+    }
     if (stop_event_) {
         ::CloseHandle(stop_event_);
         stop_event_ = nullptr;
@@ -92,6 +102,9 @@ void PipeServer::Stop() {
     if (stop_event_) {
         ::SetEvent(stop_event_);
     }
+    // Nudge the writer thread so it observes stop_ and drains/exits
+    // promptly instead of blocking forever on the condition variable.
+    outbound_cv_.notify_all();
 }
 
 bool PipeServer::CreatePipe(HANDLE& out_handle) {
@@ -318,10 +331,9 @@ bool PipeServer::WriteFrame(HANDLE pipe, const std::vector<std::uint8_t>& payloa
 bool PipeServer::ServeOneClient(HANDLE pipe) {
     LH_LOG_INFO("Pipe client connected");
 
-    // Publish the live pipe so SendFrame can push unsolicited frames from
-    // other threads (e.g. the STA worker pushing CLIPBOARD_CHANGED on user
-    // copy). The handle is owned by Run() and remains valid until we
-    // return from this function and Run() disconnects/closes it.
+    // Publish the live pipe so SendFrame and the writer thread can route
+    // outbound frames here. The handle is owned by Run() and remains valid
+    // until we return from this function and Run() disconnects/closes it.
     {
         std::lock_guard<std::mutex> lock(active_pipe_mu_);
         active_pipe_ = pipe;
@@ -344,31 +356,77 @@ bool PipeServer::ServeOneClient(HANDLE pipe) {
         }
 
         if (!reply.empty()) {
-            if (!WriteFrame(pipe, reply)) {
-                clear_active();
-                return false;
-            }
+            // Hand the reply to the writer thread instead of writing
+            // inline. The writer thread serializes all outbound bytes
+            // FIFO, so this reply still appears before any unsolicited
+            // frame the handler may have enqueued.
+            (void)EnqueueOutbound(std::move(reply));
         }
     }
     clear_active();
     return true;
 }
 
-bool PipeServer::SendFrame(const std::vector<std::uint8_t>& payload) {
-    // Snapshot the active pipe; WriteFrame internally grabs write_mu_ to
-    // serialize against any concurrent ServeOneClient reply. If the snapshot
-    // is null we have no client; if it changes between snapshot and the
-    // actual write the WriteFile call will fail with a closed-handle error
-    // and the launcher's auto-restart path will recover.
-    HANDLE pipe = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(active_pipe_mu_);
-        pipe = active_pipe_;
-    }
-    if (pipe == nullptr) {
+bool PipeServer::EnqueueOutbound(std::vector<std::uint8_t> payload) {
+    if (stop_.load()) {
         return false;
     }
-    return WriteFrame(pipe, payload);
+    {
+        std::lock_guard<std::mutex> lock(outbound_mu_);
+        outbound_.push_back(std::move(payload));
+    }
+    outbound_cv_.notify_one();
+    return true;
+}
+
+bool PipeServer::SendFrame(const std::vector<std::uint8_t>& payload) {
+    // Return false if there is no current client so callers can log the
+    // drop. There's a benign race where active_pipe_ becomes null between
+    // this check and the writer thread's pop — in that case the frame is
+    // queued, the writer sees no pipe, and the frame is dropped silently.
+    {
+        std::lock_guard<std::mutex> lock(active_pipe_mu_);
+        if (active_pipe_ == nullptr) {
+            return false;
+        }
+    }
+    return EnqueueOutbound(payload);
+}
+
+void PipeServer::WriterThreadMain() {
+    while (true) {
+        std::vector<std::uint8_t> frame;
+        {
+            std::unique_lock<std::mutex> lock(outbound_mu_);
+            outbound_cv_.wait(lock, [this] {
+                return stop_.load() || !outbound_.empty();
+            });
+            if (outbound_.empty()) {
+                // stop_ is set and the queue drained — exit cleanly so
+                // PipeServer::Run can join us.
+                return;
+            }
+            frame = std::move(outbound_.front());
+            outbound_.pop_front();
+        }
+
+        HANDLE pipe = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(active_pipe_mu_);
+            pipe = active_pipe_;
+        }
+        if (pipe == nullptr) {
+            // No client — drop. Subsequent SendFrame calls will return
+            // false at the active_pipe_ check, so a build-up of dropped
+            // frames during reconnect windows is bounded.
+            continue;
+        }
+        // WriteFrame internally grabs write_mu_ + does the overlapped
+        // WriteFile with stop_event_ cancellation. Failure usually means
+        // the client disconnected; ServeOneClient will detect that
+        // independently via its own ReadFrame failing.
+        (void)WriteFrame(pipe, frame);
+    }
 }
 
 void PipeServer::Run() {
@@ -376,6 +434,11 @@ void PipeServer::Run() {
         LH_LOG_ERROR("PipeServer::Run aborted — stop_event_ was not initialized");
         return;
     }
+
+    // Spin up the writer thread before the accept loop so the very first
+    // on-connect frame (and any unsolicited frame that follows) has a
+    // consumer for the outbound queue.
+    writer_thread_ = std::thread([this] { WriterThreadMain(); });
 
     while (!stop_.load()) {
         HANDLE pipe = INVALID_HANDLE_VALUE;
@@ -391,22 +454,33 @@ void PipeServer::Run() {
             continue;
         }
 
+        // Publish active_pipe_ before the on-connect frame so the writer
+        // thread can route the READY handshake (and any subsequent
+        // unsolicited frame) to the new client.
+        {
+            std::lock_guard<std::mutex> lock(active_pipe_mu_);
+            active_pipe_ = pipe;
+        }
+
         // Push the on-connect frame (e.g. READY handshake) before we start
-        // pulling requests. A failure here is fatal for this client only.
+        // pulling requests. Enqueue onto the writer thread so the byte
+        // stream stays FIFO with anything else the dispatcher publishes.
         if (on_connect_) {
             auto initial = on_connect_();
             if (!initial.empty()) {
-                if (!WriteFrame(pipe, initial)) {
-                    LH_LOG_WARN("on-connect frame write failed; dropping client");
-                    ::FlushFileBuffers(pipe);
-                    ::DisconnectNamedPipe(pipe);
-                    ::CloseHandle(pipe);
-                    continue;
-                }
+                (void)EnqueueOutbound(std::move(initial));
             }
         }
 
         ServeOneClient(pipe);
+
+        // ServeOneClient clears active_pipe_ on exit, but be explicit here
+        // in case it returned via an unusual path. Without this, the
+        // writer thread could try to write to a closed handle.
+        {
+            std::lock_guard<std::mutex> lock(active_pipe_mu_);
+            active_pipe_ = nullptr;
+        }
 
         ::FlushFileBuffers(pipe);
         ::DisconnectNamedPipe(pipe);
@@ -414,6 +488,12 @@ void PipeServer::Run() {
         LH_LOG_INFO("Pipe client disconnected; ready for next connection");
     }
     LH_LOG_INFO("PipeServer::Run exiting (stop requested)");
+
+    // Wake the writer thread so it sees stop_ and exits after draining.
+    outbound_cv_.notify_all();
+    if (writer_thread_.joinable()) {
+        writer_thread_.join();
+    }
 }
 
 }  // namespace leviathan::clipboard_helper

@@ -4,6 +4,7 @@
 
 #include <cstdio>
 
+#include "clipboard_ops.h"
 #include "log.h"
 #include "wic_image.h"
 
@@ -135,14 +136,23 @@ LRESULT StaWorker::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // handler is unset we leave the format slot empty — paste in
             // the remote app will see "no data" which is the least-broken
             // outcome.
+            //
+            // WM_LEVIATHAN_WORK is *not* deferred during this handler's
+            // inner message pump: deferring would wedge any pipe-thread
+            // RunSync for up to kRenderTimeoutMs. Instead we mark the
+            // thread as "OS owns the clipboard" via OsClipboardHeldGuard
+            // so any nested clipboard-touching lambda (ClipboardScope /
+            // OleGetClipboard) bails immediately with a warning rather
+            // than burning 150 ms in OpenClipboard retries.
             OnRenderFormat cb;
             {
                 std::lock_guard<std::mutex> lock(callback_mu_);
                 cb = on_render_format_;
             }
             if (cb) {
+                OsClipboardHeldGuard render_guard;
                 try {
-                    cb(static_cast<unsigned int>(wp));
+                    cb(static_cast<unsigned int>(wp), /*cache_only=*/false);
                 } catch (...) {
                     LH_LOG_ERROR("Exception in OnRenderFormat (swallowed)");
                 }
@@ -152,9 +162,12 @@ LRESULT StaWorker::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_RENDERALLFORMATS: {
             // Fired when the system is about to deliver our advertised
             // formats to another process and we are about to lose ownership.
-            // We render every format we previously advertised by re-invoking
-            // OnRenderFormat per format. Phase 3c only advertises text and
-            // image; loop over those.
+            // We can NOT afford the 120s-per-format round-trip the regular
+            // WM_RENDERFORMAT path budgets — that would stall the whole
+            // system clipboard for minutes. Invoke the callback in cache-only
+            // mode: each format renders only if the data is already cached
+            // by a prior WM_RENDERFORMAT for the same announcement; otherwise
+            // the slot is left empty.
             OnRenderFormat cb;
             {
                 std::lock_guard<std::mutex> lock(callback_mu_);
@@ -162,14 +175,16 @@ LRESULT StaWorker::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             if (cb) {
                 const unsigned int fmts[] = { CF_UNICODETEXT, CF_DIBV5, CF_DIB, CF_HDROP };
-                ::OpenClipboard(hwnd);
-                for (unsigned int fmt : fmts) {
-                    if (::IsClipboardFormatAvailable(fmt)) {
-                        try { cb(fmt); }
-                        catch (...) { LH_LOG_ERROR("OnRenderFormat threw in WM_RENDERALLFORMATS"); }
+                if (::OpenClipboard(hwnd)) {
+                    OsClipboardHeldGuard render_guard;
+                    for (unsigned int fmt : fmts) {
+                        if (::IsClipboardFormatAvailable(fmt)) {
+                            try { cb(fmt, /*cache_only=*/true); }
+                            catch (...) { LH_LOG_ERROR("OnRenderFormat threw in WM_RENDERALLFORMATS"); }
+                        }
                     }
+                    ::CloseClipboard();
                 }
-                ::CloseClipboard();
             }
             return 0;
         }
@@ -253,6 +268,21 @@ void StaWorker::ThreadMain() {
     // Tear down. Clear the public atom *before* DestroyWindow so any thread
     // currently in HwndOwner() cannot hold a dangling HWND for long.
     hwnd_atom_.store(nullptr);
+
+    // Drain any pending work items that were queued but never dispatched
+    // (e.g. a RunSync racing the WM_QUIT that brought us here). Destroying
+    // the captured packaged_tasks without invoking them surfaces as
+    // std::future_error(broken_promise) on the caller's future.get(), which
+    // is far better than the caller hanging forever.
+    {
+        std::deque<std::function<void()>> leftover;
+        {
+            std::lock_guard<std::mutex> lock(queue_mu_);
+            leftover.swap(queue_);
+        }
+        leftover.clear();  // destructors run here, breaking pending promises.
+    }
+
     ::RemoveClipboardFormatListener(hwnd);
     ::DestroyWindow(hwnd);
     // Drop the cached WIC factory while COM is still initialized on this

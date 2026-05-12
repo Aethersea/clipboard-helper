@@ -41,7 +41,13 @@ using OnClipboardChanged = std::function<void()>;
 // already open, and the callback is expected to call SetClipboardData(fmt, ...)
 // before returning. The Win32 parameter is the requested clipboard format
 // (CF_UNICODETEXT, CF_DIBV5, etc).
-using OnRenderFormat = std::function<void(unsigned int /*format*/)>;
+//
+// cache_only=true means the dispatch path must NOT issue a parent round-trip
+// (DATA_REQUEST + wait for PROVIDE_DATA) and may only materialize data it has
+// already cached. WM_RENDERALLFORMATS uses this mode because we are about to
+// lose ownership and stalling the system clipboard for tens of seconds per
+// format is unacceptable.
+using OnRenderFormat = std::function<void(unsigned int /*format*/, bool /*cache_only*/)>;
 
 class StaWorker {
 public:

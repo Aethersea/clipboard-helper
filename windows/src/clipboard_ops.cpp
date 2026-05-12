@@ -15,12 +15,29 @@ namespace leviathan::clipboard_helper {
 
 namespace {
 
+// Counter, not bool, because the STA worker enters WM_RENDERALLFORMATS and
+// then calls cb() (which is OnRenderFormat) for each advertised format —
+// the outer guard increments, OnRenderFormat would too if it were itself
+// guarded, and the unwind must symmetrically decrement.
+thread_local int tls_os_clipboard_held = 0;
+
 // RAII wrapper around OpenClipboard / CloseClipboard. OpenClipboard contends
 // with whatever app currently owns the clipboard, so we retry briefly when
 // the OS reports another locker (typical when a paste sequence is in flight).
 class ClipboardScope {
 public:
     explicit ClipboardScope(HWND owner) {
+        if (tls_os_clipboard_held != 0) {
+            // We are nested inside a WM_RENDERFORMAT / WM_RENDERALLFORMATS
+            // dispatch. The OS already has the clipboard open on behalf of
+            // the paste-target app; retrying OpenClipboard 10×15 ms would
+            // just delay the inevitable failure and stall the RunSync the
+            // pipe thread is waiting on. Fail fast — callers translate
+            // the false return into an ERROR frame and the pipe thread
+            // continues serving the next request.
+            LH_LOG_WARN("ClipboardScope: skipped — OS holds clipboard for nested render-format dispatch");
+            return;
+        }
         constexpr int kMaxAttempts = 10;
         for (int i = 0; i < kMaxAttempts; ++i) {
             if (::OpenClipboard(owner)) {
@@ -48,6 +65,17 @@ private:
 };
 
 }  // namespace
+
+OsClipboardHeldGuard::OsClipboardHeldGuard() {
+    ++tls_os_clipboard_held;
+}
+OsClipboardHeldGuard::~OsClipboardHeldGuard() {
+    --tls_os_clipboard_held;
+}
+
+bool IsOsClipboardHeldByThisThread() {
+    return tls_os_clipboard_held != 0;
+}
 
 std::wstring Utf8ToWide(const std::string& s) {
     if (s.empty()) {
@@ -604,6 +632,14 @@ UINT GetCfFileContents() {
 bool ReadVirtualFiles(ClipboardSnapshot& out) {
     out.virtual_files.clear();
     out.virtual_data_object = nullptr;
+
+    if (tls_os_clipboard_held != 0) {
+        // Same fail-fast rationale as ClipboardScope: OleGetClipboard
+        // inside an active WM_RENDERFORMAT dispatch is unsupported and
+        // would serialize the STA against itself.
+        LH_LOG_WARN("ReadVirtualFiles: skipped — OS holds clipboard for nested render-format dispatch");
+        return false;
+    }
 
     IDataObject* obj = nullptr;
     HRESULT hr = ::OleGetClipboard(&obj);
