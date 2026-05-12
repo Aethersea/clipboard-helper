@@ -1,0 +1,13 @@
+build/
+.vcpkg/
+vcpkg_installed/
+*.exe
+*.lib
+*.obj
+*.pdb
+*.dll
+.cache/
+compile_commands.json
+.vs/
+.vscode/
+*.user

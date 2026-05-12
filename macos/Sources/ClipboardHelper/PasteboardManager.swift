@@ -10,10 +10,32 @@ final class PasteboardManager: NSObject {
     private var pollTimer: DispatchSourceTimer?
     private let pollInterval: TimeInterval
 
-    // Delayed rendering state
+    // Delayed rendering state.
+    //
+    // `pendingAnnouncement`, `renderedData`, `renderedTiff`, and
+    // `isRequestInFlight` are read on the main thread (inside
+    // provideDataForType:) and mutated on the socket I/O queue (inside
+    // provideData when PROVIDE_DATA arrives). All accesses go through
+    // `stateLock` to avoid torn reads of the Optional<Data> values and to
+    // make the "dedupe concurrent requests" check race-free.
+    private let stateLock = NSLock()
     private var pendingAnnouncement: Leviathan_ClipboardAnnouncement?
     private var renderSemaphore = DispatchSemaphore(value: 0)
     private var renderedData: Data?
+    // Pre-rendered .tiff representation, computed on the socket queue when
+    // PROVIDE_DATA arrives so that pasteboard.data(forType: .tiff) doesn't
+    // spend seconds decoding+re-encoding the image on the main thread.
+    // Set alongside `renderedData`; nil if conversion failed or the
+    // announcement isn't an image.
+    private var renderedTiff: Data?
+    // True between the moment we send a DATA_REQUEST for the current
+    // pending announcement and the moment we receive a matching
+    // PROVIDE_DATA (or the announcement is replaced/cleared). When set,
+    // subsequent provideDataForType: callbacks for OTHER types of the
+    // same announcement (e.g. PNG followed by TIFF in apps that probe
+    // both) skip sending a duplicate DATA_REQUEST and just wait on the
+    // same semaphore.
+    private var isRequestInFlight = false
     private var lastSetHash: String?
 
     // File transfer coordinator (injected by AppDelegate in client mode)
@@ -122,9 +144,13 @@ final class PasteboardManager: NSObject {
     func announceDelayed(_ announcement: Leviathan_ClipboardAnnouncement) {
         assert(Thread.isMainThread)
 
+        stateLock.lock()
         pendingAnnouncement = announcement
         lastSetHash = announcement.contentHash
         renderedData = nil
+        renderedTiff = nil
+        isRequestInFlight = false
+        stateLock.unlock()
 
         // Drain any stale semaphore signals from a previous announcement whose
         // PROVIDE_DATA arrived after we timed out. Without this, the next
@@ -171,9 +197,13 @@ final class PasteboardManager: NSObject {
         }
 
         // Store announcement so the data provider callback can reference it
+        stateLock.lock()
         pendingAnnouncement = announcement
         lastSetHash = announcement.contentHash
         renderedData = nil
+        renderedTiff = nil
+        isRequestInFlight = false
+        stateLock.unlock()
 
         // Reset file download state
         fileDownloadCondition.lock()
@@ -206,20 +236,49 @@ final class PasteboardManager: NSObject {
 
     // MARK: - Provide Data (response from parent)
 
+    /// Called on the socket I/O queue when PROVIDE_DATA arrives. Mutates
+    /// `renderedData` / `renderedTiff` / `isRequestInFlight` under
+    /// `stateLock` so the main-thread provideDataForType: reader sees a
+    /// consistent view, then signals the render semaphore.
     func provideData(_ data: Leviathan_HelperProvideData) {
+        stateLock.lock()
         // Drop data that doesn't match the current pending announcement.
         // Otherwise a late response from a previous request would either
         // wedge a stale signal in the semaphore or clobber the next paste
         // with the wrong content.
-        if let pending = pendingAnnouncement, pending.contentHash != data.contentHash {
-            Log.warning("Discarding PROVIDE_DATA: hash=\(data.contentHash) does not match pending=\(pending.contentHash)")
-            return
-        }
-        if pendingAnnouncement == nil {
+        guard let pending = pendingAnnouncement else {
+            stateLock.unlock()
             Log.warning("Discarding PROVIDE_DATA: no pending announcement (hash=\(data.contentHash))")
             return
         }
+        if pending.contentHash != data.contentHash {
+            stateLock.unlock()
+            Log.warning("Discarding PROVIDE_DATA: hash=\(data.contentHash) does not match pending=\(pending.contentHash)")
+            return
+        }
+
         renderedData = data.data
+        isRequestInFlight = false
+
+        // We're on the socket I/O queue here (background). Pre-render the
+        // .tiff representation now so the main thread doesn't pay the
+        // NSImage decode + tiffRepresentation cost inside the blocking
+        // provideDataForType: callback for apps that prefer .tiff (Preview,
+        // Pages, etc.). For an 8K screenshot this conversion is ~1–3 s on
+        // main thread, which directly translates to paste-target freeze.
+        var tiff: Data? = nil
+        if pending.contentType == .image && !data.data.isEmpty {
+            if let image = NSImage(data: data.data),
+               let tiffRep = image.tiffRepresentation {
+                tiff = tiffRep
+                Log.info("Pre-rendered .tiff representation: \(tiffRep.count) bytes")
+            } else {
+                Log.warning("Failed to pre-render .tiff; will fall back to on-demand conversion")
+            }
+        }
+        renderedTiff = tiff
+        stateLock.unlock()
+
         renderSemaphore.signal()
         Log.info("Data provided: \(data.data.count) bytes for hash=\(data.contentHash)")
     }
@@ -234,48 +293,104 @@ final class PasteboardManager: NSObject {
     // MARK: - NSPasteboard Owner (delayed rendering callbacks)
 
     @objc func pasteboard(_ sender: NSPasteboard, provideDataForType type: NSPasteboard.PasteboardType) {
+        // Snapshot the announcement + any already-cached bytes under the
+        // lock; mutate isRequestInFlight only if we're the first caller
+        // for this paste burst.
+        stateLock.lock()
         guard let announcement = pendingAnnouncement else {
+            stateLock.unlock()
             Log.warning("provideDataForType called but no pending announcement")
             return
         }
 
-        Log.info("OS requested data for type: \(type.rawValue)")
-
-        // If we already have rendered data (cached from a previous format request for the same paste),
-        // provide it directly
-        if let cached = renderedData {
-            writeDataToPasteboard(cached, type: type, announcement: announcement)
+        // Early-return for types we never declared. macOS' pasteboard
+        // server can probe an owner for types beyond what was passed to
+        // declareTypes (.pdf, .rtf, type-converted variants). Without
+        // this guard we would still run the full DATA_REQUEST round-trip
+        // + 10 s wait for those probes even though the response is empty
+        // and the pasteboard call would have failed cleanly otherwise.
+        let allowedTypes: [NSPasteboard.PasteboardType]
+        switch announcement.contentType {
+        case .text:
+            allowedTypes = [.string]
+        case .image:
+            allowedTypes = [.png, .tiff]
+        default:
+            allowedTypes = []
+        }
+        guard allowedTypes.contains(type) else {
+            stateLock.unlock()
+            Log.info("provideDataForType: ignoring undeclared type \(type.rawValue)")
             return
         }
 
-        // Send DATA_REQUEST to parent
-        var request = Leviathan_ClipboardDataRequest()
-        request.contentHash = announcement.contentHash
-        request.contentType = announcement.contentType
-        onDataRequest?(request)
+        // If we already have rendered data (cached from a previous format
+        // request for the same paste), provide it directly.
+        if let cachedData = renderedData {
+            let cachedTiff = renderedTiff
+            stateLock.unlock()
+            writeDataToPasteboard(cachedData,
+                                  cachedTiff: cachedTiff,
+                                  type: type,
+                                  announcement: announcement)
+            return
+        }
 
-        // Block waiting for PROVIDE_DATA. Matches the parent-side wait budget
-        // (120s in shen's handle_data_request_data) so we don't give up early
-        // on slow networks and let a late response wedge the semaphore.
-        let result = renderSemaphore.wait(timeout: .now() + 120)
+        // Dedupe concurrent format probes. If apps query both .png and
+        // .tiff in quick succession, only the first should fire a
+        // DATA_REQUEST; the second just waits on the same semaphore.
+        let shouldSendRequest = !isRequestInFlight
+        if shouldSendRequest {
+            isRequestInFlight = true
+        }
+        stateLock.unlock()
+
+        if shouldSendRequest {
+            Log.info("OS requested data for type: \(type.rawValue) (sending DATA_REQUEST)")
+            var request = Leviathan_ClipboardDataRequest()
+            request.contentHash = announcement.contentHash
+            request.contentType = announcement.contentType
+            onDataRequest?(request)
+        } else {
+            Log.info("OS requested data for type: \(type.rawValue) (request already in flight)")
+        }
+
+        // Block waiting for PROVIDE_DATA. Capped at 10 s — long enough for
+        // a typical WebRTC round-trip plus margin, short enough that a
+        // failed fetch presents as a brief beach-ball rather than a
+        // permanent freeze on the paste-target app's main thread. Matched
+        // by shen's handle_data_request_data deadline.
+        let result = renderSemaphore.wait(timeout: .now() + 10)
 
         if result == .timedOut {
             Log.error("Timed out waiting for data from parent (type=\(announcement.contentType))")
             return
         }
 
-        guard let data = renderedData else {
+        stateLock.lock()
+        let dataCopy = renderedData
+        let tiffCopy = renderedTiff
+        stateLock.unlock()
+
+        guard let data = dataCopy else {
             Log.error("No data received after signal")
             return
         }
 
-        writeDataToPasteboard(data, type: type, announcement: announcement)
+        writeDataToPasteboard(data,
+                              cachedTiff: tiffCopy,
+                              type: type,
+                              announcement: announcement)
     }
 
     @objc func pasteboardChangedOwner(_ sender: NSPasteboard) {
         Log.info("Pasteboard ownership lost")
+        stateLock.lock()
         pendingAnnouncement = nil
         renderedData = nil
+        renderedTiff = nil
+        isRequestInFlight = false
+        stateLock.unlock()
         // Drop any residual signal so the next announcement starts clean.
         while renderSemaphore.wait(timeout: .now()) == .success {}
     }
@@ -357,16 +472,32 @@ final class PasteboardManager: NSObject {
         return data
     }
 
-    private func writeDataToPasteboard(_ data: Data, type: NSPasteboard.PasteboardType, announcement: Leviathan_ClipboardAnnouncement) {
+    /// Write the rendered payload to the pasteboard for `type`. Callers
+    /// pass `cachedTiff` so we can avoid the expensive NSImage decode +
+    /// tiffRepresentation when the cache has already been pre-rendered on
+    /// the socket queue inside provideData().
+    private func writeDataToPasteboard(_ data: Data,
+                                       cachedTiff: Data?,
+                                       type: NSPasteboard.PasteboardType,
+                                       announcement: Leviathan_ClipboardAnnouncement) {
         switch announcement.contentType {
         case .text:
             if let text = String(data: data, encoding: .utf8) {
                 pasteboard.setString(text, forType: type)
             }
         case .image:
-            // Try to decode the data into an image for proper format conversion
-            if type == .tiff, let image = NSImage(data: data), let tiffData = image.tiffRepresentation {
-                pasteboard.setData(tiffData, forType: type)
+            if type == .tiff {
+                // Prefer the pre-rendered cache. Falling back to an
+                // on-demand decode only happens if the background
+                // conversion failed (rare; logged in provideData).
+                if let cached = cachedTiff {
+                    pasteboard.setData(cached, forType: type)
+                } else if let image = NSImage(data: data),
+                          let tiffData = image.tiffRepresentation {
+                    pasteboard.setData(tiffData, forType: type)
+                } else {
+                    pasteboard.setData(data, forType: type)
+                }
             } else {
                 pasteboard.setData(data, forType: type)
             }

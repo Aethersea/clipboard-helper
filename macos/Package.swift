@@ -20,5 +20,10 @@ let package = Package(
             ],
             path: "Sources/ClipboardHelper"
         ),
+        .testTarget(
+            name: "ClipboardHelperTests",
+            dependencies: ["ClipboardHelper"],
+            path: "Tests/ClipboardHelperTests"
+        ),
     ]
 )

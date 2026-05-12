@@ -1,0 +1,94 @@
+#pragma once
+
+#include <windows.h>
+
+#include <atomic>
+#include <cstdint>
+#include <functional>
+#include <mutex>
+#include <string>
+#include <vector>
+
+namespace leviathan::clipboard_helper {
+
+// MessageHandler receives one complete length-prefixed message payload and may
+// return a response payload to send back. Returning an empty vector means no
+// reply for this message.
+using MessageHandler = std::function<std::vector<std::uint8_t>(const std::vector<std::uint8_t>&)>;
+
+// OnConnectHandler is invoked once each time a client connects, before any
+// request is read. It returns an optional frame to push to the client (e.g. a
+// HELPER_MESSAGE_TYPE_READY handshake). Return an empty vector to send nothing.
+using OnConnectHandler = std::function<std::vector<std::uint8_t>()>;
+
+class PipeServer {
+public:
+    PipeServer(std::wstring pipe_name, MessageHandler handler);
+    ~PipeServer();
+
+    PipeServer(const PipeServer&) = delete;
+    PipeServer& operator=(const PipeServer&) = delete;
+
+    // Optionally install a handler that produces a frame to push immediately
+    // after each client connects (before reading the first request).
+    void SetOnConnect(OnConnectHandler on_connect);
+
+    // Runs the accept→serve loop until Stop() is called or the parent disappears.
+    // Single-client at a time; reconnects after each disconnect.
+    void Run();
+
+    // Asks the server loop to wind down. Safe to call from any thread (e.g. the
+    // console Ctrl handler or the parent-watchdog). Implemented by signaling a
+    // manual-reset shutdown event that the overlapped wait loops also block on,
+    // so blocking I/O is canceled cooperatively rather than left hanging.
+    void Stop();
+
+    // SendFrame writes an unsolicited length-prefixed payload on the currently
+    // connected client pipe. Safe to call from any thread; concurrent reads on
+    // the same overlapped pipe handle are fine, and writes are serialized
+    // internally so two callers cannot interleave bytes mid-frame.
+    //
+    // Returns false if there is no active client or the write failed (the
+    // helper's PipeServer::Run loop will tear down the broken pipe and start
+    // listening for a fresh client).
+    bool SendFrame(const std::vector<std::uint8_t>& payload);
+
+private:
+    enum class WaitResult {
+        Io,        // overlapped operation completed
+        Shutdown,  // stop_event_ was signaled
+        Error,     // WaitForMultipleObjects failed
+    };
+
+    bool CreatePipe(HANDLE& out_handle);
+    bool ServeOneClient(HANDLE pipe);
+    bool ConnectClient(HANDLE pipe);
+    bool ReadFrame(HANDLE pipe, std::vector<std::uint8_t>& out_payload);
+    bool WriteFrame(HANDLE pipe, const std::vector<std::uint8_t>& payload);
+    bool ReadExactOverlapped(HANDLE pipe, void* buffer, DWORD count);
+    bool WriteExactOverlapped(HANDLE pipe, const void* buffer, DWORD count);
+
+    // Waits for the overlapped I/O to complete or for stop_event_ to be set.
+    // On Shutdown, cancels the I/O and waits for the cancellation to settle so
+    // the caller can safely close the handle.
+    WaitResult WaitForOverlapped(HANDLE pipe, OVERLAPPED& ov);
+
+    std::wstring        pipe_name_;
+    MessageHandler      handler_;
+    OnConnectHandler    on_connect_;
+    std::atomic<bool>   stop_{false};
+
+    // Manual-reset event. CreateEvent failure leaves this NULL; Run() checks.
+    HANDLE              stop_event_{nullptr};
+
+    // Currently-active client pipe. Set inside ServeOneClient, cleared on
+    // disconnect. Read by SendFrame via active_pipe_mu_ + write_mu_.
+    HANDLE              active_pipe_{nullptr};
+    std::mutex          active_pipe_mu_;
+    // Serializes all WriteFile calls onto active_pipe_. The reader runs on
+    // the accept loop's thread; the writer is shared between that thread
+    // (for request replies) and any thread that calls SendFrame.
+    std::mutex          write_mu_;
+};
+
+}  // namespace leviathan::clipboard_helper

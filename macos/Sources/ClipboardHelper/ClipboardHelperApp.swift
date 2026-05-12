@@ -18,6 +18,14 @@ struct ClipboardHelperCommand: ParsableCommand {
     @Option(name: .long, help: "Operating mode: server (Go server) or client (Electron client)")
     var mode: HelperMode = .server
 
+    // Int (not Int32) for ExpressibleByArgument coverage across older
+    // swift-argument-parser versions — narrowed to pid_t at the call site.
+    @Option(
+        name: .long,
+        help: "Parent process ID. When supplied the helper watches this PID and exits if it dies, mirroring the Windows --parent-pid watchdog and preventing orphan helpers from accumulating after parent crashes / force-quits."
+    )
+    var parentPid: Int?
+
     @Flag(name: .long, help: "Enable verbose debug logging")
     var verbose: Bool = false
 
@@ -26,7 +34,11 @@ struct ClipboardHelperCommand: ParsableCommand {
         Log.info("Starting clipboard-helper (mode: \(mode), socket: \(socket))")
 
         let app = NSApplication.shared
-        let delegate = AppDelegate(socketPath: socket, mode: mode)
+        let delegate = AppDelegate(
+            socketPath: socket,
+            mode: mode,
+            parentPid: parentPid.map { pid_t($0) }
+        )
         app.delegate = delegate
 
         // Run the NSApplication event loop — this never returns
@@ -48,14 +60,19 @@ enum HelperMode: String, ExpressibleByArgument, CustomStringConvertible {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let socketPath: String
     private let mode: HelperMode
+    private let parentPid: pid_t?
     private var socketServer: SocketServer!
     private var pasteboardManager: PasteboardManager!
     private var fileTransferCoordinator: FileTransferCoordinator!
     private var progressPanel: TransferProgressPanel?
+    /// Retained for lifetime of the helper — cancelling the source unregisters
+    /// the kqueue watch, so it must outlive setupParentPidWatchdog's scope.
+    private var parentPidWatcher: DispatchSourceProcess?
 
-    init(socketPath: String, mode: HelperMode) {
+    init(socketPath: String, mode: HelperMode, parentPid: pid_t?) {
         self.socketPath = socketPath
         self.mode = mode
+        self.parentPid = parentPid
         super.init()
     }
 
@@ -64,6 +81,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
 
         setupComponents()
+        setupParentPidWatchdog()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -357,6 +375,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func currentTimestamp() -> UInt64 {
         UInt64(Date().timeIntervalSince1970 * 1000)
+    }
+
+    /// Mirror the Windows helper's parent-pid watchdog: if the parent process
+    /// (shen / leviathan) dies without sending SHUTDOWN — crash, SIGKILL,
+    /// macOS Force Quit, dev-time HMR reload — we'd otherwise survive as a
+    /// system-background orphan and accumulate across restarts. DispatchSource
+    /// .makeProcessSource hooks the kqueue NOTE_EXIT filter on Darwin, so the
+    /// kernel signals us the instant the parent disappears.
+    private func setupParentPidWatchdog() {
+        guard let pid = parentPid, pid > 0 else { return }
+
+        // Install the kqueue source FIRST, then race-check. The check has to
+        // happen after install so we can't miss an exit that lands in the gap
+        // between the check and the install. getppid() is the definitive
+        // signal on Darwin: when a parent dies its children are reparented to
+        // launchd (pid 1), so getppid() != parentPid means parent is gone.
+        let source = DispatchSource.makeProcessSource(
+            identifier: pid,
+            eventMask: .exit,
+            queue: .main
+        )
+        source.setEventHandler { [weak self] in
+            Log.info("Parent pid \(pid) exited, shutting down")
+            self?.socketServer?.stop()
+            self?.pasteboardManager?.stopPolling()
+            exit(0)
+        }
+        source.resume()
+        parentPidWatcher = source
+
+        let actualPpid = getppid()
+        if actualPpid != pid {
+            Log.info(
+                "Parent pid \(pid) already reparented to \(actualPpid) before watchdog armed — exiting"
+            )
+            exit(0)
+        }
+
+        Log.info("Watching parent pid \(pid) — will exit when parent dies")
     }
 
     private func setupSignalHandlers() {
