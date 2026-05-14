@@ -82,6 +82,11 @@ constexpr std::uint32_t kFCDataFieldError      = 6;
 // fields we actually consume on the helper side are listed.
 constexpr std::uint32_t kAnnFieldContentType = 1;
 constexpr std::uint32_t kAnnFieldContentHash = 2;
+// `repeated FileMetadata files = 6` carries the metadata the helper needs
+// to publish virtual files (CFSTR_FILEDESCRIPTORW + CFSTR_FILECONTENTS)
+// — name, size, file_id — without first downloading payload bytes.
+constexpr std::uint32_t kAnnFieldFiles       = 6;
+constexpr std::uint32_t kAnnFieldTransferId  = 7;
 
 // ClipboardDataRequest field numbers (the outbound DATA_REQUEST we send when
 // the OS fires WM_RENDERFORMAT and we need the parent to materialize data).

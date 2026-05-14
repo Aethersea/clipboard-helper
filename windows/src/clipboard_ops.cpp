@@ -523,11 +523,14 @@ bool AnnounceDelayedFormatsForType(HWND owner, proto::ClipboardContentType type)
             return dibv5_ok;
         }
         case proto::ClipboardContentType::Files:
-            // Phase 4: physical-file lazy paste via CF_HDROP. The parent
-            // provides the actual file paths on demand via PROVIDE_DATA
-            // (with the payload encoded as NUL-separated absolute paths,
-            // matching the existing macOS helper's convention).
-            return announce_delayed(CF_HDROP, "CF_HDROP");
+            // Phase 2 cutover: Files content is no longer published via
+            // SetClipboardData(CF_HDROP, NULL) — it goes through
+            // OleSetClipboard with a virtual-file IDataObject in
+            // Dispatcher::HandleAnnounceDelayed instead, so this function
+            // is never called for Files. Logged in case a regression
+            // re-routes Files here.
+            LH_LOG_WARN("AnnounceDelayedFormatsForType: Files should be served by OleSetClipboard");
+            return false;
         case proto::ClipboardContentType::Unspecified:
         default:
             LH_LOG_WARN("AnnounceDelayedFormatsForType: unsupported type");

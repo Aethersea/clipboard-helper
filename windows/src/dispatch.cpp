@@ -1,8 +1,14 @@
 #include "dispatch.h"
 
+#include <ole2.h>          // OleSetClipboard (Phase 2 virtual-file paste path)
+
+#include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <deque>
+#include <future>
 #include <string>
+#include <utility>
 
 #include "clipboard_ops.h"
 #include "helper_proto.h"
@@ -10,6 +16,7 @@
 #include "pipe_server.h"
 #include "proto_wire.h"
 #include "sta_worker.h"
+#include "virtual_file_provider.h"
 
 namespace leviathan::clipboard_helper {
 
@@ -47,11 +54,12 @@ std::vector<std::uint8_t> EncodeError(std::string_view message) {
 }
 
 // FileMetadata field numbers (from Proto/clipboard.proto). Encoded as the
-// repeated `files` sub-message of ClipboardData.
+// repeated `files` sub-message of ClipboardData / ClipboardAnnouncement.
 constexpr std::uint32_t kFMFieldFileId       = 1;
 constexpr std::uint32_t kFMFieldFilename     = 2;
 constexpr std::uint32_t kFMFieldRelativePath = 3;
 constexpr std::uint32_t kFMFieldFileSize     = 4;
+constexpr std::uint32_t kFMFieldIsDirectory  = 7;
 
 // Encode a single FileMetadata sub-message for a CF_HDROP-derived path.
 // We populate file_id (the index), filename (basename), relative_path
@@ -168,6 +176,28 @@ std::vector<std::uint8_t> EncodeDataRequest(std::string_view content_hash,
     return w.take();
 }
 
+// Phase 2 outbound FILE_CHUNK_REQUEST. Symmetric to the inbound encoder
+// EncodeFileChunkData below but for the request side of the bidirectional
+// FILE_CHUNK_* pair — used by DispatcherChunkProvider when an
+// IStream::Read needs bytes from the parent.
+std::vector<std::uint8_t> EncodeFileChunkRequestOutbound(const std::string& transfer_id,
+                                                         const std::string& file_id,
+                                                         std::uint64_t      offset,
+                                                         std::uint32_t      size) {
+    Writer inner;
+    inner.WriteStringField(proto::kFCReqFieldTransferId, transfer_id);
+    inner.WriteStringField(proto::kFCReqFieldFileId, file_id);
+    inner.WriteUint64Field(proto::kFCReqFieldOffset, offset);
+    inner.WriteUint64Field(proto::kFCReqFieldSize, size);
+
+    Writer w;
+    w.WriteEnumField(proto::kFieldType,
+                     static_cast<std::int32_t>(HelperMessageType::FileChunkRequest));
+    w.WriteSubMessageField(proto::kFieldFileChunkRequest, inner.bytes());
+    w.WriteUint64Field(proto::kFieldTimestamp, NowUnixMillis());
+    return w.take();
+}
+
 // ─── Decoders ─────────────────────────────────────────────────────────────
 
 struct ParsedHelperMessage {
@@ -182,6 +212,11 @@ struct ParsedHelperMessage {
     std::size_t         provide_data_len{0};
     const std::uint8_t* file_chunk_request_ptr{nullptr};
     std::size_t         file_chunk_request_len{0};
+    // Phase 2: FILE_CHUNK_DATA inbound — the parent's reply to a
+    // FILE_CHUNK_REQUEST we sent on behalf of an IStream::Read inside the
+    // virtual-file paste path.
+    const std::uint8_t* file_chunk_data_ptr{nullptr};
+    std::size_t         file_chunk_data_len{0};
 };
 
 bool ParseHelperMessage(const std::vector<std::uint8_t>& in, ParsedHelperMessage& out) {
@@ -220,6 +255,12 @@ bool ParseHelperMessage(const std::vector<std::uint8_t>& in, ParsedHelperMessage
             }
             continue;
         }
+        if (field == proto::kFieldFileChunkData && wire == WireType::LengthDelim) {
+            if (!r.ReadLengthDelim(out.file_chunk_data_ptr, out.file_chunk_data_len)) {
+                return false;
+            }
+            continue;
+        }
         if (!r.SkipField(wire)) return false;
     }
     return true;
@@ -241,6 +282,14 @@ struct ParsedClipboardData {
 struct ParsedAnnouncement {
     ClipboardContentType content_type{ClipboardContentType::Unspecified};
     std::string          content_hash;
+    // Phase 2: per-file metadata sub-messages (CFSTR_FILEDESCRIPTORW
+    // content). Each pair is (FileMetadata sub-message bytes, length).
+    std::vector<std::pair<const std::uint8_t*, std::size_t>> files;
+    // Announcement-scoped identifier the parent uses on the WebRTC side to
+    // route this file set's chunk fetches. Helper threads it back through
+    // every FILE_CHUNK_REQUEST so shen can resolve (transfer_id, file_id)
+    // → upstream WebRTC stream without first downloading the entire set.
+    std::string          transfer_id;
 };
 
 struct ParsedProvideData {
@@ -267,8 +316,80 @@ bool ParseAnnouncement(const std::uint8_t* data, std::size_t len, ParsedAnnounce
             out.content_hash.assign(reinterpret_cast<const char*>(p), n);
             continue;
         }
+        if (field == proto::kAnnFieldFiles && wire == WireType::LengthDelim) {
+            const std::uint8_t* p = nullptr;
+            std::size_t         n = 0;
+            if (!r.ReadLengthDelim(p, n)) return false;
+            out.files.emplace_back(p, n);
+            continue;
+        }
+        if (field == proto::kAnnFieldTransferId && wire == WireType::LengthDelim) {
+            const std::uint8_t* p = nullptr;
+            std::size_t         n = 0;
+            if (!r.ReadLengthDelim(p, n)) return false;
+            out.transfer_id.assign(reinterpret_cast<const char*>(p), n);
+            continue;
+        }
         if (!r.SkipField(wire)) return false;
     }
+    return true;
+}
+
+// Extract the subset of FileMetadata fields the virtual-file IDataObject
+// needs (file_id, filename, file_size, is_directory). Returns false when
+// the entry is malformed; callers should skip it and continue.
+bool ParseFileMetadataForVirtualFile(const std::uint8_t* data, std::size_t len,
+                                     VirtualFileSpec& out) {
+    Reader r(data, len);
+    std::string file_id;
+    std::string filename;
+    std::string relative_path;
+    std::uint64_t file_size = 0;
+    bool is_directory = false;
+    while (!r.eof()) {
+        std::uint32_t field = 0;
+        WireType      wire  = WireType::Varint;
+        if (!r.ReadTag(field, wire)) return false;
+        if (field == kFMFieldFileId && wire == WireType::LengthDelim) {
+            const std::uint8_t* p = nullptr; std::size_t n = 0;
+            if (!r.ReadLengthDelim(p, n)) return false;
+            file_id.assign(reinterpret_cast<const char*>(p), n);
+            continue;
+        }
+        if (field == kFMFieldFilename && wire == WireType::LengthDelim) {
+            const std::uint8_t* p = nullptr; std::size_t n = 0;
+            if (!r.ReadLengthDelim(p, n)) return false;
+            filename.assign(reinterpret_cast<const char*>(p), n);
+            continue;
+        }
+        if (field == kFMFieldRelativePath && wire == WireType::LengthDelim) {
+            const std::uint8_t* p = nullptr; std::size_t n = 0;
+            if (!r.ReadLengthDelim(p, n)) return false;
+            relative_path.assign(reinterpret_cast<const char*>(p), n);
+            continue;
+        }
+        if (field == kFMFieldFileSize && wire == WireType::Varint) {
+            std::uint64_t v = 0; if (!r.ReadVarint(v)) return false;
+            file_size = v;
+            continue;
+        }
+        if (field == kFMFieldIsDirectory && wire == WireType::Varint) {
+            std::uint64_t v = 0; if (!r.ReadVarint(v)) return false;
+            is_directory = (v != 0);
+            continue;
+        }
+        if (!r.SkipField(wire)) return false;
+    }
+    if (file_id.empty()) return false;
+    // Prefer relative_path (it carries the dir-tree structure the shell
+    // reconstructs at the destination); fall back to filename when the
+    // upstream didn't set one.
+    const std::string& display = !relative_path.empty() ? relative_path : filename;
+    if (display.empty()) return false;
+    out.name         = Utf8ToWide(display);
+    out.size         = file_size;
+    out.file_id      = std::move(file_id);
+    out.is_directory = is_directory;
     return true;
 }
 
@@ -325,6 +446,65 @@ bool ParseClipboardData(const std::uint8_t* data, std::size_t len, ParsedClipboa
     return true;
 }
 
+// Phase 2 inbound FILE_CHUNK_DATA payload: the parent's reply to a
+// FILE_CHUNK_REQUEST we sent on behalf of an IStream::Read inside a
+// virtual-file paste.
+struct ParsedFileChunkData {
+    std::string                 transfer_id;
+    std::string                 file_id;
+    std::uint64_t               offset{0};
+    std::vector<std::uint8_t>   data;
+    bool                        is_last{false};
+    std::string                 error;
+};
+
+bool ParseFileChunkData(const std::uint8_t* data, std::size_t len, ParsedFileChunkData& out) {
+    Reader r(data, len);
+    while (!r.eof()) {
+        std::uint32_t field = 0;
+        WireType      wire  = WireType::Varint;
+        if (!r.ReadTag(field, wire)) return false;
+        switch (field) {
+            case proto::kFCDataFieldTransferId:
+                if (wire != WireType::LengthDelim) { if (!r.SkipField(wire)) return false; continue; }
+                { const std::uint8_t* p = nullptr; std::size_t n = 0;
+                  if (!r.ReadLengthDelim(p, n)) return false;
+                  out.transfer_id.assign(reinterpret_cast<const char*>(p), n); }
+                continue;
+            case proto::kFCDataFieldFileId:
+                if (wire != WireType::LengthDelim) { if (!r.SkipField(wire)) return false; continue; }
+                { const std::uint8_t* p = nullptr; std::size_t n = 0;
+                  if (!r.ReadLengthDelim(p, n)) return false;
+                  out.file_id.assign(reinterpret_cast<const char*>(p), n); }
+                continue;
+            case proto::kFCDataFieldOffset:
+                if (wire != WireType::Varint) { if (!r.SkipField(wire)) return false; continue; }
+                { std::uint64_t v = 0; if (!r.ReadVarint(v)) return false; out.offset = v; }
+                continue;
+            case proto::kFCDataFieldData:
+                if (wire != WireType::LengthDelim) { if (!r.SkipField(wire)) return false; continue; }
+                { const std::uint8_t* p = nullptr; std::size_t n = 0;
+                  if (!r.ReadLengthDelim(p, n)) return false;
+                  out.data.assign(p, p + n); }
+                continue;
+            case proto::kFCDataFieldIsLast:
+                if (wire != WireType::Varint) { if (!r.SkipField(wire)) return false; continue; }
+                { std::uint64_t v = 0; if (!r.ReadVarint(v)) return false; out.is_last = (v != 0); }
+                continue;
+            case proto::kFCDataFieldError:
+                if (wire != WireType::LengthDelim) { if (!r.SkipField(wire)) return false; continue; }
+                { const std::uint8_t* p = nullptr; std::size_t n = 0;
+                  if (!r.ReadLengthDelim(p, n)) return false;
+                  out.error.assign(reinterpret_cast<const char*>(p), n); }
+                continue;
+            default:
+                if (!r.SkipField(wire)) return false;
+                continue;
+        }
+    }
+    return true;
+}
+
 // Extract FileMetadata.relative_path (field 3, string) from a sub-message
 // payload. Used by SET_CLIPBOARD content_type=Files to recover the
 // absolute Win32 paths the Go side encoded.
@@ -360,7 +540,308 @@ namespace {
 // the macOS helper hit in April 2026 (see vault notes via NotebookLM).
 constexpr DWORD kRenderTimeoutMs = 120 * 1000;
 
+// Phase 2: per-chunk timeout for the FILE_CHUNK_REQUEST round-trip a
+// VirtualFileStream::Read does on the STA thread. Tighter than the legacy
+// 120 s render budget because Explorer's copy dialog already shows progress
+// — long stalls now surface as visible "slow" instead of a frozen shell.
+// Caps at 30 s so a single WebRTC packet loss event doesn't pin the STA.
+constexpr DWORD kChunkTimeoutMs = 30 * 1000;
+
 }  // namespace
+
+// ─── DispatcherChunkProvider ─────────────────────────────────────────────
+//
+// Lives in the named namespace so dispatch.h can forward-declare it and
+// hold a std::unique_ptr<DispatcherChunkProvider>. The Dispatcher creates
+// one instance per process lifetime; every virtual-file IDataObject the
+// dispatcher publishes via OleSetClipboard borrows this provider via the
+// ChunkProvider* abstract base.
+//
+// Threading:
+//   * FetchChunk() runs on the STA worker thread (COM marshals the
+//     IStream::Read call there). It SendFrame's a FILE_CHUNK_REQUEST and
+//     waits for the parent's FILE_CHUNK_DATA reply via
+//     MsgWaitForMultipleObjects, which keeps the STA pumping window
+//     messages so nested COM marshaling can land.
+//   * DeliverChunk() runs on the pipe-accept thread when the parent's
+//     FILE_CHUNK_DATA arrives. It finds the matching PendingChunk by
+//     transfer_id, stages the bytes, and SetEvent's that specific waiter.
+//
+// Concurrency model:
+//   The STA's inner message pump inside FetchChunk WILL re-enter
+//   IStream::Read for sibling streams (e.g. Explorer copying multiple
+//   files in parallel — COM marshals the Read calls into the same STA,
+//   and our pump dispatches them). The provider therefore must support
+//   multiple in-flight requests at once. Each request gets its own auto-
+//   reset event and its own PendingChunk struct; the map keyed by
+//   transfer_id is the only shared state.
+class DispatcherChunkProvider final : public ChunkProvider {
+public:
+    explicit DispatcherChunkProvider(PipeServer* pipe) : pipe_(pipe) {}
+    ~DispatcherChunkProvider() override {
+        // Close any leftover events. In practice ReleaseStaBoundResources
+        // → CancelAll has already cleaned out the map by the time we get
+        // here; this is defensive against torn shutdown paths.
+        std::lock_guard<std::mutex> lock(mu_);
+        for (auto& [_, queue] : pending_) {
+            for (auto& slot : queue) {
+                if (slot && slot->event != nullptr) {
+                    ::CloseHandle(slot->event);
+                    slot->event = nullptr;
+                }
+            }
+        }
+        pending_.clear();
+    }
+
+    DispatcherChunkProvider(const DispatcherChunkProvider&)            = delete;
+    DispatcherChunkProvider& operator=(const DispatcherChunkProvider&) = delete;
+
+    HRESULT FetchChunk(const std::string&         transfer_id,
+                       const std::string&         file_id,
+                       std::uint64_t              offset,
+                       std::uint32_t              size,
+                       std::vector<std::uint8_t>& out_data,
+                       bool&                      out_is_last) override {
+        out_data.clear();
+        out_is_last = false;
+        if (pipe_ == nullptr) return E_FAIL;
+        if (transfer_id.empty() || file_id.empty()) return E_INVALIDARG;
+
+        // Correlate replies by the (transfer_id, file_id, offset) tuple
+        // the parent already echoes back in HelperFileChunkData. transfer_id
+        // is the announcement-scoped identifier shen uses to route the
+        // request upstream to leviathan; file_id+offset disambiguate
+        // requests within an announcement.
+        const std::string key = MakeKey(transfer_id, file_id, offset);
+
+        auto slot = std::make_shared<PendingChunk>();
+        slot->event = ::CreateEventW(nullptr, /*manualReset=*/FALSE,
+                                     /*initial=*/FALSE, nullptr);
+        if (slot->event == nullptr) {
+            LH_LOG_ERROR("DispatcherChunkProvider: CreateEventW failed");
+            return E_FAIL;
+        }
+        // Stage in the per-key FIFO queue BEFORE sending the frame so the
+        // pipe thread can find us as soon as the reply lands. A FIFO (not
+        // a single slot) lets us survive the edge case where two distinct
+        // streams happen to issue overlapping Reads at the SAME
+        // (transfer_id, file_id, offset) — without a queue the second
+        // staging would overwrite the first's slot and strand the first
+        // request until timeout. In practice the shell never does this,
+        // but a queue is cheap and removes a class of timeout. No
+        // process-wide "canceled" gate either — cancellation is per-slot
+        // via PendingChunk::cancelled set by CancelAll on existing waiters.
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            pending_[key].push_back(slot);
+        }
+
+        const auto frame = EncodeFileChunkRequestOutbound(transfer_id, file_id, offset, size);
+        if (!pipe_->SendFrame(frame)) {
+            std::lock_guard<std::mutex> lock(mu_);
+            EraseFromQueueLocked(key, slot);
+            ::CloseHandle(slot->event);
+            return E_FAIL;
+        }
+
+        // Wait on this request's specific event. MsgWaitForMultipleObjects
+        // with QS_ALLINPUT keeps the STA pumping so sibling IStream::Read
+        // calls (for other files in a multi-file paste) and the helper's
+        // own WM_CLIPBOARDUPDATE notifications can still dispatch.
+        const DWORD start = ::GetTickCount();
+        bool got_quit = false;
+        for (;;) {
+            const DWORD elapsed = ::GetTickCount() - start;
+            if (elapsed >= kChunkTimeoutMs) {
+                LH_LOG_WARN("DispatcherChunkProvider: FILE_CHUNK_REQUEST timeout");
+                break;
+            }
+            const DWORD remaining = kChunkTimeoutMs - elapsed;
+            const DWORD wait_result = ::MsgWaitForMultipleObjects(
+                1, &slot->event, FALSE, remaining, QS_ALLINPUT);
+            if (wait_result == WAIT_OBJECT_0) {
+                break;
+            }
+            if (wait_result == WAIT_OBJECT_0 + 1) {
+                MSG msg{};
+                while (::PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                    if (msg.message == WM_QUIT) {
+                        ::PostQuitMessage(static_cast<int>(msg.wParam));
+                        got_quit = true;
+                        break;
+                    }
+                    ::TranslateMessage(&msg);
+                    ::DispatchMessageW(&msg);
+                }
+                if (got_quit) break;
+                // After the pump, our event may have been set by a
+                // re-entrant DeliverChunk OR by CancelAll; re-check
+                // under the lock.
+                std::lock_guard<std::mutex> lock(mu_);
+                if (slot->cancelled || slot->received) break;
+                continue;
+            }
+            // WAIT_TIMEOUT, WAIT_FAILED, etc. — bail out.
+            break;
+        }
+
+        // Detach THIS specific slot from the per-key queue under the lock.
+        // Removing only our entry (vs erasing the whole key) is important
+        // when sibling FetchChunk calls for the same (transfer_id, file_id,
+        // offset) are queued — they must remain in pending_ so the next
+        // DeliverChunk can find them.
+        bool received = false;
+        bool canceled = false;
+        std::vector<std::uint8_t> data;
+        bool is_last = false;
+        std::string error;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            received = slot->received;
+            canceled = slot->cancelled;
+            data     = std::move(slot->data);
+            is_last  = slot->is_last;
+            error    = std::move(slot->error);
+            EraseFromQueueLocked(key, slot);
+        }
+        ::CloseHandle(slot->event);
+        slot->event = nullptr;
+
+        if (got_quit) {
+            return E_ABORT;
+        }
+        if (canceled && !received) {
+            return STG_E_REVERTED;
+        }
+        if (!received) {
+            return E_FAIL;  // timeout
+        }
+        if (!error.empty()) {
+            char buf[160];
+            std::snprintf(buf, sizeof(buf),
+                          "DispatcherChunkProvider: parent error: %.96s", error.c_str());
+            LH_LOG_WARN(buf);
+            return E_FAIL;
+        }
+        out_data    = std::move(data);
+        out_is_last = is_last;
+        return S_OK;
+    }
+
+    // Pipe thread → STA thread bridge. Finds the matching pending request
+    // by the (transfer_id, file_id, offset) tuple, stages bytes, and
+    // signals the request's event. Late / stale tuples are dropped quietly
+    // — that's how requests cancelled by a superseded clipboard cycle
+    // drain.
+    void DeliverChunk(const std::string&         transfer_id,
+                      const std::string&         file_id,
+                      std::uint64_t              offset,
+                      std::vector<std::uint8_t>  data,
+                      bool                       is_last,
+                      const std::string&         error) {
+        const std::string key = MakeKey(transfer_id, file_id, offset);
+        std::shared_ptr<PendingChunk> slot;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            auto it = pending_.find(key);
+            if (it == pending_.end() || it->second.empty()) {
+                return;  // no waiter (timed out / canceled / unknown)
+            }
+            // FIFO: the oldest pending request wins. Match the wire order
+            // by which FetchChunks were issued, which is also the order
+            // the parent processes them.
+            slot = it->second.front();
+            slot->data     = std::move(data);
+            slot->is_last  = is_last;
+            slot->error    = error;
+            slot->received = true;
+        }
+        if (slot->event) ::SetEvent(slot->event);
+    }
+
+    // Wake every IN-FLIGHT FetchChunk so the helper's shutdown /
+    // clipboard-ownership-rotation path doesn't hang the STA. Each
+    // existing slot is flagged cancelled and its event is set so the
+    // FetchChunk wait wakes, sees slot->cancelled, and returns
+    // STG_E_REVERTED. Crucially we do NOT install a process-wide gate
+    // here — subsequent FetchChunk calls (for a fresh ANNOUNCE_DELAYED)
+    // are accepted as normal.
+    void CancelAll() {
+        std::vector<HANDLE> events;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            for (auto& [_, queue] : pending_) {
+                for (auto& slot : queue) {
+                    if (slot) {
+                        slot->cancelled = true;
+                        if (slot->event) events.push_back(slot->event);
+                    }
+                }
+            }
+        }
+        for (HANDLE h : events) ::SetEvent(h);
+    }
+
+private:
+    struct PendingChunk {
+        HANDLE                       event{nullptr};
+        std::vector<std::uint8_t>    data;
+        bool                         is_last{false};
+        std::string                  error;
+        bool                         received{false};
+        // Set by CancelAll on existing slots when clipboard ownership
+        // rotates or the helper shuts down. Per-slot rather than process-
+        // wide so the FetchChunk path can stay open for fresh
+        // announcements after a rotation.
+        bool                         cancelled{false};
+    };
+
+    // Composite key for the in-flight FetchChunk map. The wire fields the
+    // parent echoes back (transfer_id, file_id, offset) uniquely identify
+    // a request within the current process — file_id is per-announcement
+    // and offset prevents collisions when the shell issues sequential
+    // Reads on the same stream before the previous one has returned (rare
+    // but legal). Format is "<transfer_id>|<file_id>|<decimal-offset>";
+    // both transfer_id and file_id are opaque tokens (no embedded '|' is
+    // expected, but if one slips through the worst case is a missed
+    // correlation that triggers a FetchChunk timeout, not data corruption).
+    static std::string MakeKey(const std::string& transfer_id,
+                               const std::string& file_id,
+                               std::uint64_t      offset) {
+        std::string key;
+        key.reserve(transfer_id.size() + file_id.size() + 24);
+        key.append(transfer_id);
+        key.push_back('|');
+        key.append(file_id);
+        key.push_back('|');
+        key.append(std::to_string(offset));
+        return key;
+    }
+
+    // Remove a specific slot from its per-key queue under mu_. Caller MUST
+    // hold mu_. If the queue becomes empty the key is erased so the map
+    // doesn't accumulate orphan empty queues across long-running sessions.
+    void EraseFromQueueLocked(const std::string& key,
+                              const std::shared_ptr<PendingChunk>& slot) {
+        auto it = pending_.find(key);
+        if (it == pending_.end()) return;
+        auto& q = it->second;
+        for (auto qit = q.begin(); qit != q.end(); ++qit) {
+            if (*qit == slot) { q.erase(qit); break; }
+        }
+        if (q.empty()) pending_.erase(it);
+    }
+
+    PipeServer*                                                pipe_;
+    std::mutex                                                 mu_;
+    // Per-key FIFO queue of in-flight FetchChunk requests. A queue rather
+    // than a single slot so two consumers reading the SAME
+    // (transfer_id, file_id, offset) tuple don't strand each other (see
+    // FetchChunk staging block). DeliverChunk pops front; FetchChunk
+    // cleanup removes its own slot via EraseFromQueueLocked.
+    std::unordered_map<std::string, std::deque<std::shared_ptr<PendingChunk>>> pending_;
+};
 
 Dispatcher::Dispatcher(StaWorker* sta, PipeServer* pipe)
     : sta_(sta), pipe_(pipe) {
@@ -368,20 +849,27 @@ Dispatcher::Dispatcher(StaWorker* sta, PipeServer* pipe)
     if (render_event_ == nullptr) {
         LH_LOG_ERROR("Dispatcher: CreateEventW for render_event_ failed; delayed rendering disabled");
     }
+    chunk_provider_ = std::make_unique<DispatcherChunkProvider>(pipe);
 }
 
 Dispatcher::~Dispatcher() {
-    // virtual_data_object_ should already be nullptr by this point because
-    // wmain calls ReleaseStaBoundResources(&sta) before sta.Stop(). If it
-    // is not (e.g. the caller forgot to invoke the explicit hook on the
-    // shutdown path), fall back to releasing here — the IDataObject's STA
-    // is gone, so this risks a bad call, but leaking is worse and the
-    // process is about to exit anyway.
+    // Both data-object pointers should already be nullptr by this point
+    // because wmain calls ReleaseStaBoundResources(&sta) before sta.Stop().
+    // If they are not (e.g. the caller forgot to invoke the explicit hook
+    // on a shutdown path), fall back to releasing here — the apartment is
+    // gone, so this risks a bad call, but leaking is worse and the process
+    // is about to exit anyway.
     if (virtual_data_object_) {
-        LH_LOG_WARN("Dispatcher::~Dispatcher releasing IDataObject after STA shutdown — "
+        LH_LOG_WARN("Dispatcher::~Dispatcher releasing inbound IDataObject after STA shutdown — "
                     "ReleaseStaBoundResources was not called before sta.Stop");
         ReleaseDataObject(virtual_data_object_);
         virtual_data_object_ = nullptr;
+    }
+    if (outbound_data_object_) {
+        LH_LOG_WARN("Dispatcher::~Dispatcher releasing outbound IDataObject after STA shutdown — "
+                    "ReleaseStaBoundResources was not called before sta.Stop");
+        outbound_data_object_->Release();
+        outbound_data_object_ = nullptr;
     }
     if (render_event_) {
         ::CloseHandle(render_event_);
@@ -397,31 +885,100 @@ void Dispatcher::ReleaseStaBoundResources(StaWorker* sta) {
     if (sta == nullptr) {
         return;
     }
-    // Snapshot the pointer under the lock, then Release it from the STA
-    // thread so the COM call happens inside the apartment that owns the
-    // proxy. Clearing virtual_data_object_ before the RunSync prevents a
-    // racing UpdateVirtualFiles from observing the now-released pointer.
-    void* obj = nullptr;
+    // 1. Wake any FetchChunk waiter currently blocked inside an
+    //    IStream::Read on the STA thread, so the STA can drain and the
+    //    later RunSync calls below don't deadlock against it.
+    if (chunk_provider_) {
+        chunk_provider_->CancelAll();
+    }
+
+    // 2. Release the read-side (inbound) IDataObject — the one we
+    //    AddRef'd when ReadClipboard observed virtual files on our own
+    //    local clipboard. Snapshot under the lock then Release from the
+    //    STA thread so the COM call happens in the apartment that owns
+    //    the proxy.
+    void* in_obj = nullptr;
     {
         std::lock_guard<std::mutex> lock(file_paths_mu_);
-        obj = virtual_data_object_;
+        in_obj = virtual_data_object_;
         virtual_data_object_ = nullptr;
         virtual_lindex_.clear();
     }
-    if (obj == nullptr) {
-        return;
+    if (in_obj != nullptr) {
+        try {
+            sta->RunSync([in_obj]() {
+                ReleaseDataObject(in_obj);
+            });
+        } catch (const std::future_error&) {
+            // StaWorker may already have exited (broken_promise) — release
+            // locally as last resort. Leaks are worse than UB at exit.
+            LH_LOG_WARN("ReleaseStaBoundResources: STA gone, releasing inbound IDataObject locally");
+            ReleaseDataObject(in_obj);
+        }
     }
-    try {
-        sta->RunSync([obj]() {
-            ReleaseDataObject(obj);
-        });
-    } catch (const std::future_error& e) {
-        // StaWorker may already have exited (broken_promise) — in that
-        // case there's no apartment to dispatch to and we have no choice
-        // but to release on the current thread. Better leak-free + UB
-        // than guaranteed leak at process exit.
-        LH_LOG_WARN("ReleaseStaBoundResources: STA gone, releasing locally");
-        ReleaseDataObject(obj);
+
+    // 3. Release the write-side (outbound) IDataObject — the one we
+    //    handed to OleSetClipboard inside HandleAnnounceDelayed for
+    //    content_type=Files. We hold a retained reference in
+    //    outbound_data_object_; OLE has its own. Sequence:
+    //      a. OleSetClipboard(nullptr) on the STA — OLE drops its ref.
+    //      b. Release our retained ref on the STA — final destruction.
+    //    Doing both lets the IDataObject's destructor (and any STA-bound
+    //    members) wind up inside the apartment that owns the pointer.
+    IDataObject* out_obj = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(file_paths_mu_);
+        out_obj = outbound_data_object_;
+        outbound_data_object_ = nullptr;
+    }
+    if (out_obj != nullptr) {
+        try {
+            sta->RunSync([out_obj]() {
+                // Only clear the clipboard if OUR data object is still the
+                // current owner. Otherwise a foreign app has taken over
+                // since we last checked, and OleSetClipboard(nullptr)
+                // would wipe ITS contents — exactly the bug "carefully
+                // execute reversible actions" warns against.
+                if (::OleIsCurrentClipboard(out_obj) == S_OK) {
+                    const HRESULT hr = ::OleSetClipboard(nullptr);
+                    if (FAILED(hr)) {
+                        char buf[96];
+                        std::snprintf(buf, sizeof(buf),
+                                      "OleSetClipboard(nullptr) failed: hr=0x%08lx", hr);
+                        LH_LOG_WARN(buf);
+                    }
+                }
+                out_obj->Release();
+            });
+        } catch (const std::future_error&) {
+            LH_LOG_WARN("ReleaseStaBoundResources: STA gone, releasing outbound IDataObject locally");
+            out_obj->Release();
+        }
+    }
+
+    // 4. Legacy fallback for the classical SetClipboardData owners (Text/
+    //    Image delayed rendering). Those paths leave the clipboard owner
+    //    set to our STA hwnd; clear it so the next process owning the
+    //    helper window's class doesn't see stale advertised formats.
+    const HWND owner = sta->HwndOwner();
+    if (owner != nullptr) {
+        try {
+            sta->RunSync([owner]() {
+                if (::GetClipboardOwner() == owner) {
+                    const HRESULT hr = ::OleSetClipboard(nullptr);
+                    if (FAILED(hr)) {
+                        char buf[96];
+                        std::snprintf(buf, sizeof(buf),
+                                      "OleSetClipboard(nullptr) failed: hr=0x%08lx", hr);
+                        LH_LOG_WARN(buf);
+                    }
+                }
+            });
+        } catch (const std::future_error&) {
+            // STA already exited; OLE owns the lifetime and will tear
+            // things down during process exit.
+            LH_LOG_WARN("ReleaseStaBoundResources: STA gone, skipping OleSetClipboard(nullptr)");
+        }
     }
 }
 
@@ -438,6 +995,47 @@ void Dispatcher::OnClipboardChanged() {
     // bounce content we just wrote back to the parent. The parent already
     // knows the state it asked us to set; only changes initiated by
     // OTHER apps should be relayed.
+    //
+    // Two ownership tests are needed because the classical and OLE paths
+    // expose different "owner" identities:
+    //
+    //   1. SetClipboardData / delayed-rendering (Text/Image): the owner is
+    //      our STA window (HwndOwner). GetClipboardOwner() == owner.
+    //   2. OleSetClipboard (Files virtual files): the owner is OLE's
+    //      internal clipboard window, NOT our hwnd. We instead test the
+    //      IDataObject pointer with OleIsCurrentClipboard.
+    //
+    // Both checks must be cheap and side-effect-free; they run on every
+    // WM_CLIPBOARDUPDATE delivered by AddClipboardFormatListener.
+    {
+        IDataObject* obj = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(file_paths_mu_);
+            obj = outbound_data_object_;
+        }
+        if (obj != nullptr) {
+            // S_OK = we are still current. S_FALSE = a foreign app has
+            // taken over; OLE has already dropped its ref, so release
+            // ours to balance and let the new clipboard owner's contents
+            // flow through to the parent on the next branch below.
+            if (::OleIsCurrentClipboard(obj) == S_OK) {
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lock(file_paths_mu_);
+                if (outbound_data_object_ == obj) {
+                    outbound_data_object_ = nullptr;
+                }
+            }
+            obj->Release();
+            // Also cancel any in-flight FetchChunk waiters — the streams
+            // are dead the moment ownership rotated; better to surface
+            // STG_E_REVERTED to a still-pumping consumer than let it
+            // burn 120 s in MsgWaitForMultipleObjects.
+            if (chunk_provider_) chunk_provider_->CancelAll();
+        }
+    }
+
     const HWND owner = sta_->HwndOwner();
     if (::GetClipboardOwner() == owner) {
         return;
@@ -627,6 +1225,15 @@ std::vector<std::uint8_t> Dispatcher::Handle(const std::vector<std::uint8_t>& re
                                           in.file_chunk_request_ptr + in.file_chunk_request_len));
             return {};
         }
+        case HelperMessageType::FileChunkData: {
+            if (in.file_chunk_data_ptr == nullptr) {
+                return EncodeError("FILE_CHUNK_DATA missing file_chunk_data payload");
+            }
+            HandleFileChunkData(
+                std::vector<std::uint8_t>(in.file_chunk_data_ptr,
+                                          in.file_chunk_data_ptr + in.file_chunk_data_len));
+            return {};
+        }
         case HelperMessageType::FileTransferProgress:
             // Parent → Helper progress notification; helper currently has
             // nowhere to surface it. Phase 4c may use it for a tray UI.
@@ -681,6 +1288,113 @@ void Dispatcher::HandleAnnounceDelayed(const std::vector<std::uint8_t>& sub_payl
 
     const HWND owner = sta_->HwndOwner();
     const auto ct = ann.content_type;
+
+    // Phase 2 cutover: Files content takes the virtual-file IDataObject
+    // path. Text and Image continue to use the classical
+    // SetClipboardData(fmt, NULL) + WM_RENDERFORMAT format-slot model —
+    // that path is fine because the response payloads are small (an entire
+    // text/image fits in one DATA_REQUEST round-trip) and Explorer never
+    // calls WM_RENDERFORMAT for text/image owners with progress UI.
+    if (ct == ClipboardContentType::Files) {
+        // Build VirtualFileSpec list from ann.files. Empty file lists are
+        // ignored: there is nothing useful to publish, and OleSetClipboard
+        // with an IDataObject that advertises zero items confuses
+        // consumers.
+        std::vector<VirtualFileSpec> specs;
+        specs.reserve(ann.files.size());
+        for (const auto& [p, n] : ann.files) {
+            VirtualFileSpec spec;
+            if (ParseFileMetadataForVirtualFile(p, n, spec)) {
+                specs.push_back(std::move(spec));
+            }
+        }
+        if (specs.empty()) {
+            LH_LOG_WARN("ANNOUNCE_DELAYED Files: no usable file metadata, dropping");
+            return;
+        }
+        if (ann.transfer_id.empty()) {
+            // Without a transfer_id the chunk-request reply cannot be
+            // routed back to shen's WebRTC source. Bail rather than
+            // publish an IDataObject that would later return E_FAIL on
+            // every Read.
+            LH_LOG_WARN("ANNOUNCE_DELAYED Files: missing transfer_id "
+                        "(clipboard.proto ClipboardAnnouncement field 7); "
+                        "dropping virtual-file publish");
+            return;
+        }
+
+        IDataObject* dataobj = nullptr;
+        const HRESULT cr = CreateVirtualClipboardDataObject(std::move(specs),
+                                                            ann.transfer_id,
+                                                            chunk_provider_.get(),
+                                                            &dataobj);
+        if (FAILED(cr) || dataobj == nullptr) {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf),
+                          "CreateVirtualClipboardDataObject failed: hr=0x%08lx", cr);
+            LH_LOG_WARN(buf);
+            return;
+        }
+
+        // The OleSetClipboard call AND the outbound_data_object_ swap MUST
+        // run atomically on the STA thread. Doing the swap on the pipe
+        // thread first would open a UAF window where OnClipboardChanged
+        // (also STA-bound, but dispatched between OleSetClipboard pre- and
+        // post-state) could observe outbound_data_object_ == dataobj while
+        // OleIsCurrentClipboard(dataobj) still returns S_FALSE (we haven't
+        // OleSetClipboard'd yet), erroneously Release dataobj, and let the
+        // STA later call OleSetClipboard on freed memory. Bundling both
+        // operations in the same STA work item closes that window because
+        // the STA cannot dispatch WM_CLIPBOARDUPDATE while it's busy
+        // executing this lambda. (Gemini code review #1, Phase 2.)
+        IDataObject* prev_outbound = nullptr;
+        const HRESULT sr = sta_->RunSync(
+            [this, dataobj, &prev_outbound]() -> HRESULT {
+                const HRESULT hr = ::OleSetClipboard(dataobj);
+                if (FAILED(hr)) return hr;
+                // OLE has AddRefed dataobj; record our retained ref and
+                // capture the prior outbound so the caller can release it
+                // outside the lambda (Release-on-STA-thread is fine but
+                // doing it here would risk re-entrant clipboard events
+                // before WM_CLIPBOARDUPDATE for our own OleSetClipboard
+                // has fired).
+                std::lock_guard<std::mutex> lock(file_paths_mu_);
+                prev_outbound        = outbound_data_object_;
+                outbound_data_object_ = dataobj;
+                return S_OK;
+            });
+        if (FAILED(sr)) {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf),
+                          "OleSetClipboard failed: hr=0x%08lx", sr);
+            LH_LOG_WARN(buf);
+            // OLE didn't take and we never swapped; release our refcount.
+            sta_->RunSync([dataobj]() { dataobj->Release(); });
+            return;
+        }
+
+        // OleSetClipboard succeeded — the previous outbound IDataObject
+        // (if any) has lost ownership. OLE released its ref to it the
+        // moment we OleSetClipboard'd the new one; release our retained
+        // ref now to balance. RunSync onto the STA so the COM call lands
+        // in the apartment that owns the pointer.
+        if (prev_outbound != nullptr) {
+            sta_->RunSync([prev_outbound]() { prev_outbound->Release(); });
+        }
+
+        char buf[160];
+        const std::string& h = ann.content_hash;
+        std::snprintf(buf, sizeof(buf),
+                      "ANNOUNCE_DELAYED Files accepted via OleSetClipboard: hash=%.8s%s, files=%zu, transfer_id=%.16s",
+                      h.c_str(),
+                      h.size() > 8 ? "…" : "",
+                      ann.files.size(),
+                      ann.transfer_id.c_str());
+        LH_LOG_INFO(buf);
+        return;
+    }
+
+    // Text / Image: classical delayed-rendering path.
     const bool ok = sta_->RunSync([owner, ct]() {
         return AnnounceDelayedFormatsForType(owner, ct);
     });
@@ -727,14 +1441,16 @@ void Dispatcher::HandleProvideData(const std::vector<std::uint8_t>& sub_payload)
 }
 
 void Dispatcher::OnRenderFormat(unsigned int format, bool cache_only) {
-    // Determine which ContentType this Win32 format maps to.
+    // Determine which ContentType this Win32 format maps to. Phase 2:
+    // CF_HDROP is no longer advertised by us — Files content_type goes
+    // through OleSetClipboard with a virtual-file IDataObject instead, so
+    // a WM_RENDERFORMAT for CF_HDROP can only fire if something stale is
+    // in flight. Bail with a warning rather than round-trip to the parent.
     ClipboardContentType requested = ClipboardContentType::Unspecified;
     if (format == CF_UNICODETEXT) {
         requested = ClipboardContentType::Text;
     } else if (format == CF_DIBV5 || format == CF_DIB) {
         requested = ClipboardContentType::Image;
-    } else if (format == CF_HDROP) {
-        requested = ClipboardContentType::Files;
     } else {
         char buf[96];
         std::snprintf(buf, sizeof(buf), "WM_RENDERFORMAT: unsupported format 0x%x", format);
@@ -912,9 +1628,12 @@ void Dispatcher::OnRenderFormat(unsigned int format, bool cache_only) {
             }
             break;
         case ClipboardContentType::Files:
-            if (!RenderFilesDuringWmRenderFormat(response.data(), response.size())) {
-                LH_LOG_WARN("RenderFilesDuringWmRenderFormat failed");
-            }
+            // Files no longer flow through WM_RENDERFORMAT — they're served
+            // via OleSetClipboard + IStream::Read. If we ever observe a
+            // pending render of type Files here, an announcement upstream
+            // never flipped over to the new path. Log and drop.
+            LH_LOG_WARN("OnRenderFormat: Files pending in WM_RENDERFORMAT path "
+                        "— this should be handled via OleSetClipboard");
             break;
         default:
             break;
@@ -1122,6 +1841,20 @@ void Dispatcher::HandleFileChunkRequest(const std::vector<std::uint8_t>& sub_pay
         LH_LOG_WARN("FILE_CHUNK_REQUEST: FILE_CHUNK_DATA send failed (no active client)");
     }
     ::CloseHandle(h);
+}
+
+void Dispatcher::HandleFileChunkData(const std::vector<std::uint8_t>& sub_payload) {
+    ParsedFileChunkData chunk;
+    if (!ParseFileChunkData(sub_payload.data(), sub_payload.size(), chunk)) {
+        LH_LOG_WARN("FILE_CHUNK_DATA parse failed; dropping");
+        return;
+    }
+    if (chunk_provider_ == nullptr) {
+        LH_LOG_WARN("FILE_CHUNK_DATA received but chunk_provider_ is null; dropping");
+        return;
+    }
+    chunk_provider_->DeliverChunk(chunk.transfer_id, chunk.file_id, chunk.offset,
+                                  std::move(chunk.data), chunk.is_last, chunk.error);
 }
 
 }  // namespace leviathan::clipboard_helper

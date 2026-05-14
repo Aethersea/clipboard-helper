@@ -1,20 +1,28 @@
 #pragma once
 
 #include <windows.h>
+#include <ole2.h>   // IDataObject — outbound_data_object_ pointee
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "helper_proto.h"
+#include "virtual_file_provider.h"
 
 namespace leviathan::clipboard_helper {
 
 class StaWorker;
 class PipeServer;
+// Forward declaration; full definition in dispatch.cpp. The provider is
+// the ChunkProvider impl handed to a VirtualClipboardDataObject created
+// when shen sends ANNOUNCE_DELAYED with content_type=Files — it round-
+// trips FILE_CHUNK_REQUEST / FILE_CHUNK_DATA through PipeServer.
+class DispatcherChunkProvider;
 
 // Dispatcher owns the wiring between inbound HelperMessage frames (parsed by
 // HandleHelperMessage) and the STA worker that runs the actual clipboard
@@ -77,6 +85,12 @@ private:
     // Runs on the pipe-accept thread; file I/O is independent of the STA.
     void HandleFileChunkRequest(const std::vector<std::uint8_t>& sub_payload);
 
+    // Phase 2: handles FILE_CHUNK_DATA from the parent. The bytes are the
+    // reply to a FILE_CHUNK_REQUEST our chunk_provider_ sent on behalf of
+    // an outstanding IStream::Read inside a virtual-file paste. Routes the
+    // payload to chunk_provider_ which unblocks the waiting STA caller.
+    void HandleFileChunkData(const std::vector<std::uint8_t>& sub_payload);
+
     // Refresh the local file path table whenever ReadClipboard reports
     // ContentFiles. file_paths_[i] is the absolute path matching
     // FileMetadata.file_id="i" in the CLIPBOARD_CHANGED frame the parent
@@ -127,8 +141,31 @@ private:
     // ReadClipboard snapshot updates one or the other, never both.
     //   virtual_data_object_ — AddRef'd IDataObject pointer, owned by us.
     //   virtual_lindex_      — file_id → lindex for IDataObject::GetData.
+    //
+    // This is the READ-side IDataObject (snapshot of *upstream* virtual
+    // files, e.g. an Outlook attachment the user dragged onto our local
+    // clipboard). Not to be confused with the WRITE-side IDataObject our
+    // chunk_provider_ feeds when shen publishes remote files locally —
+    // that one's lifetime is owned entirely by OLE after OleSetClipboard.
     void*                                          virtual_data_object_{nullptr};
     std::unordered_map<std::string, std::uint32_t> virtual_lindex_;
+
+    // Phase 2 virtual-file paste backend. Alive for the life of the
+    // dispatcher; outbound IDataObjects we hand to OleSetClipboard call
+    // into this provider when Explorer pulls IStream chunks.
+    std::unique_ptr<DispatcherChunkProvider> chunk_provider_;
+
+    // Outbound IDataObject currently on the OS clipboard via OleSetClipboard.
+    // Our refcount=1 retained reference; the OS has its own. Released via
+    // RunSync on the STA worker when (a) a new ANNOUNCE_DELAYED supersedes
+    // (any type), (b) a foreign clipboard owner takes over, or (c) the
+    // helper shuts down (see ReleaseStaBoundResources).
+    //
+    // Lives in the same mutex as file_paths_ — read/write only on the STA
+    // worker for OleSetClipboard calls; the pointer itself is touched
+    // exclusively from the STA thread so the existing mutex coverage is
+    // belt-and-braces.
+    IDataObject*               outbound_data_object_{nullptr};
 };
 
 }  // namespace leviathan::clipboard_helper
