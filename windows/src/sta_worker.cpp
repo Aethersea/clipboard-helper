@@ -174,7 +174,13 @@ LRESULT StaWorker::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 cb = on_render_format_;
             }
             if (cb) {
-                const unsigned int fmts[] = { CF_UNICODETEXT, CF_DIBV5, CF_DIB, CF_HDROP };
+                // CF_HDROP is intentionally absent — Phase 2 ships Files
+                // via OleSetClipboard + CFSTR_FILEDESCRIPTORW, so the
+                // format-slot model never advertises CF_HDROP for us.
+                // The WM_RENDERALLFORMATS path is only meaningful for
+                // Text + Image now; Files ownership transfer is handled
+                // entirely inside OLE's clipboard glue.
+                const unsigned int fmts[] = { CF_UNICODETEXT, CF_DIBV5, CF_DIB };
                 if (::OpenClipboard(hwnd)) {
                     OsClipboardHeldGuard render_guard;
                     for (unsigned int fmt : fmts) {

@@ -101,11 +101,6 @@ public:
                                bool&                      out_is_last) = 0;
 };
 
-// CFSTR_PERFORMEDDROPEFFECT clipboard-format atom (lazy-registered).
-// CFSTR_FILEDESCRIPTORW / CFSTR_FILECONTENTS already have getters in
-// clipboard_ops.h (GetCfFileDescriptor / GetCfFileContents) — reuse those.
-UINT GetCfPerformedDropEffect();
-
 // Create an IDataObject server that advertises CFSTR_FILEDESCRIPTORW
 // (metadata for `specs`) and CFSTR_FILECONTENTS / TYMED_ISTREAM (one
 // VirtualFileStream per file, lazily produced on demand against

@@ -97,12 +97,6 @@ bool RenderTextDuringWmRenderFormat(const std::wstring& text);
 // format code that the OS asked us to render (CF_DIB or CF_DIBV5).
 bool RenderImageDuringWmRenderFormat(UINT format, const std::uint8_t* png, std::size_t png_len);
 
-// RenderFilesDuringWmRenderFormat writes a CF_HDROP HGLOBAL built from a
-// newline-separated UTF-8 path list (matching the macOS helper's
-// PROVIDE_DATA payload convention for ContentFiles) WITHOUT opening the
-// clipboard. Call ONLY from inside a WM_RENDERFORMAT handler.
-bool RenderFilesDuringWmRenderFormat(const std::uint8_t* utf8_paths, std::size_t len);
-
 // ─── Virtual files via CFSTR_FILEDESCRIPTORW (Phase 4c) ──────────────────
 //
 // One-time registration of the CFSTR_FILEDESCRIPTORW / CFSTR_FILECONTENTS

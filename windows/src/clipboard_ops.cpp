@@ -676,11 +676,60 @@ bool ReadVirtualFiles(ClipboardSnapshot& out) {
         return false;
     }
 
-    const UINT count = fg->cItems;
+    // Defensive bounds + cap on the foreign IDataObject's FILEGROUPDESCRIPTORW.
+    // Two attacks the producer could (deliberately or via memory corruption)
+    // mount:
+    //   1. cItems advertises N entries but the HGLOBAL is sized for only K<N
+    //      → reading fg->fgd[i] for i in [K..N) walks off the end of the
+    //      allocation. UB / process crash.
+    //   2. cItems is enormous (UINT_MAX) → reserve() triggers a multi-GiB
+    //      allocation and we OOM before the bounds check kicks in.
+    // Cap symmetrically with the WRITE side (see virtual_file_provider.cpp's
+    // kMaxVirtualFileSpecs = 100,000) and verify the HGLOBAL actually
+    // contains the trailing FILEDESCRIPTORW slots cItems claims.
+    constexpr UINT kMaxInboundVirtualFiles = 100'000;
+    const SIZE_T blob_size = ::GlobalSize(sm.hGlobal);
+    UINT count = fg->cItems;
+    if (count > kMaxInboundVirtualFiles) {
+        char buf[160];
+        std::snprintf(buf, sizeof(buf),
+                      "ReadVirtualFiles: rejecting cItems=%u (cap=%u) — upstream malformed",
+                      count, kMaxInboundVirtualFiles);
+        LH_LOG_WARN(buf);
+        ::GlobalUnlock(sm.hGlobal);
+        ::ReleaseStgMedium(&sm);
+        obj->Release();
+        return false;
+    }
+    // FILEGROUPDESCRIPTORW already includes one FILEDESCRIPTORW slot; the
+    // remaining (count-1) slots tail the struct in the HGLOBAL.
+    if (count > 0) {
+        const SIZE_T needed = sizeof(FILEGROUPDESCRIPTORW) +
+                              static_cast<SIZE_T>(count - 1) * sizeof(FILEDESCRIPTORW);
+        if (needed > blob_size) {
+            char buf[160];
+            std::snprintf(buf, sizeof(buf),
+                          "ReadVirtualFiles: cItems=%u requires %zu bytes but HGLOBAL is %zu",
+                          count, static_cast<std::size_t>(needed),
+                          static_cast<std::size_t>(blob_size));
+            LH_LOG_WARN(buf);
+            ::GlobalUnlock(sm.hGlobal);
+            ::ReleaseStgMedium(&sm);
+            obj->Release();
+            return false;
+        }
+    }
+
     out.virtual_files.reserve(count);
     for (UINT i = 0; i < count; ++i) {
         const FILEDESCRIPTORW& fd = fg->fgd[i];
         VirtualFileEntry e{};
+        // fd.cFileName is documented as NUL-terminated within MAX_PATH
+        // wchars. wstring's wchar_t* constructor stops at the first L'\0',
+        // which protects us if the producer forgot the NUL — the C++
+        // string ctor would walk to the next L'\0' in the HGLOBAL, but
+        // FILEDESCRIPTORW.cFileName is MAX_PATH wchars by ABI so this
+        // can't escape into adjacent slot memory.
         e.name = fd.cFileName;
         if (fd.dwFlags & FD_FILESIZE) {
             ULARGE_INTEGER sz{};
@@ -790,59 +839,6 @@ void AddRefDataObject(void* data_object) {
     if (data_object == nullptr) return;
     auto* obj = static_cast<IDataObject*>(data_object);
     obj->AddRef();
-}
-
-bool RenderFilesDuringWmRenderFormat(const std::uint8_t* utf8_paths, std::size_t len) {
-    if (len == 0) return false;
-    // Payload convention (mirrors macOS clipboard_darwin.go): paths are
-    // joined by '\n' as a single UTF-8 byte stream. Split into individual
-    // paths and convert each to UTF-16 for the CF_HDROP DROPFILES body.
-    std::string s(reinterpret_cast<const char*>(utf8_paths), len);
-    std::vector<std::wstring> paths;
-    std::size_t start = 0;
-    for (std::size_t i = 0; i <= s.size(); ++i) {
-        if (i == s.size() || s[i] == '\n') {
-            if (i > start) {
-                paths.push_back(Utf8ToWide(s.substr(start, i - start)));
-            }
-            start = i + 1;
-        }
-    }
-    if (paths.empty()) return false;
-
-    // Reuse the CF_HDROP serialization layout from WriteClipboardFiles, but
-    // SetClipboardData WITHOUT opening the clipboard (the OS already has
-    // it open inside the WM_RENDERFORMAT dispatch we are inside of).
-    std::size_t total_wchars = 0;
-    for (const auto& p : paths) total_wchars += p.size() + 1;
-    total_wchars += 1;
-    const std::size_t total_bytes = sizeof(DROPFILES) + total_wchars * sizeof(wchar_t);
-
-    HGLOBAL hglobal = ::GlobalAlloc(GMEM_MOVEABLE, total_bytes);
-    if (hglobal == nullptr) return false;
-    auto* base = static_cast<std::uint8_t*>(::GlobalLock(hglobal));
-    if (base == nullptr) {
-        ::GlobalFree(hglobal);
-        return false;
-    }
-    auto* df = reinterpret_cast<DROPFILES*>(base);
-    std::memset(df, 0, sizeof(*df));
-    df->pFiles = sizeof(DROPFILES);
-    df->fWide  = TRUE;
-    auto* dst = reinterpret_cast<wchar_t*>(base + sizeof(DROPFILES));
-    for (const auto& p : paths) {
-        std::memcpy(dst, p.data(), p.size() * sizeof(wchar_t));
-        dst += p.size();
-        *dst++ = L'\0';
-    }
-    *dst = L'\0';
-    ::GlobalUnlock(hglobal);
-
-    if (::SetClipboardData(CF_HDROP, hglobal) == nullptr) {
-        ::GlobalFree(hglobal);
-        return false;
-    }
-    return true;
 }
 
 }  // namespace leviathan::clipboard_helper
