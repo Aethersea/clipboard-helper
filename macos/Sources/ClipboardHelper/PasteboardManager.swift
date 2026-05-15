@@ -54,6 +54,22 @@ final class PasteboardManager: NSObject {
     private var fileDownloadTriggered = false
     private let fileDownloadCondition = NSCondition()
 
+    // Phase 2 (NSFilePromiseProvider dual-publish, see plan-mac-virtual-file-
+    // clipboard.md).
+    //   * activePromiseProviders pins the per-announcement
+    //     NSFilePromiseProvider instances so they survive long enough for
+    //     `writePromiseTo:` to fire — AppKit holds only a weak reference
+    //     through the pasteboard, so without us retaining, an active
+    //     download could lose its delegate mid-flight when the autorelease
+    //     pool drains.
+    //   * activeTransferID is the announcement's transfer_id captured at
+    //     publish time. cancelTransfer(_:) on FileTransferCoordinator uses
+    //     it when a fresh announcement supersedes the current one.
+    // Mutated only on the main thread (inside announceDelayedFiles +
+    // pasteboardChangedOwner), so no lock is needed.
+    fileprivate var activePromiseProviders: [NSFilePromiseProvider] = []
+    fileprivate var activeTransferID: String?
+
     init(pollInterval: TimeInterval = 0.5) {
         self.pollInterval = pollInterval
         self.lastChangeCount = NSPasteboard.general.changeCount
@@ -89,6 +105,18 @@ final class PasteboardManager: NSObject {
 
         // Remember hash to suppress echo
         lastSetHash = data.contentHash
+
+        // Tear down any Files dual-publish state from a prior
+        // ANNOUNCE_DELAYED — SetClipboard overrides any pending lazy
+        // rendering, so in-flight FileTransferCoordinator downloads
+        // are now writing to a destination the OS no longer cares
+        // about. Cancel them to free FILE_CHUNK_REQUEST bandwidth and
+        // close Finder's progress dialog (if any) cleanly.
+        if let prevTID = activeTransferID {
+            fileTransferCoordinator?.cancelTransfer(prevTID)
+        }
+        activePromiseProviders.removeAll()
+        activeTransferID = nil
 
         pasteboard.clearContents()
 
@@ -144,6 +172,19 @@ final class PasteboardManager: NSObject {
     func announceDelayed(_ announcement: Leviathan_ClipboardAnnouncement) {
         assert(Thread.isMainThread)
 
+        // Tear down any prior Files dual-publish state regardless of the
+        // new content type. Without this, a Files announcement followed
+        // by a Text announcement would leave the previous file transfer's
+        // chunks in flight against a dead destination URL, and the prior
+        // `activePromiseProviders` would linger uselessly in memory.
+        // announceDelayedFiles re-establishes both fields below if the
+        // new type is Files; otherwise they stay cleared.
+        if let prevTID = activeTransferID {
+            fileTransferCoordinator?.cancelTransfer(prevTID)
+        }
+        activePromiseProviders.removeAll()
+        activeTransferID = nil
+
         stateLock.lock()
         pendingAnnouncement = announcement
         lastSetHash = announcement.contentHash
@@ -196,6 +237,17 @@ final class PasteboardManager: NSObject {
             return
         }
 
+        // Outer `announceDelayed` already cancelled any prior transfer
+        // and cleared activePromiseProviders / activeTransferID; we just
+        // need to re-establish them for the new Files announcement.
+        activeTransferID = announcement.transferID
+
+        // Register the new announcement with the coordinator so
+        // FILE_CHUNK_REQUEST dispatch can resolve (transfer_id, file_id) →
+        // metadata. Without this the promise path's startFileDownload
+        // would have nothing to look up in fileMetadata(transferID:fileID:).
+        fileTransferCoordinator?.registerAnnouncement(announcement)
+
         // Store announcement so the data provider callback can reference it
         stateLock.lock()
         pendingAnnouncement = announcement
@@ -214,24 +266,61 @@ final class PasteboardManager: NSObject {
         // Drain any stale semaphore signals from previous operations
         while renderSemaphore.wait(timeout: .now()) == .success {}
 
-        // Create one NSPasteboardItem per file with lazy data provider for .fileURL.
-        // When the user pastes (Cmd+V), macOS calls the NSPasteboardItemDataProvider
-        // callback which triggers the on-demand download from the remote peer.
-        var items: [NSPasteboardItem] = []
-        for (i, _) in announcement.files.enumerated() {
+        // Phase 2 dual-publish: for each file we add TWO pasteboard items —
+        //
+        //   (a) NSFilePromiseProvider  — preferred by promise-aware
+        //       consumers (Finder, Mail, Notes, modern AppKit). The OS
+        //       picks the destination URL and `writePromiseTo:` (in
+        //       FilePromiseHandler.swift) streams chunks directly there
+        //       via FileTransferCoordinator. No main-thread block.
+        //
+        //   (b) NSPasteboardItem with `.fileURL` lazy provider — fallback
+        //       for legacy/third-party consumers that only read
+        //       `.fileURL`. Goes through ensureFilesDownloaded → temp-dir
+        //       cache, the same path that existed pre-Phase-2.
+        //
+        // Consumers ask the pasteboard for specific types
+        // (readObjects(forClasses: [NSFilePromiseReceiver.self]) vs
+        // [NSURL.self]), so seeing 2N items doesn't cause double-paste —
+        // each consumer picks one type-class and gets exactly N items.
+        // The risk is a consumer that reads BOTH; in practice macOS
+        // built-ins and well-behaved third parties don't.
+        var writings: [NSPasteboardWriting] = []
+        for (i, file) in announcement.files.enumerated() {
+            let provider = makeFilePromiseProvider(for: file,
+                                                   transferID: announcement.transferID)
+            activePromiseProviders.append(provider)
+            writings.append(provider)
+
             let item = NSPasteboardItem()
-            // Store file index as immediate data on a custom type
             item.setString("\(i)", forType: .init("com.leviathan.clipboard.file-index"))
-            // Register lazy data provider for file URL
             item.setDataProvider(self, forTypes: [.fileURL])
-            items.append(item)
+            writings.append(item)
         }
 
         pasteboard.clearContents()
-        pasteboard.writeObjects(items)
+        pasteboard.writeObjects(writings)
         lastChangeCount = pasteboard.changeCount
 
-        Log.info("Announced delayed files: \(announcement.files.count) file(s) hash=\(announcement.contentHash)")
+        // Eager pre-download for the `.fileURL` fallback path. Without
+        // this, a legacy consumer that pastes triggers ensureFilesDownloaded
+        // on the main thread — which then spins the run loop for up to
+        // 300 s. With this, the download is already in flight (or done)
+        // by the time the fallback callback fires, so ensureFilesDownloaded
+        // returns from cache near-instantly.
+        //
+        // Cost: bandwidth wasted if every consumer in the session is
+        // promise-aware (Finder etc.) and so never hits the fallback.
+        // Acceptable trade-off given the UX win for legacy consumers.
+        // Note: this is a no-op in server mode (no onDataRequest wired);
+        // the dispatch_async still happens but the inner closure exits
+        // early on missing callbacks.
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            _ = self.ensureFilesDownloaded(announcement: announcement)
+        }
+
+        Log.info("Announced delayed files (dual-publish): \(announcement.files.count) file(s) hash=\(announcement.contentHash) transferID=\(announcement.transferID)")
     }
 
     // MARK: - Provide Data (response from parent)
@@ -393,6 +482,20 @@ final class PasteboardManager: NSObject {
         stateLock.unlock()
         // Drop any residual signal so the next announcement starts clean.
         while renderSemaphore.wait(timeout: .now()) == .success {}
+
+        // Phase 2: tear down dual-publish state when a foreign owner
+        // takes over. Cancel any in-flight FileTransferCoordinator
+        // downloads (writePromiseTo: callbacks already in flight will
+        // see their FileDownloadTask cancelled and surface
+        // FileDownloadError.cancelled to AppKit, which closes Finder's
+        // progress dialog without a half-written file). The providers
+        // array is dropped so retain cycles don't keep dead promises
+        // alive past their useful lifetime.
+        if let tid = activeTransferID {
+            fileTransferCoordinator?.cancelTransfer(tid)
+        }
+        activePromiseProviders.removeAll()
+        activeTransferID = nil
     }
 
     // MARK: - Private
@@ -595,6 +698,23 @@ extension PasteboardManager: NSPasteboardItemDataProvider {
             return paths
         }
 
+        // Helper: is this download still serving the same announcement we
+        // were called for? When a fresh announceDelayed rotates state, any
+        // in-flight ensureFilesDownloaded thread for the OLD announcement
+        // would otherwise (a) commit the new announcement's bytes as the
+        // old's paths (because renderedData is process-global, not per-
+        // announcement) or (b) hang the full 300 s waiting for a
+        // PROVIDE_DATA that provideData() will drop on hash mismatch.
+        // Both failure modes regressed visibly once Phase 2's eager
+        // pre-download fired ensureFilesDownloaded from a background
+        // thread parallel to the user-paste main-thread path.
+        let isStillCurrent: () -> Bool = { [weak self] in
+            guard let self = self else { return false }
+            self.stateLock.lock()
+            defer { self.stateLock.unlock() }
+            return self.pendingAnnouncement?.contentHash == announcement.contentHash
+        }
+
         // First caller triggers the download
         if !fileDownloadTriggered {
             fileDownloadTriggered = true
@@ -612,9 +732,12 @@ extension PasteboardManager: NSPasteboardItemDataProvider {
             // can appear and update during the download.
             let deadline = Date(timeIntervalSinceNow: 300)
             var completed = false
-            while !completed && Date() < deadline {
+            var superseded = false
+            while !completed && !superseded && Date() < deadline {
                 if renderSemaphore.wait(timeout: .now()) == .success {
                     completed = true
+                } else if !isStillCurrent() {
+                    superseded = true
                 } else if Thread.isMainThread {
                     RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.05))
                 } else {
@@ -623,13 +746,23 @@ extension PasteboardManager: NSPasteboardItemDataProvider {
             }
 
             fileDownloadCondition.lock()
-            if completed, let data = renderedData,
+            // Final hash check before committing: even if `completed` is
+            // true, the signal might have been delivered just after a
+            // supersede. Without this guard, we'd return announcement-B
+            // paths under announcement-A's transferID.
+            if completed, isStillCurrent(),
+               let data = renderedData,
                let str = String(data: data, encoding: .utf8) {
                 fileDownloadPaths = str.components(separatedBy: "\n").filter { !$0.isEmpty }
                 Log.info("File download complete: \(fileDownloadPaths?.count ?? 0) file(s)")
+            } else if superseded {
+                Log.warning("File download abandoned: announcement superseded mid-flight")
             } else {
                 Log.error("File download failed or timed out")
             }
+            // Broadcast unconditionally so secondary waiters (if any) wake
+            // up — they'll see isStillCurrent()==false too and exit
+            // promptly instead of timing out at 300 s.
             fileDownloadCondition.broadcast()
             let paths = fileDownloadPaths
             fileDownloadCondition.unlock()
@@ -648,6 +781,10 @@ extension PasteboardManager: NSPasteboardItemDataProvider {
             fileDownloadCondition.unlock()
             if let paths = paths {
                 return paths
+            }
+            if !isStillCurrent() {
+                Log.warning("ensureFilesDownloaded (secondary): announcement superseded, exiting")
+                return nil
             }
             if Thread.isMainThread {
                 RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.05))
