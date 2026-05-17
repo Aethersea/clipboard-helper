@@ -28,12 +28,17 @@ final class FilePromiseHandlerTests: XCTestCase {
         XCTAssertEqual(uti, UTType.json.identifier)
     }
 
-    func testUTIFallsBackToMimeWhenExtensionUnresolvable() {
-        // A filename with an extension UTType can't resolve (gibberish
-        // suffix) still falls through to the MIME pathway.
+    func testUTIDynamicallySynthesizedFromUnknownExtensionWinsOverMime() {
+        // UTType doesn't return nil for an unknown extension — it
+        // synthesises a `dyn.*` identifier. The production code
+        // therefore takes the extension path and returns the dynamic
+        // UTI, NOT the MIME-derived UTType.json. Lock in that
+        // behaviour so a future caller that expected MIME-fallback
+        // for novel extensions surfaces the surprise here.
         let uti = filePromiseUTI(forFilename: "x.zzznotreal",
                                  mimeType: "application/json")
-        XCTAssertEqual(uti, UTType.json.identifier)
+        XCTAssertTrue(uti.hasPrefix("dyn."), "expected dyn.* UTI, got \(uti)")
+        XCTAssertNotEqual(uti, UTType.json.identifier)
     }
 
     func testUTIBothEmptyReturnsPublicData() {
