@@ -11,6 +11,7 @@ add_executable(clipboard_helper_tests
     proto_wire_test.cpp
     session_test.cpp
     pipe_server_test.cpp
+    log_test.cpp
     ${CMAKE_SOURCE_DIR}/src/proto_wire.cpp
     ${CMAKE_SOURCE_DIR}/src/pipe_server.cpp
     ${CMAKE_SOURCE_DIR}/src/session.cpp
