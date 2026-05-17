@@ -3,8 +3,9 @@
 # We rebuild the small set of production sources we want to exercise as part
 # of the test executable rather than depending on an OBJECT library. This
 # keeps the test binary free of the OLE / WIC / STA transitive dependencies
-# that the production exe pulls in via dispatch.cpp and friends — proto_wire,
-# pipe_server, session, and log are the only TUs the tests need.
+# that the production exe pulls in via dispatch.cpp and friends. The codec
+# split (dispatch_codec.cpp + string_utils.cpp) is what makes that possible
+# for the wire-format surface — neither TU touches OLE.
 
 add_executable(clipboard_helper_tests
     main.cpp
@@ -12,10 +13,13 @@ add_executable(clipboard_helper_tests
     session_test.cpp
     pipe_server_test.cpp
     log_test.cpp
+    dispatch_codec_test.cpp
     ${CMAKE_SOURCE_DIR}/src/proto_wire.cpp
     ${CMAKE_SOURCE_DIR}/src/pipe_server.cpp
     ${CMAKE_SOURCE_DIR}/src/session.cpp
     ${CMAKE_SOURCE_DIR}/src/log.cpp
+    ${CMAKE_SOURCE_DIR}/src/dispatch_codec.cpp
+    ${CMAKE_SOURCE_DIR}/src/string_utils.cpp
 )
 
 target_include_directories(clipboard_helper_tests PRIVATE
