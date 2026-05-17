@@ -335,14 +335,12 @@ final class PasteboardManager: NSObject {
         // Otherwise a late response from a previous request would either
         // wedge a stale signal in the semaphore or clobber the next paste
         // with the wrong content.
-        guard let pending = pendingAnnouncement else {
+        guard let pending = pendingAnnouncement,
+              shouldAcceptProvideData(pending: pending,
+                                      incomingHash: data.contentHash) else {
+            let pendingHash = pendingAnnouncement?.contentHash ?? "<none>"
             stateLock.unlock()
-            Log.warning("Discarding PROVIDE_DATA: no pending announcement (hash=\(data.contentHash))")
-            return
-        }
-        if pending.contentHash != data.contentHash {
-            stateLock.unlock()
-            Log.warning("Discarding PROVIDE_DATA: hash=\(data.contentHash) does not match pending=\(pending.contentHash)")
+            Log.warning("Discarding PROVIDE_DATA: hash=\(data.contentHash) does not match pending=\(pendingHash)")
             return
         }
 
@@ -526,24 +524,9 @@ final class PasteboardManager: NSObject {
         if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [
             .urlReadingFileURLsOnly: true
         ]) as? [URL], !urls.isEmpty {
-            data.contentType = .files
-            localFileURLs = [:]  // reset and repopulate
-            for (i, url) in urls.enumerated() {
-                var meta = Leviathan_FileMetadata()
-                meta.fileID = "\(i)"
-                meta.filename = url.lastPathComponent
-                meta.relativePath = url.path
-                if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path) {
-                    meta.fileSize = (attrs[.size] as? UInt64) ?? 0
-                }
-                meta.isDirectory = url.hasDirectoryPath
-                data.files.append(meta)
-                localFileURLs[meta.fileID] = url  // store for FILE_CHUNK_REQUEST serving
-            }
-            // Hash based on file paths
-            let pathString = urls.map { $0.path }.joined(separator: "\n")
-            data.contentHash = sha256Hex(Data(pathString.utf8))
-            return data
+            let result = clipboardDataFromFileURLs(urls)
+            localFileURLs = result.fileIDtoURL  // store for FILE_CHUNK_REQUEST serving
+            return result.data
         }
 
         // Try text
@@ -609,13 +592,67 @@ final class PasteboardManager: NSObject {
         }
     }
 
-    private func sha256Hex(_ data: Data) -> String {
-        var hash = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
-        data.withUnsafeBytes { ptr in
-            _ = CC_SHA256(ptr.baseAddress, CC_LONG(data.count), &hash)
-        }
-        return hash.map { String(format: "%02x", $0) }.joined()
+}
+
+// MARK: - Pure helpers (file scope for unit-testability)
+
+/// Hex-encoded SHA-256 of `data`. Used as the content_hash field for
+/// every ClipboardData and ClipboardAnnouncement we emit, so the parent
+/// can dedupe and route DATA_REQUEST round-trips against a stable id.
+///
+/// File-scope so unit tests can exercise it without instantiating a
+/// PasteboardManager (which would touch NSPasteboard on init).
+func sha256Hex(_ data: Data) -> String {
+    var hash = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
+    data.withUnsafeBytes { ptr in
+        _ = CC_SHA256(ptr.baseAddress, CC_LONG(data.count), &hash)
     }
+    return hash.map { String(format: "%02x", $0) }.joined()
+}
+
+/// Build a Files-flavoured `Leviathan_ClipboardData` from a sequence of
+/// local file URLs. Side effect: also returns the `file_id → URL` map
+/// the caller stores on PasteboardManager.localFileURLs so the
+/// FILE_CHUNK_REQUEST path can resolve the upstream-announced id back
+/// to an on-disk path. Pure aside from the FileManager.attributesOfItem
+/// stat call (testable against real temp files).
+func clipboardDataFromFileURLs(
+    _ urls: [URL]
+) -> (data: Leviathan_ClipboardData, fileIDtoURL: [String: URL]) {
+    var data = Leviathan_ClipboardData()
+    data.contentType = .files
+    var fileIDtoURL: [String: URL] = [:]
+    for (i, url) in urls.enumerated() {
+        var meta = Leviathan_FileMetadata()
+        meta.fileID = "\(i)"
+        meta.filename = url.lastPathComponent
+        meta.relativePath = url.path
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path) {
+            meta.fileSize = (attrs[.size] as? UInt64) ?? 0
+        }
+        meta.isDirectory = url.hasDirectoryPath
+        data.files.append(meta)
+        fileIDtoURL[meta.fileID] = url
+    }
+    // The path-join hash is stable across runs as long as the URL set
+    // and order are identical, so the parent can dedupe echo-back
+    // CLIPBOARD_CHANGED frames against our own SET_CLIPBOARD writes.
+    let pathString = urls.map { $0.path }.joined(separator: "\n")
+    data.contentHash = sha256Hex(Data(pathString.utf8))
+    return (data, fileIDtoURL)
+}
+
+/// Decide whether an incoming HelperProvideData belongs to the current
+/// pending announcement. The "no pending announcement at all" case is
+/// the caller's responsibility (guard let pending = pendingAnnouncement
+/// before calling); this rule only encapsulates the hash-match check
+/// so it can evolve (empty-hash rejection, expiry, etc.) in one place.
+/// Pure: no I/O, no state.
+func shouldAcceptProvideData(
+    pending: Leviathan_ClipboardAnnouncement,
+    incomingHash: String
+) -> Bool {
+    return pending.contentHash == incomingHash
 }
 
 // MARK: - NSImage Extension
