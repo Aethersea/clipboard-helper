@@ -14,7 +14,6 @@ namespace leviathan::clipboard_helper {
 namespace {
 
 std::mutex g_mutex;
-std::wstring g_process_name;
 
 const char* LevelTag(LogLevel level) {
     switch (level) {
@@ -84,16 +83,6 @@ std::size_t FormatLogLine(LogLevel                              level,
     }
     const std::size_t written_unclamped = static_cast<std::size_t>(written_raw);
     return std::min<std::size_t>(written_unclamped, out_size - 1);
-}
-
-void LogInit(const std::wstring& process_name) {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    g_process_name = process_name;
-}
-
-void LogShutdown() {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    g_process_name.clear();
 }
 
 void LogMessage(LogLevel level, std::string_view msg) {

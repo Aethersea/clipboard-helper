@@ -145,8 +145,6 @@ void RunParentWatchdog(Watchdog* w) {
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
-    leviathan::clipboard_helper::LogInit(L"leviathan-clipboard-helper");
-
     const DWORD session_id = leviathan::clipboard_helper::GetCurrentSessionId();
     std::wstring pipe_name = ParsePipeNameOverride(argc, argv);
     const bool pipe_name_overridden = !pipe_name.empty();
@@ -167,7 +165,6 @@ int wmain(int argc, wchar_t** argv) {
     leviathan::clipboard_helper::StaWorker sta;
     if (!sta.Start()) {
         LH_LOG_ERROR("StaWorker failed to initialize; exiting");
-        leviathan::clipboard_helper::LogShutdown();
         return 1;
     }
 
@@ -248,6 +245,5 @@ int wmain(int argc, wchar_t** argv) {
     ::SetConsoleCtrlHandler(&ConsoleCtrlHandler, FALSE);
 
     LH_LOG_INFO("leviathan-clipboard-helper exited cleanly");
-    leviathan::clipboard_helper::LogShutdown();
     return 0;
 }

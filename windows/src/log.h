@@ -15,9 +15,6 @@ enum class LogLevel {
     Error,
 };
 
-void LogInit(const std::wstring& process_name);
-void LogShutdown();
-
 void LogMessage(LogLevel level, std::string_view msg);
 
 // FormatLogLine builds the textual log line that LogMessage would emit,
