@@ -174,7 +174,16 @@ final class SocketServerTests: XCTestCase {
         let client = try connectClient()
         defer { close(client) }
 
-        let frame = try framedBytes(for: makeReadyMessage(timestamp: 99))
+        // Use a realistic millisecond-precision Unix timestamp (~year
+        // 2026) so the encoded varint occupies enough bytes that
+        // `split = frame.count / 2` lands inside the body. A small
+        // value like 99 fits in a single varint byte and produces an
+        // 8-byte frame, which would split at byte 4 — right on the
+        // length prefix, breaking the "partial frame" precondition.
+        let realisticTimestamp: UInt64 = 1_780_000_000_000
+
+        let frame = try framedBytes(
+            for: makeReadyMessage(timestamp: realisticTimestamp))
         // Split halfway through the body so both halves are partial frames.
         let split = frame.count / 2
         XCTAssertGreaterThan(split, 4, "Frame must be larger than the length prefix")
@@ -189,7 +198,7 @@ final class SocketServerTests: XCTestCase {
         XCTAssertTrue(writeAll(client, frame.subdata(in: split..<frame.count)))
         let received = waitForMessages(count: 1, timeout: 2.0)
         XCTAssertEqual(received.count, 1)
-        XCTAssertEqual(received.first?.timestamp, 99)
+        XCTAssertEqual(received.first?.timestamp, realisticTimestamp)
     }
 
     func testOversizedFramePrefixCausesDisconnect() throws {
