@@ -12,6 +12,7 @@
 #include <shellapi.h>   // DROPFILES (with WIN32_LEAN_AND_MEAN we still need shlobj.h)
 #include <shlobj.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -40,6 +41,61 @@ OsClipboardHeldGuard::~OsClipboardHeldGuard() {
 
 bool IsOsClipboardHeldByThisThread() {
     return tls_os_clipboard_held != 0;
+}
+
+std::vector<std::uint8_t> BuildFileGroupDescriptorPayload(
+    const std::vector<VirtualFileSpec>& specs) {
+    if (specs.empty()) return {};
+    if (specs.size() > kMaxVirtualFileSpecs) return {};
+
+    // FILEGROUPDESCRIPTORW already includes one FILEDESCRIPTORW slot via
+    // its `fgd[1]` trailing array; allocate (N-1) extras when N > 1.
+    const std::size_t base  = sizeof(FILEGROUPDESCRIPTORW);
+    const std::size_t extra = (specs.size() - 1) * sizeof(FILEDESCRIPTORW);
+    const std::size_t total = base + extra;
+
+    std::vector<std::uint8_t> buf(total, 0);
+    auto* fg = reinterpret_cast<FILEGROUPDESCRIPTORW*>(buf.data());
+    fg->cItems = static_cast<UINT>(specs.size());
+    for (std::size_t i = 0; i < specs.size(); ++i) {
+        FILEDESCRIPTORW& fd = fg->fgd[i];
+        // FD_FILESIZE: nFileSizeLow/High are valid.
+        // FD_ATTRIBUTES: dwFileAttributes is valid (dir vs file).
+        // FD_PROGRESSUI: shell shows its standard copy progress dialog
+        //   while pulling bytes — visible win over the old CF_HDROP
+        //   path where Explorer just blocked silently.
+        fd.dwFlags          = FD_FILESIZE | FD_ATTRIBUTES | FD_PROGRESSUI;
+        fd.dwFileAttributes = specs[i].is_directory
+            ? FILE_ATTRIBUTE_DIRECTORY
+            : FILE_ATTRIBUTE_NORMAL;
+        fd.nFileSizeLow  = static_cast<DWORD>(specs[i].size & 0xFFFFFFFFu);
+        fd.nFileSizeHigh = static_cast<DWORD>(specs[i].size >> 32);
+
+        // cFileName is MAX_PATH wchars (NUL-terminated). Truncate over-
+        // long names so the shell drop target sees a valid string. Back
+        // off by one if we'd split a UTF-16 surrogate pair — a dangling
+        // high surrogate renders as a replacement glyph and confuses
+        // some consumers' path matching.
+        const auto& n  = specs[i].name;
+        std::size_t copy = std::min<std::size_t>(n.size(), MAX_PATH - 1);
+        if (copy < n.size() && copy > 0) {
+            const wchar_t last = n[copy - 1];
+            if (last >= 0xD800 && last <= 0xDBFF) {
+                --copy;
+            }
+        }
+        // Copy with forward-slash → backslash normalization. macOS-side
+        // FileMetadata.relative_path uses '/', and legacy shell virtual-
+        // file consumers (Outlook, 7-Zip, OneDrive Files-on-Demand) only
+        // honor '\\' for the rebuilt subdirectory structure inside the
+        // drop target.
+        for (std::size_t j = 0; j < copy; ++j) {
+            const wchar_t c = n[j];
+            fd.cFileName[j] = (c == L'/') ? L'\\' : c;
+        }
+        fd.cFileName[copy] = L'\0';
+    }
+    return buf;
 }
 
 std::vector<std::uint8_t> BuildCfDibV5Payload(int width, int height,

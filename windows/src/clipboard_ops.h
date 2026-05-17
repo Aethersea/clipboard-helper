@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "helper_proto.h"
+#include "virtual_file_spec.h"  // VirtualFileSpec — input to BuildFileGroupDescriptorPayload
 
 namespace leviathan::clipboard_helper {
 
@@ -99,6 +100,28 @@ std::vector<std::uint8_t> BuildCfHdropPayload(const std::vector<std::wstring>& p
 std::vector<std::uint8_t> BuildCfDibV5Payload(int width, int height,
                                               const std::uint8_t* bgra_pixels,
                                               std::size_t pixel_bytes_len);
+
+// Upper bound on the number of FILEDESCRIPTORW entries we'll pack into
+// a CFSTR_FILEDESCRIPTORW announcement. ~100k * 592 bytes = ~60 MiB,
+// enough headroom for any realistic copy and a clear ceiling against
+// upstream-side malformation.
+constexpr std::size_t kMaxVirtualFileSpecs = 100'000;
+
+// Build the in-memory CFSTR_FILEDESCRIPTORW payload (FILEGROUPDESCRIPTORW
+// header + N FILEDESCRIPTORW slots) from `specs`. Pure: no GlobalAlloc /
+// no IDataObject. Layout details:
+//   * cItems = specs.size()
+//   * each fgd[i].dwFlags = FD_FILESIZE | FD_ATTRIBUTES | FD_PROGRESSUI
+//   * dwFileAttributes = FILE_ATTRIBUTE_DIRECTORY for dirs, NORMAL for files
+//   * nFileSize{Low,High} split from the 64-bit spec.size
+//   * cFileName carries spec.name truncated to MAX_PATH-1 wchars, with
+//     surrogate-pair-aware truncation and forward-slash → backslash
+//     normalization (legacy shell consumers only honor '\\').
+//
+// Returns an empty vector when `specs` is empty or when its size exceeds
+// kMaxVirtualFileSpecs.
+std::vector<std::uint8_t> BuildFileGroupDescriptorPayload(
+    const std::vector<VirtualFileSpec>& specs);
 
 // ─── Delayed rendering (Phase 3c) ────────────────────────────────────────
 //

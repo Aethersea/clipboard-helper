@@ -16,20 +16,15 @@ namespace leviathan::clipboard_helper {
 
 namespace {
 
-// Defensive upper bound on the number of files we'll publish in a single
-// CFSTR_FILEDESCRIPTORW announcement. Each FILEDESCRIPTORW is ~592 bytes,
-// so the cap maps to ~60 MiB of HGLOBAL — large but bounded. A degenerate
-// or malicious announcement that asks for millions of entries would
-// otherwise drive GlobalAlloc into the ground and (more importantly)
-// freeze the STA worker building the descriptor mid-paste.
-constexpr std::size_t kMaxVirtualFileSpecs = 100'000;
-
 // Build a FILEGROUPDESCRIPTORW HGLOBAL for `specs`. Returns nullptr on
 // allocation failure; caller takes ownership of the HGLOBAL and is
 // responsible for GlobalFree (or hands it to STGMEDIUM with
 // pUnkForRelease=nullptr so ReleaseStgMedium does it for them).
+//
+// The byte layout itself comes from BuildFileGroupDescriptorPayload in
+// clipboard_format.cpp so the descriptor packing can be unit-tested
+// without OLE / STGMEDIUM in the test binary.
 HGLOBAL BuildFileGroupDescriptor(const std::vector<VirtualFileSpec>& specs) {
-    if (specs.empty()) return nullptr;
     if (specs.size() > kMaxVirtualFileSpecs) {
         char buf[160];
         std::snprintf(buf, sizeof(buf),
@@ -39,72 +34,31 @@ HGLOBAL BuildFileGroupDescriptor(const std::vector<VirtualFileSpec>& specs) {
         LH_LOG_WARN(buf);
         return nullptr;
     }
-    // FILEGROUPDESCRIPTORW already includes one FILEDESCRIPTORW slot via
-    // its `fgd[1]` flexible-ish trailing array. Allocate (N-1) extras
-    // when N > 1; for N==1 the base size already covers it.
-    const std::size_t base  = sizeof(FILEGROUPDESCRIPTORW);
-    const std::size_t extra = (specs.size() - 1) * sizeof(FILEDESCRIPTORW);
-    const std::size_t total = base + extra;
+    // Pre-scan for cFileName truncations so the operator can correlate
+    // paste failures on deeply-nested paths to MAX_PATH limits. The pure
+    // BuildFileGroupDescriptorPayload helper is silent by design; we
+    // observe at the wrapper boundary instead.
+    for (const auto& s : specs) {
+        if (s.name.size() > MAX_PATH - 1) {
+            char buf[160];
+            std::snprintf(buf, sizeof(buf),
+                          "BuildFileGroupDescriptor: truncating cFileName (%zu → ≤%zu wchars)",
+                          s.name.size(),
+                          static_cast<std::size_t>(MAX_PATH - 1));
+            LH_LOG_WARN(buf);
+        }
+    }
+    const std::vector<std::uint8_t> payload = BuildFileGroupDescriptorPayload(specs);
+    if (payload.empty()) return nullptr;
 
-    HGLOBAL h = ::GlobalAlloc(GMEM_MOVEABLE, total);
+    HGLOBAL h = ::GlobalAlloc(GMEM_MOVEABLE, payload.size());
     if (h == nullptr) return nullptr;
-    auto* fg = static_cast<FILEGROUPDESCRIPTORW*>(::GlobalLock(h));
-    if (fg == nullptr) {
+    auto* base = static_cast<std::uint8_t*>(::GlobalLock(h));
+    if (base == nullptr) {
         ::GlobalFree(h);
         return nullptr;
     }
-    std::memset(fg, 0, total);
-    fg->cItems = static_cast<UINT>(specs.size());
-    for (std::size_t i = 0; i < specs.size(); ++i) {
-        FILEDESCRIPTORW& fd = fg->fgd[i];
-        // FD_FILESIZE: nFileSizeLow/High are valid.
-        // FD_ATTRIBUTES: dwFileAttributes is valid (dir vs file).
-        // FD_PROGRESSUI: Shell may show its standard copy progress dialog
-        //   while pulling bytes — this is the user-visible win over the
-        //   old CF_HDROP path where Explorer just blocked silently.
-        fd.dwFlags          = FD_FILESIZE | FD_ATTRIBUTES | FD_PROGRESSUI;
-        fd.dwFileAttributes = specs[i].is_directory
-            ? FILE_ATTRIBUTE_DIRECTORY
-            : FILE_ATTRIBUTE_NORMAL;
-        fd.nFileSizeLow  = static_cast<DWORD>(specs[i].size & 0xFFFFFFFFu);
-        fd.nFileSizeHigh = static_cast<DWORD>(specs[i].size >> 32);
-        // cFileName is MAX_PATH wchars (NUL-terminated). Truncate if the
-        // incoming name is too long; the shell drop target will fail
-        // gracefully on the truncated name rather than crash. Log so the
-        // operator can correlate paste failures to MAX_PATH limits when
-        // remote machines copy deeply-nested paths.
-        const auto& n = specs[i].name;
-        std::size_t copy = std::min<std::size_t>(n.size(), MAX_PATH - 1);
-        // Truncating in the middle of a UTF-16 surrogate pair leaves a
-        // dangling high surrogate at cFileName[copy-1], which the shell
-        // renders as a replacement glyph and confuses some consumers'
-        // path matching. Back off by one if we'd split a pair so we
-        // truncate cleanly on a BMP/SMP boundary.
-        if (copy < n.size() && copy > 0) {
-            const wchar_t last = n[copy - 1];
-            if (last >= 0xD800 && last <= 0xDBFF) {
-                --copy;
-            }
-        }
-        if (copy < n.size()) {
-            char buf[128];
-            std::snprintf(buf, sizeof(buf),
-                          "BuildFileGroupDescriptor: truncating cFileName (%zu → %zu wchars)",
-                          n.size(), copy);
-            LH_LOG_WARN(buf);
-        }
-        // Copy with forward-slash → backslash normalization. macOS-side
-        // FileMetadata.relative_path uses '/', and shell virtual-file
-        // consumers (Outlook, 7-Zip, OneDrive Files-on-Demand) historically
-        // only honor '\\' for the rebuilt subdirectory structure inside the
-        // drop target. Modern Explorer handles '/' fine; legacy consumers
-        // silently flatten the tree instead.
-        for (std::size_t j = 0; j < copy; ++j) {
-            const wchar_t c = n[j];
-            fd.cFileName[j] = (c == L'/') ? L'\\' : c;
-        }
-        fd.cFileName[copy] = L'\0';
-    }
+    std::memcpy(base, payload.data(), payload.size());
     ::GlobalUnlock(h);
     return h;
 }
