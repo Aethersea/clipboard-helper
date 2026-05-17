@@ -16,6 +16,8 @@
 #include <cstring>
 #include <vector>
 
+#include "wic_image.h"  // kMaxImageDimension (shared cap with the WIC layer)
+
 namespace leviathan::clipboard_helper {
 
 namespace {
@@ -38,6 +40,50 @@ OsClipboardHeldGuard::~OsClipboardHeldGuard() {
 
 bool IsOsClipboardHeldByThisThread() {
     return tls_os_clipboard_held != 0;
+}
+
+std::vector<std::uint8_t> BuildCfDibV5Payload(int width, int height,
+                                              const std::uint8_t* bgra_pixels,
+                                              std::size_t pixel_bytes_len) {
+    if (width <= 0 || height <= 0) {
+        return {};
+    }
+    if (width > kMaxImageDimension || height > kMaxImageDimension) {
+        return {};
+    }
+    // width is capped at kMaxImageDimension (16384) so width*4 fits in
+    // size_t with room to spare on 32-bit and infinitely on 64-bit.
+    const std::size_t stride       = static_cast<std::size_t>(width) * 4;
+    const std::size_t expected_len = stride * static_cast<std::size_t>(height);
+    if (pixel_bytes_len != expected_len) {
+        return {};
+    }
+    if (bgra_pixels == nullptr && expected_len > 0) {
+        return {};
+    }
+
+    const std::size_t total = sizeof(BITMAPV5HEADER) + expected_len;
+    std::vector<std::uint8_t> buf(total, 0);
+
+    auto* hdr = reinterpret_cast<BITMAPV5HEADER*>(buf.data());
+    hdr->bV5Size        = sizeof(BITMAPV5HEADER);
+    hdr->bV5Width       = width;
+    hdr->bV5Height      = -height;  // top-down
+    hdr->bV5Planes      = 1;
+    hdr->bV5BitCount    = 32;
+    hdr->bV5Compression = BI_BITFIELDS;
+    hdr->bV5SizeImage   = static_cast<DWORD>(expected_len);
+    hdr->bV5RedMask     = 0x00FF0000;
+    hdr->bV5GreenMask   = 0x0000FF00;
+    hdr->bV5BlueMask    = 0x000000FF;
+    hdr->bV5AlphaMask   = 0xFF000000;
+    hdr->bV5CSType      = 0x73524742;  // 'sRGB' little-endian FourCC
+    hdr->bV5Intent      = LCS_GM_GRAPHICS;
+
+    if (expected_len > 0) {
+        std::memcpy(buf.data() + sizeof(BITMAPV5HEADER), bgra_pixels, expected_len);
+    }
+    return buf;
 }
 
 std::vector<std::uint8_t> BuildCfHdropPayload(const std::vector<std::wstring>& paths) {

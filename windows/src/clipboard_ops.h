@@ -81,6 +81,25 @@ bool WriteClipboardFiles(HWND owner, const std::vector<std::wstring>& paths);
 // of wchar_t storage, ready to be copied into an HGLOBAL by the caller.
 std::vector<std::uint8_t> BuildCfHdropPayload(const std::vector<std::wstring>& paths);
 
+// Build the in-memory CF_DIBV5 payload (BITMAPV5HEADER + 32bpp BGRA
+// pixel rows, top-down) for an image. Pure: no GlobalAlloc / no
+// SetClipboardData / no WIC.
+//
+// Layout matches what Office, Paint, and modern shell viewers expect:
+// BI_BITFIELDS compression, R/G/B/A masks in BGRA byte order, sRGB
+// color space, LCS_GM_GRAPHICS rendering intent, biHeight = -height
+// to flag the rows as top-down.
+//
+// Returns an empty vector when any of the following hold (the caller
+// treats empty as failure):
+//   * width <= 0 or height <= 0
+//   * width or height exceeds kMaxImageDimension
+//   * bgra_pixels is null when pixel_bytes_len > 0
+//   * pixel_bytes_len does not match width * 4 * height
+std::vector<std::uint8_t> BuildCfDibV5Payload(int width, int height,
+                                              const std::uint8_t* bgra_pixels,
+                                              std::size_t pixel_bytes_len);
+
 // ─── Delayed rendering (Phase 3c) ────────────────────────────────────────
 //
 // AnnounceDelayedFormatsForType opens the clipboard, empties it, and

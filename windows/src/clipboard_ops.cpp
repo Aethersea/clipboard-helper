@@ -308,16 +308,17 @@ bool WriteClipboardImagePng(HWND owner, const std::uint8_t* png, std::size_t png
         return false;
     }
 
-    // Construct a CF_DIBV5 buffer: BITMAPV5HEADER followed by pixel rows.
-    // BITMAPV5HEADER carries alpha-channel and color-space hints, so apps
-    // that respect transparency (Office, modern Windows shell viewers)
-    // composite correctly. The image is laid out top-down (biHeight < 0)
-    // and 4-byte-aligned because we're 32bpp.
-    const std::size_t stride = static_cast<std::size_t>(img.width) * 4;
-    const std::size_t pixel_bytes = stride * img.height;
-    const std::size_t total = sizeof(BITMAPV5HEADER) + pixel_bytes;
+    // BITMAPV5HEADER + pixel rows. The pure layout is in clipboard_format.cpp
+    // so it can be unit-tested without WIC. Caller-side responsibility:
+    // copy the buffer into an HGLOBAL the OS can own.
+    const std::vector<std::uint8_t> payload = BuildCfDibV5Payload(
+        img.width, img.height, img.pixels.data(), img.pixels.size());
+    if (payload.empty()) {
+        LH_LOG_ERROR("BuildCfDibV5Payload rejected the decoded image");
+        return false;
+    }
 
-    HGLOBAL hglobal = ::GlobalAlloc(GMEM_MOVEABLE, total);
+    HGLOBAL hglobal = ::GlobalAlloc(GMEM_MOVEABLE, payload.size());
     if (hglobal == nullptr) {
         LH_LOG_ERROR("GlobalAlloc(CF_DIBV5) failed");
         return false;
@@ -328,24 +329,7 @@ bool WriteClipboardImagePng(HWND owner, const std::uint8_t* png, std::size_t png
         LH_LOG_ERROR("GlobalLock(CF_DIBV5) failed");
         return false;
     }
-
-    auto* hdr = reinterpret_cast<BITMAPV5HEADER*>(base);
-    std::memset(hdr, 0, sizeof(*hdr));
-    hdr->bV5Size        = sizeof(BITMAPV5HEADER);
-    hdr->bV5Width       = img.width;
-    hdr->bV5Height      = -img.height;  // top-down
-    hdr->bV5Planes      = 1;
-    hdr->bV5BitCount    = 32;
-    hdr->bV5Compression = BI_BITFIELDS;
-    hdr->bV5SizeImage   = static_cast<DWORD>(pixel_bytes);
-    hdr->bV5RedMask     = 0x00FF0000;
-    hdr->bV5GreenMask   = 0x0000FF00;
-    hdr->bV5BlueMask    = 0x000000FF;
-    hdr->bV5AlphaMask   = 0xFF000000;
-    hdr->bV5CSType      = 0x73524742;  // 'sRGB'
-    hdr->bV5Intent      = LCS_GM_GRAPHICS;
-
-    std::memcpy(base + sizeof(BITMAPV5HEADER), img.pixels.data(), pixel_bytes);
+    std::memcpy(base, payload.data(), payload.size());
     ::GlobalUnlock(hglobal);
 
     // EmptyClipboard + SetClipboardData both require the clipboard to be
@@ -507,33 +491,18 @@ HGLOBAL BuildDibV5HGlobalFromPng(const std::uint8_t* png, std::size_t png_len) {
     if (!PngToBgra(png, png_len, img)) {
         return nullptr;
     }
-    const std::size_t stride      = static_cast<std::size_t>(img.width) * 4;
-    const std::size_t pixel_bytes = stride * img.height;
-    const std::size_t total       = sizeof(BITMAPV5HEADER) + pixel_bytes;
+    const std::vector<std::uint8_t> payload = BuildCfDibV5Payload(
+        img.width, img.height, img.pixels.data(), img.pixels.size());
+    if (payload.empty()) return nullptr;
 
-    HGLOBAL hglobal = ::GlobalAlloc(GMEM_MOVEABLE, total);
+    HGLOBAL hglobal = ::GlobalAlloc(GMEM_MOVEABLE, payload.size());
     if (hglobal == nullptr) return nullptr;
     auto* base = static_cast<std::uint8_t*>(::GlobalLock(hglobal));
     if (base == nullptr) {
         ::GlobalFree(hglobal);
         return nullptr;
     }
-    auto* hdr = reinterpret_cast<BITMAPV5HEADER*>(base);
-    std::memset(hdr, 0, sizeof(*hdr));
-    hdr->bV5Size        = sizeof(BITMAPV5HEADER);
-    hdr->bV5Width       = img.width;
-    hdr->bV5Height      = -img.height;  // top-down
-    hdr->bV5Planes      = 1;
-    hdr->bV5BitCount    = 32;
-    hdr->bV5Compression = BI_BITFIELDS;
-    hdr->bV5SizeImage   = static_cast<DWORD>(pixel_bytes);
-    hdr->bV5RedMask     = 0x00FF0000;
-    hdr->bV5GreenMask   = 0x0000FF00;
-    hdr->bV5BlueMask    = 0x000000FF;
-    hdr->bV5AlphaMask   = 0xFF000000;
-    hdr->bV5CSType      = 0x73524742;  // 'sRGB'
-    hdr->bV5Intent      = LCS_GM_GRAPHICS;
-    std::memcpy(base + sizeof(BITMAPV5HEADER), img.pixels.data(), pixel_bytes);
+    std::memcpy(base, payload.data(), payload.size());
     ::GlobalUnlock(hglobal);
     return hglobal;
 }
