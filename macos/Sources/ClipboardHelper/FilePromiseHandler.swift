@@ -64,23 +64,16 @@ extension PasteboardManager: NSFilePromiseProviderDelegate {
         _ filePromiseProvider: NSFilePromiseProvider,
         fileNameForType fileType: String
     ) -> String {
-        guard let info = filePromiseProvider.userInfo as? [String: Any],
-              let rawName = info[kPromiseUserInfoFilename] as? String,
-              !rawName.isEmpty
-        else {
-            // The promise was built without a filename — the only fallback
-            // that won't confuse the destination is a stable opaque name.
-            // The shell will rename on collision anyway.
+        let info = filePromiseProvider.userInfo as? [String: Any]
+        let rawName = info?[kPromiseUserInfoFilename] as? String ?? ""
+        if rawName.isEmpty {
+            // The promise was built without a filename — sanitizeFilename
+            // returns the stable "untitled" fallback below, but log the
+            // miss separately so production deployments can correlate
+            // bad announcements with paste failures.
             Log.warning("FilePromise: missing filename in userInfo; returning fallback")
-            return "untitled"
         }
-        // Strip any path components — a remote peer that sets
-        // `relative_path = "../../etc/passwd"` must not be able to
-        // influence WHERE the OS writes the file. AppKit honors only
-        // the basename anyway, but defense-in-depth keeps the contract
-        // explicit on our side.
-        let sanitized = (rawName as NSString).lastPathComponent
-        return sanitized.isEmpty ? "untitled" : sanitized
+        return sanitizeFilename(rawName)
     }
 
     func filePromiseProvider(
@@ -160,6 +153,24 @@ extension PasteboardManager: NSFilePromiseProviderDelegate {
 }
 
 // MARK: - UTI lookup
+
+/// Sanitize a remote-announced filename into a basename safe to hand
+/// the OS. Strips any path components so a malicious or accidental
+/// `relative_path = "../../etc/passwd"` cannot influence WHERE the OS
+/// writes the file — AppKit honors only the basename anyway, but
+/// defense-in-depth keeps the contract explicit on our side.
+///
+/// Returns "untitled" when the input is empty OR when the basename
+/// after stripping is empty (e.g. trailing-slash paths like "a/b/").
+///
+/// Internal to the file so unit tests can exercise it without
+/// instantiating an NSFilePromiseProvider. Pure: no I/O, no global
+/// state.
+func sanitizeFilename(_ rawName: String) -> String {
+    guard !rawName.isEmpty else { return "untitled" }
+    let basename = (rawName as NSString).lastPathComponent
+    return basename.isEmpty ? "untitled" : basename
+}
 
 /// Resolve a UTI for an NSFilePromiseProvider given the announcement's
 /// filename + MIME hint. Strategy:
