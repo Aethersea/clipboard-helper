@@ -15,19 +15,18 @@ namespace leviathan::clipboard_helper {
 
 namespace {
 
-// Counter, not bool, because the STA worker enters WM_RENDERALLFORMATS and
-// then calls cb() (which is OnRenderFormat) for each advertised format —
-// the outer guard increments, OnRenderFormat would too if it were itself
-// guarded, and the unwind must symmetrically decrement.
-thread_local int tls_os_clipboard_held = 0;
-
 // RAII wrapper around OpenClipboard / CloseClipboard. OpenClipboard contends
 // with whatever app currently owns the clipboard, so we retry briefly when
 // the OS reports another locker (typical when a paste sequence is in flight).
+//
+// The thread-local re-entrancy guard (OsClipboardHeldGuard) lives in
+// clipboard_format.cpp; we query it via IsOsClipboardHeldByThisThread()
+// rather than touching the thread_local directly so the implementation
+// can stay testable in isolation.
 class ClipboardScope {
 public:
     explicit ClipboardScope(HWND owner) {
-        if (tls_os_clipboard_held != 0) {
+        if (IsOsClipboardHeldByThisThread()) {
             // We are nested inside a WM_RENDERFORMAT / WM_RENDERALLFORMATS
             // dispatch. The OS already has the clipboard open on behalf of
             // the paste-target app; retrying OpenClipboard 10×15 ms would
@@ -63,21 +62,6 @@ public:
 private:
     bool opened_{false};
 };
-
-}  // namespace
-
-OsClipboardHeldGuard::OsClipboardHeldGuard() {
-    ++tls_os_clipboard_held;
-}
-OsClipboardHeldGuard::~OsClipboardHeldGuard() {
-    --tls_os_clipboard_held;
-}
-
-bool IsOsClipboardHeldByThisThread() {
-    return tls_os_clipboard_held != 0;
-}
-
-namespace {
 
 // Read CF_DIBV5 (preferred) or CF_DIB into a BgraImage. CF_DIB is just
 // BITMAPINFOHEADER + (optional palette) + pixel rows, with rows bottom-up
@@ -391,19 +375,12 @@ bool WriteClipboardImagePng(HWND owner, const std::uint8_t* png, std::size_t png
 bool WriteClipboardFiles(HWND owner, const std::vector<std::wstring>& paths) {
     if (paths.empty()) return false;
 
-    // CF_HDROP wire layout:
-    //   DROPFILES { pFiles=sizeof(DROPFILES), fWide=TRUE, pt={0,0}, fNC=0 }
-    //   <path0> NUL <path1> NUL ... <pathN-1> NUL NUL
-    //
-    // The double NUL ends the list. All paths share a single NUL each
-    // and the buffer is terminated by an extra NUL — DragQueryFileW
-    // walks the buffer by that convention.
-    std::size_t total_wchars = 0;
-    for (const auto& p : paths) total_wchars += p.size() + 1;  // +1 for per-path NUL
-    total_wchars += 1;  // final double-NUL terminator
+    // Build the DROPFILES + UTF-16 path list in a plain buffer first; the
+    // pure layout lives in clipboard_format.cpp so it can be unit-tested.
+    const std::vector<std::uint8_t> payload = BuildCfHdropPayload(paths);
+    if (payload.empty()) return false;
 
-    const std::size_t total_bytes = sizeof(DROPFILES) + total_wchars * sizeof(wchar_t);
-    HGLOBAL hglobal = ::GlobalAlloc(GMEM_MOVEABLE, total_bytes);
+    HGLOBAL hglobal = ::GlobalAlloc(GMEM_MOVEABLE, payload.size());
     if (hglobal == nullptr) {
         LH_LOG_ERROR("GlobalAlloc(CF_HDROP) failed");
         return false;
@@ -414,18 +391,7 @@ bool WriteClipboardFiles(HWND owner, const std::vector<std::wstring>& paths) {
         LH_LOG_ERROR("GlobalLock(CF_HDROP) failed");
         return false;
     }
-    auto* df = reinterpret_cast<DROPFILES*>(base);
-    std::memset(df, 0, sizeof(*df));
-    df->pFiles = sizeof(DROPFILES);
-    df->fWide  = TRUE;
-
-    auto* dst = reinterpret_cast<wchar_t*>(base + sizeof(DROPFILES));
-    for (const auto& p : paths) {
-        std::memcpy(dst, p.data(), p.size() * sizeof(wchar_t));
-        dst += p.size();
-        *dst++ = L'\0';
-    }
-    *dst = L'\0';
+    std::memcpy(base, payload.data(), payload.size());
     ::GlobalUnlock(hglobal);
 
     ClipboardScope scope(owner);
@@ -608,7 +574,7 @@ bool ReadVirtualFiles(ClipboardSnapshot& out) {
     out.virtual_files.clear();
     out.virtual_data_object = nullptr;
 
-    if (tls_os_clipboard_held != 0) {
+    if (IsOsClipboardHeldByThisThread()) {
         // Same fail-fast rationale as ClipboardScope: OleGetClipboard
         // inside an active WM_RENDERFORMAT dispatch is unsupported and
         // would serialize the STA against itself.

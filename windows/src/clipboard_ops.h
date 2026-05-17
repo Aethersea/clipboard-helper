@@ -71,6 +71,16 @@ bool WriteClipboardImagePng(HWND owner, const std::uint8_t* png, std::size_t png
 // final additional NUL ("double-NUL" terminated list per CF_HDROP spec).
 bool WriteClipboardFiles(HWND owner, const std::vector<std::wstring>& paths);
 
+// Build the in-memory CF_HDROP payload (DROPFILES header + UTF-16 path
+// list + trailing double-NUL) for `paths`. Pure: no GlobalAlloc / no
+// SetClipboardData / no Win32 clipboard interaction.
+//
+// Returns an empty vector when `paths` is empty — CF_HDROP doesn't have
+// a meaningful zero-path representation. Otherwise the returned buffer
+// is `sizeof(DROPFILES) + (sum of (path.size()+1) per path) + 1` bytes
+// of wchar_t storage, ready to be copied into an HGLOBAL by the caller.
+std::vector<std::uint8_t> BuildCfHdropPayload(const std::vector<std::wstring>& paths);
+
 // ─── Delayed rendering (Phase 3c) ────────────────────────────────────────
 //
 // AnnounceDelayedFormatsForType opens the clipboard, empties it, and

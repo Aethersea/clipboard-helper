@@ -14,12 +14,14 @@ add_executable(clipboard_helper_tests
     pipe_server_test.cpp
     log_test.cpp
     dispatch_codec_test.cpp
+    clipboard_ops_unit_test.cpp
     ${CMAKE_SOURCE_DIR}/src/proto_wire.cpp
     ${CMAKE_SOURCE_DIR}/src/pipe_server.cpp
     ${CMAKE_SOURCE_DIR}/src/session.cpp
     ${CMAKE_SOURCE_DIR}/src/log.cpp
     ${CMAKE_SOURCE_DIR}/src/dispatch_codec.cpp
     ${CMAKE_SOURCE_DIR}/src/string_utils.cpp
+    ${CMAKE_SOURCE_DIR}/src/clipboard_format.cpp
 )
 
 target_include_directories(clipboard_helper_tests PRIVATE
