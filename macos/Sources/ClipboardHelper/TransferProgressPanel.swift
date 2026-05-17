@@ -108,17 +108,16 @@ final class TransferProgressPanel {
 /// style. Matches what Finder shows in the inspector ("1.5 MB", "2 KB",
 /// etc.). File-scope so unit tests don't have to construct an NSPanel.
 ///
-/// Locale is pinned to en_US so the formatted strings stay stable
-/// across CI runners — ByteCountFormatter localises units ("octet"
-/// in fr_FR, etc.) and we don't want that to flake the tests.
-/// Production users see the same English unit suffix; the helper is
-/// the only consumer of the formatted string and it goes into a HUD
-/// that already uses English labels ("File Transfer", "Transfer
-/// complete").
+/// Note: ByteCountFormatter localises unit names against the current
+/// process locale ("octet" in fr_FR, etc.) and does NOT expose a
+/// `locale` property to pin it. Unit tests that assert on exact
+/// strings ("Zero bytes", "1 byte") therefore rely on the CI runner
+/// (GitHub Actions macos-14) defaulting to en_US. If a future change
+/// switches the runner locale, the assertions need loosening to unit
+/// suffix checks.
 func formatBytes(_ bytes: UInt64) -> String {
     let formatter = ByteCountFormatter()
     formatter.countStyle = .file
-    formatter.locale = Locale(identifier: "en_US")
     // Int64 conversion would trap for bytes >= 2^63. APFS can't host
     // a single file that large today, but defending the conversion
     // here keeps the helper safe against any future protocol that
