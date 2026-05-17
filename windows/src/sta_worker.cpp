@@ -68,10 +68,7 @@ void StaWorker::Stop() {
 }
 
 void StaWorker::PostTask(std::function<void()> task) {
-    {
-        std::lock_guard<std::mutex> lock(queue_mu_);
-        queue_.push_back(std::move(task));
-    }
+    queue_.Push(std::move(task));
     // PostMessage to the window: the message pump picks it up and drains
     // the queue on the STA thread. PostThreadMessage to thread_id_ would
     // also work but window-targeted dispatch keeps everything inside the
@@ -84,17 +81,13 @@ void StaWorker::PostTask(std::function<void()> task) {
 }
 
 void StaWorker::DrainWorkQueue() {
-    std::deque<std::function<void()>> snapshot;
-    {
-        std::lock_guard<std::mutex> lock(queue_mu_);
-        snapshot.swap(queue_);
-    }
-    for (auto& fn : snapshot) {
-        try {
-            fn();
-        } catch (...) {
-            LH_LOG_ERROR("Exception in STA work item (swallowed)");
-        }
+    const auto stats = queue_.Drain();
+    if (stats.exceptions > 0) {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf),
+                      "STA work drain: %zu/%zu items threw and were swallowed",
+                      stats.exceptions, stats.executed);
+        LH_LOG_ERROR(buf);
     }
 }
 
@@ -275,19 +268,12 @@ void StaWorker::ThreadMain() {
     // currently in HwndOwner() cannot hold a dangling HWND for long.
     hwnd_atom_.store(nullptr);
 
-    // Drain any pending work items that were queued but never dispatched
+    // Drop any pending work items that were queued but never dispatched
     // (e.g. a RunSync racing the WM_QUIT that brought us here). Destroying
     // the captured packaged_tasks without invoking them surfaces as
     // std::future_error(broken_promise) on the caller's future.get(), which
     // is far better than the caller hanging forever.
-    {
-        std::deque<std::function<void()>> leftover;
-        {
-            std::lock_guard<std::mutex> lock(queue_mu_);
-            leftover.swap(queue_);
-        }
-        leftover.clear();  // destructors run here, breaking pending promises.
-    }
+    queue_.DropAll();
 
     ::RemoveClipboardFormatListener(hwnd);
     ::DestroyWindow(hwnd);

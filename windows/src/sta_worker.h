@@ -11,8 +11,8 @@
 //
 // The worker is constructed on the helper's main thread, started with
 // Start(), and shut down with Stop(). Other threads schedule work using
-// RunSync (request/reply) or PostAsync (fire-and-forget); both queue a
-// callable that the STA thread executes inside its message loop.
+// RunSync (request/reply); the queued callable runs inside the STA
+// thread's message loop on receipt of WM_LEVIATHAN_WORK.
 //
 // The worker also installs an AddClipboardFormatListener subscription and
 // invokes the OnClipboardChanged callback on every WM_CLIPBOARDUPDATE.
@@ -21,12 +21,13 @@
 
 #include <atomic>
 #include <condition_variable>
-#include <deque>
 #include <functional>
 #include <future>
 #include <mutex>
 #include <string>
 #include <thread>
+
+#include "work_queue.h"
 
 namespace leviathan::clipboard_helper {
 
@@ -81,12 +82,19 @@ public:
     // copyable. packaged_task itself is move-only; the shared_ptr indirection
     // gives us a copyable handle without dragging in std::move_only_function
     // (C++23) or hand-rolling a move-only erased callable.
+    //
+    // The shared_ptr is moved INTO the lambda so the only live reference
+    // dies with the queue's stored callable. Keeping a second copy on
+    // this stack frame would mean a Stop()-during-RunSync race could
+    // wedge: DropAll would drop the queue's lambda, but the packaged_task
+    // would still be alive (held here) and future.get() below would
+    // block forever instead of surfacing std::future_error(broken_promise).
     template <typename F>
     auto RunSync(F&& fn) -> decltype(fn()) {
         using Result = decltype(fn());
         auto task   = std::make_shared<std::packaged_task<Result()>>(std::forward<F>(fn));
         auto future = task->get_future();
-        PostTask([task]() { (*task)(); });
+        PostTask([t = std::move(task)]() { (*t)(); });
         return future.get();
     }
 
@@ -125,10 +133,10 @@ private:
     bool                        init_done_{false};
     bool                        init_ok_{false};
 
-    // Work queue. Items are popped on the STA thread inside WndProc when
-    // the custom WM_LEVIATHAN_WORK message arrives.
-    std::mutex                          queue_mu_;
-    std::deque<std::function<void()>>   queue_;
+    // Work queue. Items are pushed by any thread via PostTask, popped
+    // on the STA thread inside WndProc when the custom WM_LEVIATHAN_WORK
+    // message arrives.
+    WorkQueue                           queue_;
 
     // on_clipboard_changed_ is set by external threads (SetOnClipboardChanged)
     // and read by the STA thread inside WndProc when WM_CLIPBOARDUPDATE

@@ -35,6 +35,7 @@ add_executable(leviathan-clipboard-helper
     src/dispatch.cpp
     src/dispatch_codec.cpp
     src/sta_worker.cpp
+    src/work_queue.cpp
     src/clipboard_ops.cpp
     src/clipboard_format.cpp
     src/string_utils.cpp

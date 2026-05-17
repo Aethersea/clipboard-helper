@@ -17,6 +17,8 @@ add_executable(clipboard_helper_tests
     clipboard_ops_unit_test.cpp
     wic_image_test.cpp
     virtual_file_provider_test.cpp
+    work_queue_test.cpp
+    ${CMAKE_SOURCE_DIR}/src/work_queue.cpp
     ${CMAKE_SOURCE_DIR}/src/proto_wire.cpp
     ${CMAKE_SOURCE_DIR}/src/pipe_server.cpp
     ${CMAKE_SOURCE_DIR}/src/session.cpp
