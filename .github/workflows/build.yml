@@ -42,6 +42,12 @@ jobs:
       - name: Build universal binary (arm64 + x86_64)
         run: make build-universal
 
+      # Run XCTest against the host arch only. swift test cannot build a
+      # universal test bundle and we don't need one — the test target
+      # exercises pure-logic helpers that have no arch-specific behaviour.
+      - name: Run unit tests
+        run: swift test --parallel
+
       - name: Rename binary
         run: |
           cp .build/universal/ClipboardHelper clipboard-helper-macos
@@ -76,6 +82,14 @@ jobs:
 
       - name: Configure + build (Release)
         run: pwsh -NoProfile -ExecutionPolicy Bypass -File build.ps1 -Config Release
+
+      # ctest is wired up by the test target in tests/CMakeLists.txt; this
+      # invokes the same clipboard_helper_tests binary build.ps1 -RunTests
+      # would run, but as its own CI step so failures are easy to spot in
+      # the workflow timeline. --output-on-failure keeps the log quiet on
+      # green runs but surfaces test_lite assertion text when a case fails.
+      - name: Run unit tests
+        run: ctest --test-dir build --build-config Release --output-on-failure
 
       - name: Rename binary
         run: |
