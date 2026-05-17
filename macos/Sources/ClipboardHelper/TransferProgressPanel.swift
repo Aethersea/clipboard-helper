@@ -81,7 +81,7 @@ final class TransferProgressPanel {
     func updateProgress(bytesTransferred: UInt64, totalBytes: UInt64) {
         guard let progressIndicator else { return }
 
-        let fraction = totalBytes > 0 ? Double(bytesTransferred) / Double(totalBytes) : 0
+        let fraction = progressFraction(transferred: bytesTransferred, total: totalBytes)
         progressIndicator.doubleValue = fraction
 
         let transferred = formatBytes(bytesTransferred)
@@ -100,12 +100,40 @@ final class TransferProgressPanel {
             bytesLabel?.stringValue = errorMessage
         }
     }
+}
 
-    // MARK: - Helpers
+// MARK: - Pure helpers (file scope for unit-testability)
 
-    private func formatBytes(_ bytes: UInt64) -> String {
-        let formatter = ByteCountFormatter()
-        formatter.countStyle = .file
-        return formatter.string(fromByteCount: Int64(bytes))
-    }
+/// Format a byte count for display via ByteCountFormatter's `.file`
+/// style. Matches what Finder shows in the inspector ("1.5 MB", "2 KB",
+/// etc.). File-scope so unit tests don't have to construct an NSPanel.
+///
+/// Locale is pinned to en_US so the formatted strings stay stable
+/// across CI runners — ByteCountFormatter localises units ("octet"
+/// in fr_FR, etc.) and we don't want that to flake the tests.
+/// Production users see the same English unit suffix; the helper is
+/// the only consumer of the formatted string and it goes into a HUD
+/// that already uses English labels ("File Transfer", "Transfer
+/// complete").
+func formatBytes(_ bytes: UInt64) -> String {
+    let formatter = ByteCountFormatter()
+    formatter.countStyle = .file
+    formatter.locale = Locale(identifier: "en_US")
+    // Int64 conversion would trap for bytes >= 2^63. APFS can't host
+    // a single file that large today, but defending the conversion
+    // here keeps the helper safe against any future protocol that
+    // sends UInt64-wide values from a non-filesystem source.
+    let clamped = Int64(min(bytes, UInt64(Int64.max)))
+    return formatter.string(fromByteCount: clamped)
+}
+
+/// Map (transferred, total) to a progress fraction in [0.0, 1.0].
+/// Guards against division-by-zero by returning 0 when total is zero,
+/// and clamps to 1.0 if a buggy upstream over-reports transferred.
+func progressFraction(transferred: UInt64, total: UInt64) -> Double {
+    guard total > 0 else { return 0 }
+    let raw = Double(transferred) / Double(total)
+    // UInt64 / UInt64 is non-negative so a lower bound of 0 is
+    // already implicit; only the upper bound needs enforcement.
+    return min(raw, 1.0)
 }
