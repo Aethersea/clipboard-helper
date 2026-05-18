@@ -2,7 +2,12 @@ cmake_minimum_required(VERSION 3.21)
 
 project(clipboard-helper-linux
     VERSION 0.1.0
-    LANGUAGES CXX
+    # CXX for our own code; C for the wayland-scanner-generated
+    # protocol stubs (-protocol.c). Without C in the language list
+    # CMake silently SKIPS .c sources passed to add_executable —
+    # producing an empty link with undefined references to every
+    # `*_interface` descriptor.
+    LANGUAGES CXX C
 )
 
 set(CMAKE_CXX_STANDARD 17)

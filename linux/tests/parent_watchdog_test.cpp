@@ -41,14 +41,6 @@ namespace {
     return pid;
 }
 
-// Reap a child cleanly. Used by test teardown — best-effort.
-void ReapChild(::pid_t pid) {
-    if (pid <= 0) return;
-    ::kill(pid, SIGKILL);
-    int status = 0;
-    while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
-}
-
 // Poll for `pred()` becoming true, up to `timeout` total. Returns true
 // if pred fires, false on timeout. Polls in 50 ms slices to keep
 // tests responsive.
