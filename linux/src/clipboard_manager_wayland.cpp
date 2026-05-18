@@ -73,6 +73,7 @@
 #include <vector>
 
 #include "log.h"
+#include "uri_list_format.h"
 #include "wayland_display.h"
 
 namespace leviathan::clipboard_helper {
@@ -122,86 +123,13 @@ const char* const kFilesMimeTypes[] = {
 
 constexpr std::chrono::seconds kProvideDataWait{10};
 
-// Percent-encode bytes per RFC 3986 — anything outside the unreserved
-// set [A-Za-z0-9-._~] OR the path-separator '/' is encoded as %HH.
-// Multi-byte UTF-8 sequences are encoded byte-by-byte (which the spec
-// allows for "path" segment characters); receivers UTF-8-decode after
-// percent-decoding.
-bool IsUriPathSafe(unsigned char c) {
-    return (c >= 'A' && c <= 'Z')
-        || (c >= 'a' && c <= 'z')
-        || (c >= '0' && c <= '9')
-        || c == '-' || c == '_' || c == '.' || c == '~'
-        || c == '/';
-}
-
-std::string PercentEncodePath(std::string_view path) {
-    std::string out;
-    out.reserve(path.size());
-    for (char ch : path) {
-        const auto c = static_cast<unsigned char>(ch);
-        if (IsUriPathSafe(c)) {
-            out += static_cast<char>(c);
-        } else {
-            char buf[4];
-            std::snprintf(buf, sizeof(buf), "%%%02X", c);
-            out += buf;
-        }
-    }
-    return out;
-}
-
 // Convert PROVIDE_DATA payload (newline-joined LOCAL absolute paths,
 // the format the macOS helper's send_provide_data_file_paths produces
-// on the Shen side) into the bytes a paste consumer expects for `mime`:
-//
-//   text/uri-list                  — RFC 2483: file:// URIs each
-//                                    terminated by CRLF (including the
-//                                    last one).
-//   x-special/gnome-copied-files   — Nautilus / GTK convention:
-//                                    "copy" (we never cut) + LF, then
-//                                    file:// URIs joined by LF, no
-//                                    trailing terminator.
-//
-// shen separates paths with '\n' (not CRLF); empty lines are skipped.
-// We tolerate '\r\n' on input too in case the parent ever changes.
-std::vector<std::uint8_t> FormatFilesForMime(
-        const std::vector<std::uint8_t>& path_bytes, const char* mime) {
-    std::vector<std::string> uris;
-    std::string_view sv(reinterpret_cast<const char*>(path_bytes.data()),
-                        path_bytes.size());
-    std::size_t start = 0;
-    while (start <= sv.size()) {
-        std::size_t end = sv.find('\n', start);
-        if (end == std::string_view::npos) end = sv.size();
-        std::string_view line = sv.substr(start, end - start);
-        if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
-        if (!line.empty()) {
-            uris.push_back("file://" + PercentEncodePath(line));
-        }
-        if (end >= sv.size()) break;
-        start = end + 1;
-    }
-
-    std::string out;
-    if (mime != nullptr && std::strcmp(mime, "x-special/gnome-copied-files") == 0) {
-        // Nautilus format: "copy\n" + LF-joined URIs, no trailing LF.
-        out = "copy";
-        for (const auto& u : uris) {
-            out += "\n";
-            out += u;
-        }
-    } else {
-        // text/uri-list (RFC 2483): each URI terminated by CRLF,
-        // including the last one. Receivers that ignore the trailing
-        // empty line still parse correctly.
-        for (const auto& u : uris) {
-            out += u;
-            out += "\r\n";
-        }
-    }
-    return std::vector<std::uint8_t>(out.begin(), out.end());
-}
+// on the Shen side) into the bytes a paste consumer expects for the
+// MIME they requested (text/uri-list or x-special/gnome-copied-files).
+// Pure: lives in uri_list_format.h so all three backends share one
+// implementation + a single unit-test surface.
+using uri_list::FormatForMime;
 
 // Decode `webp_bytes` (or any QImage-readable format) and re-encode to
 // the byte stream a paste consumer expects for `mime`. Empty result on
@@ -366,7 +294,7 @@ void WaitAndWriteOnWorker(std::shared_ptr<WlrState> state,
                     // result rather than corrupted bytes.
                 }
             } else if (kind == ContentKind::Files) {
-                const auto uris = FormatFilesForMime(bytes, mime.c_str());
+                const auto uris = FormatForMime(bytes, mime.c_str());
                 WriteAll(fd, uris.data(), uris.size());
             } else {
                 WriteAll(fd, bytes.data(), bytes.size());
@@ -702,7 +630,7 @@ private:
                 }
                 // else: empty write, paster sees no data (better than corrupted bytes).
             } else if (kind == ContentKind::Files) {
-                const auto uris = FormatFilesForMime(eager_bytes, mime_str.c_str());
+                const auto uris = FormatForMime(eager_bytes, mime_str.c_str());
                 WriteAll(fd, uris.data(), uris.size());
             } else {
                 WriteAll(fd, eager_bytes.data(), eager_bytes.size());

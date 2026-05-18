@@ -114,6 +114,7 @@ add_executable(clipboard-helper
     src/clipboard_manager_ext.cpp
     src/clipboard_manager_x11.cpp
     src/wayland_display.cpp
+    src/uri_list_format.cpp
     "${WLR_PRIVATE_CODE}"
     "${EXT_PRIVATE_CODE}"
 )

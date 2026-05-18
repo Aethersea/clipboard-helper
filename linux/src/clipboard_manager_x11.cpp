@@ -48,6 +48,7 @@
 #include <vector>
 
 #include "log.h"
+#include "uri_list_format.h"
 
 namespace leviathan::clipboard_helper {
 
@@ -65,67 +66,14 @@ std::string ShortHash(const std::string& h) {
 // how it materialises bytes in retrieveData.
 enum class ContentKind { Text, Image, Files };
 
-// Percent-encode bytes per RFC 3986 for use inside a file:// URI
-// path; '/' is preserved as the path separator, multi-byte UTF-8
-// bytes are encoded byte-by-byte. (Mirrors the helper-side Wayland
-// formatter so cross-backend behaviour stays uniform.)
-bool IsUriPathSafe(unsigned char c) {
-    return (c >= 'A' && c <= 'Z')
-        || (c >= 'a' && c <= 'z')
-        || (c >= '0' && c <= '9')
-        || c == '-' || c == '_' || c == '.' || c == '~'
-        || c == '/';
-}
-
-// `mime` selects text/uri-list (CRLF-joined URIs) or
-// x-special/gnome-copied-files (Nautilus format: "copy\n" header +
-// LF-joined URIs, no trailing terminator).
+// Wraps the shared uri_list::FormatForMime in a QByteArray for Qt's
+// QVariant return path. The shared formatter owns the RFC 2483 +
+// GNOME conventions; we just rebox the bytes here.
 QByteArray FormatFilesBytesForMime(const std::vector<std::uint8_t>& path_bytes,
                                    const QString& mime) {
-    QByteArray uris_only;
-    // Collect URI strings without separators first; then join per mime.
-    std::vector<std::string> uris;
-
-    std::string_view sv(reinterpret_cast<const char*>(path_bytes.data()),
-                        path_bytes.size());
-    std::size_t start = 0;
-    while (start <= sv.size()) {
-        std::size_t end = sv.find('\n', start);
-        if (end == std::string_view::npos) end = sv.size();
-        std::string_view line = sv.substr(start, end - start);
-        if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
-        if (!line.empty()) {
-            std::string u = "file://";
-            for (char ch : line) {
-                const auto c = static_cast<unsigned char>(ch);
-                if (IsUriPathSafe(c)) {
-                    u += static_cast<char>(c);
-                } else {
-                    char buf[4];
-                    std::snprintf(buf, sizeof(buf), "%%%02X", c);
-                    u += buf;
-                }
-            }
-            uris.push_back(std::move(u));
-        }
-        if (end >= sv.size()) break;
-        start = end + 1;
-    }
-
-    QByteArray out;
-    if (mime == QStringLiteral("x-special/gnome-copied-files")) {
-        out += "copy";
-        for (const auto& u : uris) {
-            out += '\n';
-            out += QByteArray::fromStdString(u);
-        }
-    } else {
-        for (const auto& u : uris) {
-            out += QByteArray::fromStdString(u);
-            out += "\r\n";
-        }
-    }
-    return out;
+    const auto bytes = uri_list::FormatForMime(path_bytes, mime.toStdString());
+    return QByteArray(reinterpret_cast<const char*>(bytes.data()),
+                      static_cast<qsizetype>(bytes.size()));
 }
 
 // Shared cross-thread state between the manager and the QMimeData
