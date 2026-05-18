@@ -4,7 +4,9 @@ Qt 6 / C++17 implementation of the `clipboard-helper` agent for Linux. Sibling t
 
 Speaks the same length-prefixed `HelperMessage` protobuf wire protocol; runtime-selects between **Wayland** (`ext-data-control-v1` for KDE Plasma 6, `wlr-data-control-unstable-v1` for wlroots compositors), **X11** (Qt `xcb` QClipboard), and **GNOME XWayland** (force `QT_QPA_PLATFORM=xcb` because Mutter does not implement any data-control extension).
 
-> **Status — P1 骨架 (in progress)**: IPC layer, dispatch, parent watchdog, backend detector, and unit tests landed. The actual Wayland / X11 clipboard ownership backends are stubbed pending the next PR.
+> **Status — P3 (IMAGE) landing**: IPC layer, dispatch, parent watchdog, backend detector all in. **Wayland (`wlr-data-control` + `ext-data-control`) and X11 backends both handle TEXT and IMAGE delayed rendering.** FILES (`text/uri-list` + per-file chunk plumbing) still pending — Linux helper currently rejects FILES with an error reply, parent should fall back to no-op.
+
+The IMAGE path decodes the lossless WebP shen sends on the wire via QImage (qt6-image-formats-plugins) and re-encodes per paste consumer's MIME (PNG / BMP / Qt-native QImage).
 
 ## Architecture
 
@@ -29,7 +31,8 @@ clipboard-helper
 |---|---|---|---|
 | CMake | 3.21 | `cmake` | `cmake` |
 | clang or gcc | clang 16+ / gcc 12+ | `clang` | `clang` |
-| Qt 6 (Core) | 6.5 LTS | `qt6-base-dev` | `qt6-qtbase-devel` |
+| Qt 6 (Core + Gui) | 6.5 LTS | `qt6-base-dev` | `qt6-qtbase-devel` |
+| Qt 6 image format plugins (for WebP decode) | 6.5 LTS | `qt6-image-formats-plugins` | `qt6-qtimageformats` |
 
 Wayland backend dependencies (added in the next PR alongside the actual binding):
 

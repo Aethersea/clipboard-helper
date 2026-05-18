@@ -135,14 +135,24 @@ std::vector<std::uint8_t> Dispatcher::HandleSetClipboard(const std::uint8_t* dat
     if (!dispatch_codec::ParseClipboardData(data, len, cd)) {
         return dispatch_codec::EncodeError("SET_CLIPBOARD parse failure");
     }
-    if (cd.content_type != proto::ClipboardContentType::Text) {
-        return dispatch_codec::EncodeError("SET_CLIPBOARD: only TEXT supported in P1");
+    if (clipboard_ == nullptr) return {};
+
+    switch (cd.content_type) {
+        case proto::ClipboardContentType::Text: {
+            std::string utf8(reinterpret_cast<const char*>(cd.payload_ptr), cd.payload_len);
+            clipboard_->SetClipboardText(utf8);
+            return {};
+        }
+        case proto::ClipboardContentType::Image: {
+            std::vector<std::uint8_t> bytes(cd.payload_ptr, cd.payload_ptr + cd.payload_len);
+            clipboard_->SetClipboardImage(bytes);
+            return {};
+        }
+        case proto::ClipboardContentType::Files:
+            return dispatch_codec::EncodeError("SET_CLIPBOARD: FILES not yet supported on Linux helper");
+        default:
+            return dispatch_codec::EncodeError("SET_CLIPBOARD: unknown content_type");
     }
-    if (clipboard_ != nullptr) {
-        std::string utf8(reinterpret_cast<const char*>(cd.payload_ptr), cd.payload_len);
-        clipboard_->SetClipboardText(utf8);
-    }
-    return {};  // no reply
 }
 
 std::vector<std::uint8_t> Dispatcher::HandleAnnounceDelayed(const std::uint8_t* data, std::size_t len) {
@@ -153,13 +163,20 @@ std::vector<std::uint8_t> Dispatcher::HandleAnnounceDelayed(const std::uint8_t* 
     if (!dispatch_codec::ParseAnnouncement(data, len, ann)) {
         return dispatch_codec::EncodeError("ANNOUNCE_DELAYED parse failure");
     }
-    if (ann.content_type != proto::ClipboardContentType::Text) {
-        return dispatch_codec::EncodeError("ANNOUNCE_DELAYED: only TEXT supported in P1");
+    if (clipboard_ == nullptr) return {};
+
+    switch (ann.content_type) {
+        case proto::ClipboardContentType::Text:
+            clipboard_->AnnounceDelayedText(ann.content_hash);
+            return {};
+        case proto::ClipboardContentType::Image:
+            clipboard_->AnnounceDelayedImage(ann.content_hash);
+            return {};
+        case proto::ClipboardContentType::Files:
+            return dispatch_codec::EncodeError("ANNOUNCE_DELAYED: FILES not yet supported on Linux helper");
+        default:
+            return dispatch_codec::EncodeError("ANNOUNCE_DELAYED: unknown content_type");
     }
-    if (clipboard_ != nullptr) {
-        clipboard_->AnnounceDelayedText(ann.content_hash);
-    }
-    return {};
 }
 
 std::vector<std::uint8_t> Dispatcher::HandleProvideData(const std::uint8_t* data, std::size_t len) {

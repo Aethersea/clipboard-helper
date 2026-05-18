@@ -45,7 +45,11 @@
 
 #include "wlr-data-control-unstable-v1-client-protocol.h"
 
+#include <QBuffer>
+#include <QByteArray>
 #include <QCoreApplication>
+#include <QImage>
+#include <QImageReader>
 #include <QMetaObject>
 #include <QObject>
 #include <QThread>
@@ -75,6 +79,11 @@ namespace leviathan::clipboard_helper {
 
 namespace {
 
+// What kind of content is currently announced / set. Determines which
+// MIMEs we advertise on create_data_source AND how we materialise the
+// bytes when the compositor's `send` event arrives.
+enum class ContentKind { Text, Image };
+
 // MIME types we advertise for TEXT. Order matters: most-specific
 // first per the convention pasters (LibreOffice in particular) use.
 const char* const kTextMimeTypes[] = {
@@ -85,7 +94,60 @@ const char* const kTextMimeTypes[] = {
     "STRING",
 };
 
+// MIME types we advertise for IMAGE. The on-wire format from shen is
+// lossless WebP; we decode via QImage and re-encode per request to
+// whichever format the paste consumer asked for. PNG first (broadest
+// modern app support); image/bmp second (older / Wine apps).
+const char* const kImageMimeTypes[] = {
+    "image/png",
+    "image/bmp",
+    "image/x-bmp",
+};
+
 constexpr std::chrono::seconds kProvideDataWait{10};
+
+// Decode `webp_bytes` (or any QImage-readable format) and re-encode to
+// the byte stream a paste consumer expects for `mime`. Empty result on
+// any decode/encode failure — caller writes empty payload to the fd.
+std::vector<std::uint8_t> ConvertImageForMime(
+        const std::vector<std::uint8_t>& webp_bytes,
+        const char* mime) {
+    if (webp_bytes.empty() || mime == nullptr) return {};
+
+    QImage img;
+    if (!img.loadFromData(webp_bytes.data(),
+                          static_cast<int>(webp_bytes.size()))) {
+        LH_LOG_WARN("[wlr/image] QImage::loadFromData failed; "
+                    "is qt6-image-formats-plugins installed?");
+        return {};
+    }
+
+    QByteArray out;
+    QBuffer buf(&out);
+    buf.open(QIODevice::WriteOnly);
+
+    // Map MIME → QImageWriter format name. We're conservative — only
+    // support the formats we advertise. Anything else is a paster bug.
+    const char* fmt = nullptr;
+    if (std::strcmp(mime, "image/png") == 0)               fmt = "PNG";
+    else if (std::strcmp(mime, "image/bmp") == 0
+          || std::strcmp(mime, "image/x-bmp") == 0)        fmt = "BMP";
+
+    if (fmt == nullptr) {
+        std::ostringstream m;
+        m << "[wlr/image] unsupported image MIME '" << mime
+          << "'; advertised types should never reach this branch";
+        LH_LOG_WARN(m.str());
+        return {};
+    }
+    if (!img.save(&buf, fmt)) {
+        std::ostringstream m;
+        m << "[wlr/image] QImage::save as " << fmt << " failed";
+        LH_LOG_WARN(m.str());
+        return {};
+    }
+    return std::vector<std::uint8_t>(out.cbegin(), out.cend());
+}
 
 std::string ShortHash(const std::string& h) {
     if (h.size() <= 8) return h;
@@ -135,6 +197,7 @@ struct WlrState {
     std::condition_variable                          cv;
     std::atomic<bool>                                stop{false};
     std::string                                      current_hash;
+    ContentKind                                      content_kind{ContentKind::Text};
     std::optional<std::vector<std::uint8_t>>         pending_data;
     std::string                                      pending_data_hash;
     std::optional<std::string>                       cached_clipboard_text;
@@ -143,12 +206,15 @@ struct WlrState {
 };
 
 // Worker: wait for ProvideData matching `hash`, then write bytes to fd.
-// Always closes fd. Captures only the shared state, no manager pointer.
+// `mime` tells us which representation to materialise (text payload
+// pass-through, image WebP → PNG/BMP via QImage). Always closes fd.
+// Captures only the shared state, no manager pointer.
 void WaitAndWriteOnWorker(std::shared_ptr<WlrState> state,
-                          int fd, std::string hash) {
+                          int fd, std::string hash, std::string mime) {
     enum class Outcome { Stopping, Stale, Timeout, Wrote };
     Outcome outcome = Outcome::Timeout;
     std::vector<std::uint8_t> bytes;
+    ContentKind               kind = ContentKind::Text;
     {
         std::unique_lock<std::mutex> lock(state->mu);
         const bool got_signal = state->cv.wait_for(lock, kProvideDataWait, [&] {
@@ -161,6 +227,7 @@ void WaitAndWriteOnWorker(std::shared_ptr<WlrState> state,
         } else if (got_signal && state->pending_data
                    && state->pending_data_hash == hash) {
             bytes = *state->pending_data;
+            kind  = state->content_kind;
             outcome = Outcome::Wrote;
         } else if (got_signal) {
             // notify_all fired (e.g. a new announcement replaced our hash)
@@ -191,9 +258,21 @@ void WaitAndWriteOnWorker(std::shared_ptr<WlrState> state,
             LH_LOG_WARN(m.str());
             break;
         }
-        case Outcome::Wrote:
-            WriteAll(fd, bytes.data(), bytes.size());
+        case Outcome::Wrote: {
+            if (kind == ContentKind::Image) {
+                const auto converted = ConvertImageForMime(bytes, mime.c_str());
+                if (!converted.empty()) {
+                    WriteAll(fd, converted.data(), converted.size());
+                } else {
+                    // Conversion failed (decode/encode error, unsupported
+                    // MIME). Empty write so the paster sees an empty
+                    // result rather than corrupted bytes.
+                }
+            } else {
+                WriteAll(fd, bytes.data(), bytes.size());
+            }
             break;
+        }
     }
     ::close(fd);
 }
@@ -287,10 +366,32 @@ public:
             // hash unused for eager set; treat the payload itself as the
             // matching key for ProvideData hash comparison.
             state_->current_hash      = utf8;
+            state_->content_kind      = ContentKind::Text;
             state_->pending_data      = std::vector<std::uint8_t>(utf8.begin(), utf8.end());
             state_->pending_data_hash = utf8;
         }
-        InvokeOnMain([this] { RecreateSource(); });
+        state_->cv.notify_all();
+        InvokeOnMain([this] { RecreateSource(ContentKind::Text); });
+    }
+
+    void SetClipboardImage(const std::vector<std::uint8_t>& webp_bytes) override {
+        std::ostringstream m;
+        m << "[wlr] SetClipboardImage(len=" << webp_bytes.size() << ")";
+        LH_LOG_INFO(m.str());
+
+        // Same eager-payload trick as SetClipboardText: we don't carry
+        // a separate hash on the wire for SET_CLIPBOARD, so the bytes
+        // double as both the payload and the dedup key.
+        std::string key(webp_bytes.begin(), webp_bytes.end());
+        {
+            std::lock_guard<std::mutex> g(state_->mu);
+            state_->current_hash      = key;
+            state_->content_kind      = ContentKind::Image;
+            state_->pending_data      = webp_bytes;
+            state_->pending_data_hash = key;
+        }
+        state_->cv.notify_all();
+        InvokeOnMain([this] { RecreateSource(ContentKind::Image); });
     }
 
     void AnnounceDelayedText(const std::string& content_hash) override {
@@ -301,6 +402,7 @@ public:
         {
             std::lock_guard<std::mutex> g(state_->mu);
             state_->current_hash = content_hash;
+            state_->content_kind = ContentKind::Text;
             state_->pending_data.reset();
             state_->pending_data_hash.clear();
         }
@@ -308,7 +410,23 @@ public:
         // exit via the Stale path (writing an empty payload).
         state_->cv.notify_all();
 
-        InvokeOnMain([this] { RecreateSource(); });
+        InvokeOnMain([this] { RecreateSource(ContentKind::Text); });
+    }
+
+    void AnnounceDelayedImage(const std::string& content_hash) override {
+        std::ostringstream m;
+        m << "[wlr] AnnounceDelayedImage(hash=" << ShortHash(content_hash) << ")";
+        LH_LOG_INFO(m.str());
+
+        {
+            std::lock_guard<std::mutex> g(state_->mu);
+            state_->current_hash = content_hash;
+            state_->content_kind = ContentKind::Image;
+            state_->pending_data.reset();
+            state_->pending_data_hash.clear();
+        }
+        state_->cv.notify_all();
+        InvokeOnMain([this] { RecreateSource(ContentKind::Image); });
     }
 
     void ProvideData(const std::string&            content_hash,
@@ -384,7 +502,7 @@ private:
         if (display_) display_->Roundtrip();
     }
 
-    void RecreateSource() {
+    void RecreateSource(ContentKind kind) {
         if (display_ == nullptr || device_ == nullptr) return;
 
         if (current_source_ != nullptr) {
@@ -400,9 +518,22 @@ private:
         }
         zwlr_data_control_source_v1_add_listener(
             current_source_, &kSourceListener, this);
-        for (const char* mime : kTextMimeTypes) {
-            zwlr_data_control_source_v1_offer(current_source_, mime);
+
+        // Advertise the MIME set matching the announced content kind.
+        // No mixing — a paste consumer can't ask for image bytes from
+        // a text announcement (no MIME advertised) so the compositor
+        // simply omits that consumer's data_offer.offer event for the
+        // missing type.
+        if (kind == ContentKind::Image) {
+            for (const char* mime : kImageMimeTypes) {
+                zwlr_data_control_source_v1_offer(current_source_, mime);
+            }
+        } else {
+            for (const char* mime : kTextMimeTypes) {
+                zwlr_data_control_source_v1_offer(current_source_, mime);
+            }
         }
+
         zwlr_data_control_device_v1_set_selection(device_, current_source_);
         display_->Flush();
     }
@@ -410,12 +541,15 @@ private:
     // ── wlr-data-control source events ──
 
     void OnSourceSend(const char* mime, int fd) {
+        const std::string mime_str = (mime != nullptr) ? mime : "";
         std::string hash;
+        ContentKind kind = ContentKind::Text;
         std::vector<std::uint8_t> eager_bytes;
         bool                      have_eager = false;
         {
             std::lock_guard<std::mutex> g(state_->mu);
             hash = state_->current_hash;
+            kind = state_->content_kind;
             if (state_->pending_data && state_->pending_data_hash == hash) {
                 eager_bytes = *state_->pending_data;
                 have_eager  = true;
@@ -425,11 +559,20 @@ private:
         std::ostringstream lm;
         lm << "[wlr] send event (mime=" << (mime ? mime : "<null>")
            << ", fd=" << fd << ", hash=" << ShortHash(hash)
+           << ", kind=" << (kind == ContentKind::Image ? "image" : "text")
            << ", eager=" << (have_eager ? "yes" : "no") << ")";
         LH_LOG_DEBUG(lm.str());
 
         if (have_eager) {
-            WriteAll(fd, eager_bytes.data(), eager_bytes.size());
+            if (kind == ContentKind::Image) {
+                const auto converted = ConvertImageForMime(eager_bytes, mime_str.c_str());
+                if (!converted.empty()) {
+                    WriteAll(fd, converted.data(), converted.size());
+                }
+                // else: empty write, paster sees no data (better than corrupted bytes).
+            } else {
+                WriteAll(fd, eager_bytes.data(), eager_bytes.size());
+            }
             ::close(fd);
             return;
         }
@@ -442,8 +585,9 @@ private:
         if (req_cb) req_cb(hash);
 
         // Worker captures the shared_ptr, NOT raw `this`; safe to
-        // outlive the manager.
-        std::thread(WaitAndWriteOnWorker, state_, fd, hash).detach();
+        // outlive the manager. Worker also receives the MIME so it
+        // knows how to convert image payloads after they arrive.
+        std::thread(WaitAndWriteOnWorker, state_, fd, hash, mime_str).detach();
     }
 
     void OnSourceCancelled() {

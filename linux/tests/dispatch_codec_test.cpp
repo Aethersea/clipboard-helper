@@ -209,3 +209,36 @@ TEST(DispatchCodec, ParseProvideDataHandlesEmptyData) {
     EXPECT_EQ(out.content_hash, std::string("abcd"));
     EXPECT_TRUE(out.data.empty());
 }
+
+// ─── IMAGE content_type round-trips ──────────────────────────────────────
+
+TEST(DispatchCodec, ParseClipboardDataDetectsImageContentType) {
+    // content_type=2 (Image), payload=4 bytes of dummy WebP header
+    // ("RIFF" magic). Image dispatch in dispatch.cpp inspects exactly
+    // content_type to route into SetClipboardImage.
+    std::vector<std::uint8_t> cd = {
+        0x08, 0x02,                  // field 1 varint = 2 (Image)
+        0x12, 0x04, 'R','I','F','F', // field 2 bytes len=4
+    };
+    cc::ParsedClipboardData out{};
+    ASSERT_TRUE(cc::ParseClipboardData(cd.data(), cd.size(), out));
+    EXPECT_EQ(static_cast<int>(out.content_type),
+              static_cast<int>(ch::proto::ClipboardContentType::Image));
+    ASSERT_EQ(out.payload_len, static_cast<std::size_t>(4));
+    EXPECT_EQ(static_cast<int>(out.payload_ptr[0]), static_cast<int>('R'));
+    EXPECT_EQ(static_cast<int>(out.payload_ptr[3]), static_cast<int>('F'));
+}
+
+TEST(DispatchCodec, ParseAnnouncementDetectsImageContentType) {
+    // content_type=2 (Image), content_hash="imghash". The dispatch in
+    // dispatch.cpp uses this branch to call AnnounceDelayedImage().
+    std::vector<std::uint8_t> ann = {
+        0x08, 0x02,                                    // field 1 varint = 2 (Image)
+        0x12, 0x07, 'i','m','g','h','a','s','h',       // field 2 string len=7
+    };
+    cc::ParsedAnnouncement out{};
+    ASSERT_TRUE(cc::ParseAnnouncement(ann.data(), ann.size(), out));
+    EXPECT_EQ(static_cast<int>(out.content_type),
+              static_cast<int>(ch::proto::ClipboardContentType::Image));
+    EXPECT_EQ(out.content_hash, std::string("imghash"));
+}

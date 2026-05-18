@@ -17,8 +17,11 @@
 #include <signal.h>
 #include <unistd.h>
 
+#include <QByteArray>
 #include <QCoreApplication>
 #include <QGuiApplication>
+#include <QImageReader>
+#include <QList>
 #include <QMetaObject>
 #include <QSocketNotifier>
 
@@ -218,21 +221,43 @@ int main(int argc, char** argv) {
         return 71;  // EX_OSERR — no display available
     }
 
-    // The X11 backend uses Qt's QClipboard which lives in QtGui and
-    // requires a QGuiApplication. The Wayland backend talks
-    // libwayland-client directly and prefers a plain QCoreApplication
-    // so no QPA plugin is loaded (which would race us for the
-    // wl_display socket). main.cpp picks the right subclass based on
-    // BackendDecision; both can be referenced as QCoreApplication&.
-    std::unique_ptr<QCoreApplication> app_owned;
-    const bool needs_gui = backend.kind == ch::BackendKind::X11
-                        || backend.kind == ch::BackendKind::ForceXWayland;
-    if (needs_gui) {
-        app_owned = std::make_unique<QGuiApplication>(argc, argv);
-    } else {
-        app_owned = std::make_unique<QCoreApplication>(argc, argv);
+    // Both backends now use QGuiApplication so QImage (in QtGui) can
+    // load WebP via qt6-image-formats-plugins and re-encode to PNG/BMP
+    // for the OS clipboard. The X11 backend wants the real xcb QPA so
+    // Qt's QClipboard handles selection ownership; the Wayland backend
+    // sets QT_QPA_PLATFORM=minimal so Qt loads the no-op QPA — no
+    // wl_display_connect() from Qt, leaving the real wl_display
+    // entirely to libwayland-client code we drive ourselves.
+    if (backend.kind == ch::BackendKind::Wayland) {
+        ::setenv("QT_QPA_PLATFORM", "minimal", /*overwrite=*/1);
+        LH_LOG_DEBUG("Wayland backend: forcing QT_QPA_PLATFORM=minimal so "
+                     "Qt's QPA doesn't second-connect to the compositor");
     }
-    QCoreApplication& app = *app_owned;
+    QGuiApplication app(argc, argv);
+
+    // Sanity-check that QImage can decode WebP, which is what shen
+    // sends on the wire for IMAGE clipboards. The qt6-image-formats-
+    // plugins / qt6-qtimageformats package is separate from qt6-base
+    // and is easy to miss in a minimal install — without it,
+    // IMAGE pastes silently produce empty results (loadFromData
+    // returns false, the backends log a per-paste warning, and the
+    // user sees nothing). One critical log line at startup is much
+    // easier to spot in field reports.
+    {
+        const auto fmts = QImageReader::supportedImageFormats();
+        bool have_webp = false;
+        for (const auto& f : fmts) {
+            if (f.toLower() == QByteArray("webp")) { have_webp = true; break; }
+        }
+        if (have_webp) {
+            LH_LOG_INFO("QImage WebP decoder available (image clipboards will work)");
+        } else {
+            LH_LOG_ERROR(
+                "QImage cannot decode WebP — install qt6-image-formats-plugins "
+                "(Debian/Ubuntu) or qt6-qtimageformats (Fedora). IMAGE clipboards "
+                "from shen will paste as empty until this is fixed.");
+        }
+    }
 
     // ── Self-pipe for signal-driven shutdown ──
     int sig_pipe[2];

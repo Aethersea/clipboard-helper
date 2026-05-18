@@ -18,6 +18,12 @@ public:
         LH_LOG_INFO(m.str());
     }
 
+    void SetClipboardImage(const std::vector<std::uint8_t>& webp_bytes) override {
+        std::ostringstream m;
+        m << "[stub] SetClipboardImage(len=" << webp_bytes.size() << ")";
+        LH_LOG_INFO(m.str());
+    }
+
     void AnnounceDelayedText(const std::string& content_hash) override {
         {
             std::lock_guard<std::mutex> g(mu_);
@@ -25,6 +31,16 @@ public:
         }
         std::ostringstream m;
         m << "[stub] AnnounceDelayedText(hash=" << ShortHash(content_hash) << ")";
+        LH_LOG_INFO(m.str());
+    }
+
+    void AnnounceDelayedImage(const std::string& content_hash) override {
+        {
+            std::lock_guard<std::mutex> g(mu_);
+            pending_hash_ = content_hash;
+        }
+        std::ostringstream m;
+        m << "[stub] AnnounceDelayedImage(hash=" << ShortHash(content_hash) << ")";
         LH_LOG_INFO(m.str());
     }
 

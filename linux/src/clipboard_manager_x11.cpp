@@ -20,9 +20,14 @@
 
 #include "clipboard_manager.h"
 
+#include <QBuffer>
+#include <QByteArray>
 #include <QClipboard>
 #include <QGuiApplication>
+#include <QImage>
+#include <QImageReader>
 #include <QMetaObject>
+#include <QMetaType>
 #include <QMimeData>
 #include <QObject>
 #include <QString>
@@ -55,15 +60,21 @@ std::string ShortHash(const std::string& h) {
     return h.substr(0, 8) + "...";
 }
 
+// Whether the currently-announced slot is text or image. Determines
+// which MIMEs DelayedClipboardMimeData advertises and how it
+// materialises bytes in retrieveData.
+enum class ContentKind { Text, Image };
+
 // Shared cross-thread state between the manager and the QMimeData
-// subclass. We use shared_ptr so a DelayedTextMimeData instance that
-// outlives its parent manager (e.g. still attached to QClipboard during
-// shutdown) doesn't dereference freed memory.
+// subclass. We use shared_ptr so a DelayedClipboardMimeData instance
+// that outlives its parent manager (e.g. still attached to QClipboard
+// during shutdown) doesn't dereference freed memory.
 struct DelayedState {
     std::mutex                                       mu;
     std::condition_variable                          cv;
     std::atomic<bool>                                stop{false};
     std::string                                      current_hash;
+    ContentKind                                      content_kind{ContentKind::Text};
     std::optional<std::vector<std::uint8_t>>         pending_data;
     std::string                                      pending_data_hash;
     std::optional<std::string>                       cached_clipboard_text;
@@ -71,15 +82,31 @@ struct DelayedState {
     std::function<void(const std::string&)>          on_request;
 };
 
-class DelayedTextMimeData : public QMimeData {
+class DelayedClipboardMimeData : public QMimeData {
 public:
-    DelayedTextMimeData(std::shared_ptr<DelayedState> state,
-                        std::string                   hash)
-        : state_(std::move(state)), hash_(std::move(hash)) {}
+    DelayedClipboardMimeData(std::shared_ptr<DelayedState> state,
+                             std::string                   hash,
+                             ContentKind                   kind)
+        : state_(std::move(state)), hash_(std::move(hash)), kind_(kind) {}
 
-    // Tell Qt this object exposes the standard text MIME types. Qt's
-    // xcb selection owner uses formats() to advertise on the X11 wire.
+    // Tell Qt which MIMEs this announcement can satisfy. The xcb QPA
+    // advertises this set on the X11 wire so paste consumers know
+    // what they can ask for. Mixing text+image MIMEs on the same
+    // announcement would mislead consumers, so we only return the set
+    // matching the announced kind.
     QStringList formats() const override {
+        if (kind_ == ContentKind::Image) {
+            return {
+                QStringLiteral("image/png"),
+                QStringLiteral("image/bmp"),
+                QStringLiteral("image/x-bmp"),
+                // application/x-qt-image is Qt's internal canonical
+                // type — Qt's QClipboard relies on it being present
+                // for QClipboard::image() to work on the receiving
+                // side (when the paster is also Qt).
+                QStringLiteral("application/x-qt-image"),
+            };
+        }
         return {
             QStringLiteral("text/plain;charset=utf-8"),
             QStringLiteral("text/plain"),
@@ -91,51 +118,62 @@ public:
 
 protected:
     // Qt calls retrieveData when a paste consumer wants the bytes for
-    // a given MIME type. We synthesise text from whichever payload
-    // arrives via ProvideData, regardless of the exact MIME asked for
-    // (all our advertised types are text representations).
+    // a given MIME type. We wait for ProvideData (blocks the main
+    // thread up to kProvideDataWait), then either return raw text
+    // bytes / QString or decode WebP → QImage / specific image format
+    // bytes depending on what was asked for.
     QVariant retrieveData(const QString& mimeType, QMetaType type) const override {
-        (void)mimeType;
         std::vector<std::uint8_t> bytes;
-        bool                      have_data = false;
+        if (!WaitForBytes(bytes)) return QVariant();
+
+        if (kind_ == ContentKind::Image) {
+            return MaterialiseImage(bytes, mimeType, type);
+        }
+        return MaterialiseText(bytes, type);
+    }
+
+private:
+    bool WaitForBytes(std::vector<std::uint8_t>& out) const {
         {
             std::lock_guard<std::mutex> g(state_->mu);
             if (state_->pending_data && state_->pending_data_hash == hash_) {
-                bytes = *state_->pending_data;
-                have_data = true;
+                out = *state_->pending_data;
+                return true;
             }
         }
-        if (!have_data) {
-            // No eager data → fire DATA_REQUEST and wait. Blocks the
-            // main thread; that's OK because the only thing that
-            // unblocks us (ProvideData from the worker thread) doesn't
-            // depend on the main thread.
-            std::function<void(const std::string&)> req_cb;
-            {
-                std::lock_guard<std::mutex> g(state_->mu);
-                req_cb = state_->on_request;
-            }
-            if (req_cb) req_cb(hash_);
-
-            std::unique_lock<std::mutex> lock(state_->mu);
-            const bool got = state_->cv.wait_for(lock, kProvideDataWait, [&] {
-                return state_->stop.load(std::memory_order_acquire)
-                    || (state_->pending_data
-                        && state_->pending_data_hash == hash_);
-            });
-            if (state_->stop.load(std::memory_order_acquire)
-                || !got
-                || !state_->pending_data
-                || state_->pending_data_hash != hash_) {
-                std::ostringstream m;
-                m << "[x11] retrieveData timed out (hash=" << ShortHash(hash_)
-                  << "); returning empty";
-                LH_LOG_WARN(m.str());
-                return QVariant();
-            }
-            bytes = *state_->pending_data;
+        // Eager prefetch missed — fire DATA_REQUEST and wait. Blocks
+        // the main thread; that's OK because the only thing that
+        // unblocks us (ProvideData from the worker thread) doesn't
+        // depend on the main thread.
+        std::function<void(const std::string&)> req_cb;
+        {
+            std::lock_guard<std::mutex> g(state_->mu);
+            req_cb = state_->on_request;
         }
+        if (req_cb) req_cb(hash_);
 
+        std::unique_lock<std::mutex> lock(state_->mu);
+        const bool got = state_->cv.wait_for(lock, kProvideDataWait, [&] {
+            return state_->stop.load(std::memory_order_acquire)
+                || (state_->pending_data
+                    && state_->pending_data_hash == hash_);
+        });
+        if (state_->stop.load(std::memory_order_acquire)
+            || !got
+            || !state_->pending_data
+            || state_->pending_data_hash != hash_) {
+            std::ostringstream m;
+            m << "[x11] retrieveData timed out (hash=" << ShortHash(hash_)
+              << "); returning empty";
+            LH_LOG_WARN(m.str());
+            return false;
+        }
+        out = *state_->pending_data;
+        return true;
+    }
+
+    QVariant MaterialiseText(const std::vector<std::uint8_t>& bytes,
+                             QMetaType type) const {
         QByteArray ba(reinterpret_cast<const char*>(bytes.data()),
                       static_cast<qsizetype>(bytes.size()));
         // Qt's QString conversion handles UTF-8 → UTF-16; if the caller
@@ -147,9 +185,57 @@ protected:
         return QVariant(ba);
     }
 
-private:
+    QVariant MaterialiseImage(const std::vector<std::uint8_t>& webp_bytes,
+                              const QString& mimeType,
+                              QMetaType type) const {
+        QImage img;
+        if (!img.loadFromData(webp_bytes.data(),
+                              static_cast<int>(webp_bytes.size()))) {
+            LH_LOG_WARN("[x11/image] QImage::loadFromData failed; "
+                        "is qt6-image-formats-plugins installed?");
+            return QVariant();
+        }
+
+        // Qt's preferred path: return the QImage directly. The xcb
+        // QPA's selection owner converts the QImage to whichever wire
+        // format the X11 paster requested via SelectionRequest +
+        // INCR. Returning QImage also satisfies QClipboard::image()
+        // on Qt-side pasters.
+        if (type == QMetaType::fromType<QImage>()
+            || mimeType == QStringLiteral("application/x-qt-image")) {
+            return QVariant::fromValue(img);
+        }
+
+        // Non-Qt MIME — encode to the requested format byte stream.
+        const char* fmt = nullptr;
+        const QByteArray mimeBytes = mimeType.toLatin1();
+        if (mimeBytes == "image/png")                              fmt = "PNG";
+        else if (mimeBytes == "image/bmp"
+              || mimeBytes == "image/x-bmp")                       fmt = "BMP";
+
+        if (fmt == nullptr) {
+            std::ostringstream m;
+            m << "[x11/image] unexpected MIME '"
+              << mimeType.toStdString() << "' for image announcement";
+            LH_LOG_WARN(m.str());
+            return QVariant();
+        }
+
+        QByteArray out;
+        QBuffer buf(&out);
+        buf.open(QIODevice::WriteOnly);
+        if (!img.save(&buf, fmt)) {
+            std::ostringstream m;
+            m << "[x11/image] QImage::save as " << fmt << " failed";
+            LH_LOG_WARN(m.str());
+            return QVariant();
+        }
+        return QVariant(out);
+    }
+
     std::shared_ptr<DelayedState> state_;
     std::string                   hash_;
+    ContentKind                   kind_;
 };
 
 }  // namespace
@@ -199,7 +285,7 @@ public:
         m << "[x11] SetClipboardText(len=" << utf8.size() << ")";
         LH_LOG_INFO(m.str());
 
-        // Eager set: bypass DelayedTextMimeData and hand Qt a plain
+        // Eager set: bypass DelayedClipboardMimeData and hand Qt a plain
         // QMimeData with the text already in it. Faster path; the
         // delayed flow is reserved for ANNOUNCE_DELAYED.
         const QString text = QString::fromUtf8(utf8.c_str(), static_cast<qsizetype>(utf8.size()));
@@ -217,29 +303,70 @@ public:
         SetOwnedClipboardText(utf8);
     }
 
-    void AnnounceDelayedText(const std::string& content_hash) override {
+    void SetClipboardImage(const std::vector<std::uint8_t>& webp_bytes) override {
         std::ostringstream m;
-        m << "[x11] AnnounceDelayedText(hash=" << ShortHash(content_hash) << ")";
+        m << "[x11] SetClipboardImage(len=" << webp_bytes.size() << ")";
+        LH_LOG_INFO(m.str());
+
+        QImage img;
+        if (!img.loadFromData(webp_bytes.data(),
+                              static_cast<int>(webp_bytes.size()))) {
+            LH_LOG_WARN("[x11/image] SetClipboardImage: QImage::loadFromData "
+                        "failed (qt6-image-formats-plugins missing?)");
+            return;
+        }
+
+        InvokeOnMain([img] {
+            auto* cb = QGuiApplication::clipboard();
+            if (cb == nullptr) return;
+            // setImageData implicitly fills application/x-qt-image,
+            // image/png, image/bmp via Qt's standard image-format
+            // plumbing — pasters get all three.
+            auto* mime = new QMimeData;
+            mime->setImageData(img);
+            cb->setMimeData(mime, QClipboard::Clipboard);
+        });
+
+        // No content-based echo suppression for images (would require
+        // comparing decoded pixels — expensive + lossy round-trip
+        // checks). Use the one-shot expectation flag instead.
+        expecting_self_echo_.store(true, std::memory_order_release);
+    }
+
+    void AnnounceDelayedText(const std::string& content_hash) override {
+        AnnounceDelayed(content_hash, ContentKind::Text);
+    }
+
+    void AnnounceDelayedImage(const std::string& content_hash) override {
+        AnnounceDelayed(content_hash, ContentKind::Image);
+    }
+
+    void AnnounceDelayed(const std::string& content_hash, ContentKind kind) {
+        std::ostringstream m;
+        m << "[x11] AnnounceDelayed"
+          << (kind == ContentKind::Image ? "Image" : "Text")
+          << "(hash=" << ShortHash(content_hash) << ")";
         LH_LOG_INFO(m.str());
 
         {
             std::lock_guard<std::mutex> g(state_->mu);
             state_->current_hash = content_hash;
+            state_->content_kind = kind;
             state_->pending_data.reset();
             state_->pending_data_hash.clear();
         }
         state_->cv.notify_all();  // wake any old retrieveData waiters
 
         auto state = state_;
-        InvokeOnMain([state, content_hash] {
+        InvokeOnMain([state, content_hash, kind] {
             auto* cb = QGuiApplication::clipboard();
             if (cb == nullptr) return;
             // Each set_selection-equivalent requires a fresh QMimeData;
             // Qt takes ownership and deletes the previous one.
-            auto* mime = new DelayedTextMimeData(state, content_hash);
+            auto* mime = new DelayedClipboardMimeData(state, content_hash, kind);
             cb->setMimeData(mime, QClipboard::Clipboard);
         });
-        // For delayed slots we don't know the text yet; the echo
+        // For delayed slots we don't know the content yet; the echo
         // suppression on AnnounceDelayed relies on a one-shot expectation
         // recorded here. OnClipboardChanged consumes it on the next event
         // regardless of content.

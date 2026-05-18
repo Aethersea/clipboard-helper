@@ -34,11 +34,24 @@ public:
     // delayed rendering. Used for SET_CLIPBOARD.
     virtual void SetClipboardText(const std::string& utf8) = 0;
 
+    // Apply a concrete image to the clipboard immediately. `webp_bytes`
+    // is what the parent put on the wire (Shen uses lossless WebP);
+    // the implementation decodes via QImage and re-advertises as
+    // image/png + image/bmp so common Linux apps (browsers, document
+    // editors) can paste it. Used for SET_CLIPBOARD content_type=IMAGE.
+    virtual void SetClipboardImage(const std::vector<std::uint8_t>& webp_bytes) = 0;
+
     // Take clipboard ownership and advertise a TEXT type whose bytes
     // will be materialised on demand via the OnDataRequest callback.
     // `content_hash` is recorded; subsequent ProvideData calls MUST
     // present the same hash or the payload is discarded.
     virtual void AnnounceDelayedText(const std::string& content_hash) = 0;
+
+    // Like AnnounceDelayedText but advertises image/png + image/bmp
+    // MIMEs. ProvideData supplies WebP bytes; backend decodes via
+    // QImage and converts to whichever MIME the paste consumer asks
+    // for.
+    virtual void AnnounceDelayedImage(const std::string& content_hash) = 0;
 
     // Provide the actual bytes for a previously-announced delayed
     // slot. Implementations enforce: if `content_hash` does not match
