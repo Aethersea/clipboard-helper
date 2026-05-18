@@ -8,13 +8,17 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$script_dir"
 
-# Pinned to a known-good wlr-protocols commit. Bump deliberately
-# (verify the XML still parses + compositor-side compat stays intact
-# on Sway / Hyprland / Plasma 6.x).
-WLR_PROTOCOLS_REV="2b8d43325b7012cc544f9af7ec47c1ad27d1df70"
-
-# Pinned to wayland-protocols 1.39 (Dec 2024) — first release with
-# ext-data-control-v1 in staging. Bump when newer protocols stabilize.
+# Refs to fetch from. `master` for wlr-protocols (its default branch);
+# `1.39` for wayland-protocols (first tagged release with
+# ext-data-control-v1 in staging).
+#
+# TODO(repro): wlr-protocols ref is currently a branch tip, not a
+# pinned commit. Bump to a specific SHA once we know which one CI
+# settled on — but only after the first green Linux run; the
+# previous hardcoded SHA (2b8d43325b...) turned out to be made up
+# and 404'd. Branch tip keeps CI unblocked at the cost of
+# reproducibility.
+WLR_PROTOCOLS_REV="master"
 WAYLAND_PROTOCOLS_REV="1.39"
 
 fetch_one() {
