@@ -60,10 +60,73 @@ std::string ShortHash(const std::string& h) {
     return h.substr(0, 8) + "...";
 }
 
-// Whether the currently-announced slot is text or image. Determines
-// which MIMEs DelayedClipboardMimeData advertises and how it
-// materialises bytes in retrieveData.
-enum class ContentKind { Text, Image };
+// Whether the currently-announced slot is text, image, or files.
+// Determines which MIMEs DelayedClipboardMimeData advertises and
+// how it materialises bytes in retrieveData.
+enum class ContentKind { Text, Image, Files };
+
+// Percent-encode bytes per RFC 3986 for use inside a file:// URI
+// path; '/' is preserved as the path separator, multi-byte UTF-8
+// bytes are encoded byte-by-byte. (Mirrors the helper-side Wayland
+// formatter so cross-backend behaviour stays uniform.)
+bool IsUriPathSafe(unsigned char c) {
+    return (c >= 'A' && c <= 'Z')
+        || (c >= 'a' && c <= 'z')
+        || (c >= '0' && c <= '9')
+        || c == '-' || c == '_' || c == '.' || c == '~'
+        || c == '/';
+}
+
+// `mime` selects text/uri-list (CRLF-joined URIs) or
+// x-special/gnome-copied-files (Nautilus format: "copy\n" header +
+// LF-joined URIs, no trailing terminator).
+QByteArray FormatFilesBytesForMime(const std::vector<std::uint8_t>& path_bytes,
+                                   const QString& mime) {
+    QByteArray uris_only;
+    // Collect URI strings without separators first; then join per mime.
+    std::vector<std::string> uris;
+
+    std::string_view sv(reinterpret_cast<const char*>(path_bytes.data()),
+                        path_bytes.size());
+    std::size_t start = 0;
+    while (start <= sv.size()) {
+        std::size_t end = sv.find('\n', start);
+        if (end == std::string_view::npos) end = sv.size();
+        std::string_view line = sv.substr(start, end - start);
+        if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+        if (!line.empty()) {
+            std::string u = "file://";
+            for (char ch : line) {
+                const auto c = static_cast<unsigned char>(ch);
+                if (IsUriPathSafe(c)) {
+                    u += static_cast<char>(c);
+                } else {
+                    char buf[4];
+                    std::snprintf(buf, sizeof(buf), "%%%02X", c);
+                    u += buf;
+                }
+            }
+            uris.push_back(std::move(u));
+        }
+        if (end >= sv.size()) break;
+        start = end + 1;
+    }
+
+    QByteArray out;
+    if (mime == QStringLiteral("x-special/gnome-copied-files")) {
+        out += "copy";
+        for (const auto& u : uris) {
+            out += '\n';
+            out += QByteArray::fromStdString(u);
+        }
+    } else {
+        for (const auto& u : uris) {
+            out += QByteArray::fromStdString(u);
+            out += "\r\n";
+        }
+    }
+    return out;
+}
 
 // Shared cross-thread state between the manager and the QMimeData
 // subclass. We use shared_ptr so a DelayedClipboardMimeData instance
@@ -107,6 +170,16 @@ public:
                 QStringLiteral("application/x-qt-image"),
             };
         }
+        if (kind_ == ContentKind::Files) {
+            return {
+                QStringLiteral("text/uri-list"),
+                // GNOME / Nautilus convention carrying the copy-vs-cut
+                // hint. Required for correct paste behaviour on Files
+                // and other GTK file managers. Skipping it makes
+                // Nautilus treat the paste ambiguously / silently fail.
+                QStringLiteral("x-special/gnome-copied-files"),
+            };
+        }
         return {
             QStringLiteral("text/plain;charset=utf-8"),
             QStringLiteral("text/plain"),
@@ -128,6 +201,9 @@ protected:
 
         if (kind_ == ContentKind::Image) {
             return MaterialiseImage(bytes, mimeType, type);
+        }
+        if (kind_ == ContentKind::Files) {
+            return MaterialiseFiles(bytes, mimeType);
         }
         return MaterialiseText(bytes, type);
     }
@@ -183,6 +259,13 @@ private:
             return QVariant(QString::fromUtf8(ba));
         }
         return QVariant(ba);
+    }
+
+    // text/uri-list: RFC 2483 CRLF-joined file:// URIs.
+    // x-special/gnome-copied-files: Nautilus format (see formatter).
+    QVariant MaterialiseFiles(const std::vector<std::uint8_t>& path_bytes,
+                              const QString& mimeType) const {
+        return QVariant(FormatFilesBytesForMime(path_bytes, mimeType));
     }
 
     QVariant MaterialiseImage(const std::vector<std::uint8_t>& webp_bytes,
@@ -339,6 +422,10 @@ public:
 
     void AnnounceDelayedImage(const std::string& content_hash) override {
         AnnounceDelayed(content_hash, ContentKind::Image);
+    }
+
+    void AnnounceDelayedFiles(const std::string& content_hash) override {
+        AnnounceDelayed(content_hash, ContentKind::Files);
     }
 
     void AnnounceDelayed(const std::string& content_hash, ContentKind kind) {

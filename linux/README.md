@@ -4,9 +4,11 @@ Qt 6 / C++17 implementation of the `clipboard-helper` agent for Linux. Sibling t
 
 Speaks the same length-prefixed `HelperMessage` protobuf wire protocol; runtime-selects between **Wayland** (`ext-data-control-v1` for KDE Plasma 6, `wlr-data-control-unstable-v1` for wlroots compositors), **X11** (Qt `xcb` QClipboard), and **GNOME XWayland** (force `QT_QPA_PLATFORM=xcb` because Mutter does not implement any data-control extension).
 
-> **Status — P3 (IMAGE) landing**: IPC layer, dispatch, parent watchdog, backend detector all in. **Wayland (`wlr-data-control` + `ext-data-control`) and X11 backends both handle TEXT and IMAGE delayed rendering.** FILES (`text/uri-list` + per-file chunk plumbing) still pending — Linux helper currently rejects FILES with an error reply, parent should fall back to no-op.
+> **Status — P3 complete (TEXT + IMAGE + FILES)**: IPC layer, dispatch, parent watchdog, backend detector all in. **Wayland (`wlr-data-control` + `ext-data-control`) and X11 backends handle all three content types in delayed rendering.**
 
 The IMAGE path decodes the lossless WebP shen sends on the wire via QImage (qt6-image-formats-plugins) and re-encodes per paste consumer's MIME (PNG / BMP / Qt-native QImage).
+
+The FILES path mirrors the macOS helper's flow: shen downloads files locally and returns newline-joined absolute paths via PROVIDE_DATA; the helper formats those into `file://` URIs joined by CRLF per RFC 2483 and writes them to the paste consumer's fd as `text/uri-list`.
 
 ## Architecture
 

@@ -44,6 +44,16 @@ public:
         LH_LOG_INFO(m.str());
     }
 
+    void AnnounceDelayedFiles(const std::string& content_hash) override {
+        {
+            std::lock_guard<std::mutex> g(mu_);
+            pending_hash_ = content_hash;
+        }
+        std::ostringstream m;
+        m << "[stub] AnnounceDelayedFiles(hash=" << ShortHash(content_hash) << ")";
+        LH_LOG_INFO(m.str());
+    }
+
     void ProvideData(const std::string&            content_hash,
                      const std::vector<std::uint8_t>& data) override {
         std::string expected;

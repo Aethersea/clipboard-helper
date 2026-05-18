@@ -173,7 +173,8 @@ std::vector<std::uint8_t> Dispatcher::HandleAnnounceDelayed(const std::uint8_t* 
             clipboard_->AnnounceDelayedImage(ann.content_hash);
             return {};
         case proto::ClipboardContentType::Files:
-            return dispatch_codec::EncodeError("ANNOUNCE_DELAYED: FILES not yet supported on Linux helper");
+            clipboard_->AnnounceDelayedFiles(ann.content_hash);
+            return {};
         default:
             return dispatch_codec::EncodeError("ANNOUNCE_DELAYED: unknown content_type");
     }

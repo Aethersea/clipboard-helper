@@ -242,3 +242,18 @@ TEST(DispatchCodec, ParseAnnouncementDetectsImageContentType) {
               static_cast<int>(ch::proto::ClipboardContentType::Image));
     EXPECT_EQ(out.content_hash, std::string("imghash"));
 }
+
+TEST(DispatchCodec, ParseAnnouncementDetectsFilesContentType) {
+    // content_type=3 (Files), content_hash="fileshash". Dispatch
+    // routes via AnnounceDelayedFiles → backend advertises
+    // text/uri-list.
+    std::vector<std::uint8_t> ann = {
+        0x08, 0x03,                                              // field 1 varint = 3 (Files)
+        0x12, 0x09, 'f','i','l','e','s','h','a','s','h',         // field 2 string len=9
+    };
+    cc::ParsedAnnouncement out{};
+    ASSERT_TRUE(cc::ParseAnnouncement(ann.data(), ann.size(), out));
+    EXPECT_EQ(static_cast<int>(out.content_type),
+              static_cast<int>(ch::proto::ClipboardContentType::Files));
+    EXPECT_EQ(out.content_hash, std::string("fileshash"));
+}

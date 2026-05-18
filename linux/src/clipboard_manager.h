@@ -53,6 +53,19 @@ public:
     // for.
     virtual void AnnounceDelayedImage(const std::string& content_hash) = 0;
 
+    // Files announcement — advertises text/uri-list. On paste the
+    // backend sends DATA_REQUEST upstream like text/image; the parent
+    // is expected to download files locally first, then return a
+    // newline-joined list of LOCAL absolute paths via ProvideData.
+    // Backend converts those paths into `file://`-prefixed URIs joined
+    // by CRLF per RFC 2483, then writes the result to the paste fd.
+    //
+    // (Matches the macOS helper's flow for FILES: the parent owns the
+    // download because it has the WebRTC connection; the helper just
+    // formats local paths into the platform-specific clipboard
+    // representation.)
+    virtual void AnnounceDelayedFiles(const std::string& content_hash) = 0;
+
     // Provide the actual bytes for a previously-announced delayed
     // slot. Implementations enforce: if `content_hash` does not match
     // the current pending announcement, the data is discarded silently
