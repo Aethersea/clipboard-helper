@@ -33,8 +33,18 @@ clipboard-helper
 |---|---|---|---|
 | CMake | 3.21 | `cmake` | `cmake` |
 | clang or gcc | clang 16+ / gcc 12+ | `clang` | `clang` |
-| Qt 6 (Core + Gui) | 6.5 LTS | `qt6-base-dev` | `qt6-qtbase-devel` |
-| Qt 6 image format plugins (for WebP decode) | 6.5 LTS | `qt6-image-formats-plugins` | `qt6-qtimageformats` |
+| Qt 6 (Core + Gui) | 6.4 (Debian 13 / Ubuntu 24.04 stock) | `qt6-base-dev` | `qt6-qtbase-devel` |
+| Qt 6 image format plugins (for WebP decode) | 6.4 | `qt6-image-formats-plugins` | `qt6-qtimageformats` |
+
+### Runtime portability
+
+The GitHub Actions release build runs on `ubuntu-24.04`, which links
+the binary against **glibc 2.39**. End users on older distributions
+(Ubuntu 22.04 = glibc 2.35, Debian 12 bookworm = glibc 2.36) will hit
+`GLIBC_2.XX not found` at startup. Build from source on the target
+distro to work around it; a future CI improvement could move to an
+`ubuntu-22.04` runner + `aqtinstall` for a wider compatibility floor
+at the cost of more CI complexity.
 
 Wayland backend dependencies (added in the next PR alongside the actual binding):
 

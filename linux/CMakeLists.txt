@@ -33,8 +33,12 @@ set(CMAKE_AUTOMOC ON)
 # Wayland backend talks libwayland-client directly and stays QtCore-only
 # (no QPA plugin → no risk of double-grabbing the wl_display socket).
 #
-# Floor: Qt 6.5 (LTS, ships on Debian 13 / Ubuntu 24.04 / Fedora 40+).
-find_package(Qt6 6.5 REQUIRED COMPONENTS Core Gui)
+# Floor: Qt 6.4 — matches what Debian 13 (trixie, 6.4.2) and Ubuntu
+# 24.04 ship by default, so distro-package installs suffice without
+# pulling in aqtinstall / Qt installer. Nothing in our actual usage
+# (QCoreApplication, QGuiApplication, QClipboard, QMimeData,
+# QImage{Reader,Writer}) is 6.5-specific.
+find_package(Qt6 6.4 REQUIRED COMPONENTS Core Gui)
 
 # ─── Wayland (libwayland-client + wayland-scanner) ─────────────────────────
 #

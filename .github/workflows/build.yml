@@ -101,8 +101,89 @@ jobs:
           name: clipboard-helper-windows-x64
           path: windows/clipboard-helper-windows.exe
 
+  build-linux:
+    name: Linux (x64, Qt 6 + clang)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: linux
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+
+      # System packages cover everything we need at build time AND
+      # runtime: qt6-base-dev pulls in Qt's QtCore+QtGui dev files;
+      # qt6-image-formats-plugins is the runtime WebP plugin (loaded by
+      # QImage::loadFromData at paste time — the helper logs a loud
+      # error on startup if it's missing); libwayland-dev gives us
+      # both libwayland-client (link target) and wayland-scanner
+      # (codegen for the protocol XMLs); pkg-config is required by
+      # the wayland-client find_package call. Ubuntu 24.04 ships
+      # Qt 6.4.2 by default, matching our CMakeLists floor.
+      - name: Install build + runtime deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake clang \
+            qt6-base-dev qt6-image-formats-plugins \
+            libwayland-dev pkg-config curl
+
+      # The XMLs are fetched from the canonical upstream sources by
+      # ./protocols/fetch-protocols.sh. CMake's configure step bails
+      # with a clear error if they're missing; do this BEFORE configure.
+      - name: Fetch Wayland protocol XMLs
+        run: ./protocols/fetch-protocols.sh
+
+      - name: Configure (Release)
+        env:
+          CC: clang
+          CXX: clang++
+        run: |
+          mkdir -p build
+          cd build
+          cmake -DCMAKE_BUILD_TYPE=Release ..
+
+      - name: Build
+        run: cmake --build build -j
+
+      # Same pattern as the macOS / Windows test steps: ctest invokes
+      # the clipboard_helper_tests binary that tests/CMakeLists.txt
+      # builds. --output-on-failure stays quiet on green runs but
+      # surfaces test_lite assertion text on first failure.
+      #
+      # Several test cases (parent_watchdog, socket_server) exercise
+      # real Linux syscalls (prctl, AF_UNIX, fork) — the runner is a
+      # real Ubuntu VM so these are first-class tests, not mocks.
+      - name: Run unit tests
+        run: ctest --test-dir build --output-on-failure
+
+      # Verify the WebP plugin is actually loadable from the binary's
+      # runtime environment. main.cpp does the same check at startup
+      # and logs ERROR if missing; this is an extra CI-time guard so
+      # we never publish a release where the apt dep got dropped.
+      # `find` is arch-agnostic — the plugin lives under
+      # /usr/lib/<triple>/qt6/plugins/imageformats/ where the triple
+      # varies (x86_64-linux-gnu, aarch64-linux-gnu, ...).
+      - name: Verify WebP plugin available
+        run: |
+          if ! find /usr/lib -name 'libqwebp*.so' -print -quit | grep -q .; then
+            echo "qt6-image-formats-plugins didn't install the WebP plugin" >&2
+            exit 1
+          fi
+
+      - name: Rename binary
+        run: |
+          cp build/clipboard-helper clipboard-helper-linux
+          chmod +x clipboard-helper-linux
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: clipboard-helper-linux-x64
+          path: linux/clipboard-helper-linux
+
   release:
-    needs: [build-macos, build-windows]
+    needs: [build-macos, build-windows, build-linux]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
@@ -118,16 +199,22 @@ jobs:
         with:
           name: clipboard-helper-windows-x64
 
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: clipboard-helper-linux-x64
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           files: |
             clipboard-helper-macos
             clipboard-helper-windows.exe
+            clipboard-helper-linux
           generate_release_notes: true
 
   release-latest:
-    needs: [build-macos, build-windows]
+    needs: [build-macos, build-windows, build-linux]
     if: github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     permissions:
@@ -143,6 +230,11 @@ jobs:
         with:
           name: clipboard-helper-windows-x64
 
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: clipboard-helper-linux-x64
+
       - name: Update latest release
         uses: softprops/action-gh-release@v3
         with:
@@ -152,5 +244,6 @@ jobs:
           files: |
             clipboard-helper-macos
             clipboard-helper-windows.exe
+            clipboard-helper-linux
           prerelease: true
           make_latest: false
