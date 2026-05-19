@@ -185,31 +185,12 @@ bool ReadClipboard(HWND owner, ClipboardSnapshot& out) {
         return false;
     }
 
-    if (::IsClipboardFormatAvailable(CF_UNICODETEXT)) {
-        HANDLE h = ::GetClipboardData(CF_UNICODETEXT);
-        if (h != nullptr) {
-            auto* p = static_cast<const wchar_t*>(::GlobalLock(h));
-            if (p != nullptr) {
-                // Trust the OS NUL-termination. wcslen is safe because the
-                // clipboard always stores a NUL after the user data.
-                const std::size_t n = ::wcslen(p);
-                out.text.assign(p, p + n);
-                out.content_type = proto::ClipboardContentType::Text;
-                ::GlobalUnlock(h);
-                return true;
-            }
-        }
-    }
-
-    if (::IsClipboardFormatAvailable(CF_DIB) || ::IsClipboardFormatAvailable(CF_DIBV5)) {
-        BgraImage img;
-        if (ReadClipboardDibToBgra(img)) {
-            if (BgraToPng(img, out.image_png)) {
-                out.content_type = proto::ClipboardContentType::Image;
-                return true;
-            }
-        }
-    }
+    // File formats must be probed BEFORE text/image.  When Explorer copies a
+    // file it advertises *both* CF_HDROP and CF_UNICODETEXT (the full path as
+    // text) on the clipboard, so a naive "text first" lookup misclassifies
+    // every file copy as a text copy and the parent never receives a Files
+    // CLIPBOARD_CHANGED frame.  The macOS helper has the same ordering rule;
+    // see PasteboardManager.swift:readPasteboard.
 
     // CF_HDROP — physical-file copies (Explorer, file-manager apps).
     if (::IsClipboardFormatAvailable(CF_HDROP)) {
@@ -252,6 +233,33 @@ bool ReadClipboard(HWND owner, ClipboardSnapshot& out) {
             return true;
         }
     }
+
+    if (::IsClipboardFormatAvailable(CF_UNICODETEXT)) {
+        HANDLE h = ::GetClipboardData(CF_UNICODETEXT);
+        if (h != nullptr) {
+            auto* p = static_cast<const wchar_t*>(::GlobalLock(h));
+            if (p != nullptr) {
+                // Trust the OS NUL-termination. wcslen is safe because the
+                // clipboard always stores a NUL after the user data.
+                const std::size_t n = ::wcslen(p);
+                out.text.assign(p, p + n);
+                out.content_type = proto::ClipboardContentType::Text;
+                ::GlobalUnlock(h);
+                return true;
+            }
+        }
+    }
+
+    if (::IsClipboardFormatAvailable(CF_DIB) || ::IsClipboardFormatAvailable(CF_DIBV5)) {
+        BgraImage img;
+        if (ReadClipboardDibToBgra(img)) {
+            if (BgraToPng(img, out.image_png)) {
+                out.content_type = proto::ClipboardContentType::Image;
+                return true;
+            }
+        }
+    }
+
     return false;
 }
 
