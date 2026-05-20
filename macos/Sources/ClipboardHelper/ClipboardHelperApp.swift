@@ -235,6 +235,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // Show or update progress
             if progressPanel == nil {
                 progressPanel = TransferProgressPanel()
+                // Cancel button → PasteboardManager.  The transferID we
+                // pass through lets PasteboardManager filter out late
+                // cancels for a transfer that already completed, in
+                // case the user clicks Cancel within the 1.5 s
+                // auto-dismiss window after the final progress frame.
+                let transferID = progress.transferID
+                progressPanel?.onCancel = { [weak self] in
+                    self?.pasteboardManager.cancelFileDownload(transferID: transferID)
+                }
                 progressPanel?.showPanel()
             }
             progressPanel?.updateProgress(

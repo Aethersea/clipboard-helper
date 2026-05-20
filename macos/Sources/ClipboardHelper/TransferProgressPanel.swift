@@ -3,20 +3,27 @@ import Foundation
 
 /// A floating HUD-style panel that shows file transfer progress.
 /// Displayed by the clipboard-helper when the Go server reports download progress.
-final class TransferProgressPanel {
+final class TransferProgressPanel: NSObject {
+
+    /// User clicked the Cancel button in the HUD.  Wired by
+    /// ClipboardHelperApp at panel-creation time so the cancellation
+    /// flows back to PasteboardManager (which sets a flag the
+    /// ensureFilesDownloaded spin loop checks).
+    var onCancel: (() -> Void)?
 
     private var panel: NSPanel?
     private var progressIndicator: NSProgressIndicator?
     private var statusLabel: NSTextField?
     private var bytesLabel: NSTextField?
+    private var cancelButton: NSButton?
 
     // MARK: - Show / Close
 
     func showPanel() {
         guard panel == nil else { return }
 
-        let panelWidth: CGFloat = 320
-        let panelHeight: CGFloat = 90
+        let panelWidth: CGFloat = 360
+        let panelHeight: CGFloat = 100
 
         // Position: bottom-right of the main screen, above the Dock
         let screenFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1920, height: 1080)
@@ -38,15 +45,34 @@ final class TransferProgressPanel {
 
         let contentView = NSView(frame: NSRect(x: 0, y: 0, width: panelWidth, height: panelHeight))
 
-        // Status label: "Transferring files…"
+        // Cancel button (top-right).  Sized for HUD aesthetic;
+        // `bezelStyle = .inline` matches macOS native cancel-during-
+        // copy chrome.  Width fits "Cancel" in en_US — localise the
+        // title separately if a future locale needs more room.
+        let cancelButtonWidth: CGFloat = 64
+        let cancelButtonHeight: CGFloat = 22
+        let cancel = NSButton(frame: NSRect(
+            x: panelWidth - 16 - cancelButtonWidth,
+            y: panelHeight - 16 - cancelButtonHeight,
+            width: cancelButtonWidth,
+            height: cancelButtonHeight))
+        cancel.title = "Cancel"
+        cancel.bezelStyle = .inline
+        cancel.font = NSFont.systemFont(ofSize: 11)
+        cancel.target = self
+        cancel.action = #selector(cancelButtonClicked)
+        contentView.addSubview(cancel)
+        cancelButton = cancel
+
+        // Status label: "Transferring files…" (left of cancel button)
         let status = NSTextField(labelWithString: "Transferring files…")
         status.font = NSFont.systemFont(ofSize: 13, weight: .medium)
-        status.frame = NSRect(x: 16, y: 52, width: panelWidth - 32, height: 20)
+        status.frame = NSRect(x: 16, y: 60, width: panelWidth - 32 - cancelButtonWidth - 8, height: 20)
         contentView.addSubview(status)
         statusLabel = status
 
         // Progress bar
-        let progress = NSProgressIndicator(frame: NSRect(x: 16, y: 32, width: panelWidth - 32, height: 14))
+        let progress = NSProgressIndicator(frame: NSRect(x: 16, y: 36, width: panelWidth - 32, height: 14))
         progress.style = .bar
         progress.isIndeterminate = false
         progress.minValue = 0
@@ -59,7 +85,7 @@ final class TransferProgressPanel {
         let bytes = NSTextField(labelWithString: "")
         bytes.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
         bytes.textColor = .secondaryLabelColor
-        bytes.frame = NSRect(x: 16, y: 8, width: panelWidth - 32, height: 16)
+        bytes.frame = NSRect(x: 16, y: 10, width: panelWidth - 32, height: 16)
         contentView.addSubview(bytes)
         bytesLabel = bytes
 
@@ -68,12 +94,23 @@ final class TransferProgressPanel {
         panel = p
     }
 
+    @objc private func cancelButtonClicked() {
+        // Reflect the cancel intent immediately in the UI before the
+        // upstream pipeline observes the flag and tears down — gives
+        // the user instant feedback that the click registered.
+        statusLabel?.stringValue = "Cancelling…"
+        cancelButton?.isEnabled = false
+        onCancel?()
+    }
+
     func close() {
         panel?.orderOut(nil)
         panel = nil
         progressIndicator = nil
         statusLabel = nil
         bytesLabel = nil
+        cancelButton = nil
+        onCancel = nil
     }
 
     // MARK: - Update
@@ -91,6 +128,7 @@ final class TransferProgressPanel {
     }
 
     func completeTransfer(success: Bool, errorMessage: String) {
+        cancelButton?.isEnabled = false
         if success {
             statusLabel?.stringValue = "Transfer complete"
             progressIndicator?.doubleValue = 1.0
