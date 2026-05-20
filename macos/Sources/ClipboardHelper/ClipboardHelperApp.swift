@@ -138,6 +138,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.ensureProgressPanelVisible(for: transferID)
         }
 
+        // KVO-driven progress from the NSFilePromiseProvider path
+        // (FilePromiseHandler.writePromiseTo observes
+        // parentProgress.fractionCompleted).  Finder's actual paste path
+        // doesn't emit IPC FILE_TRANSFER_PROGRESS frames, so this
+        // callback is what keeps the panel updated when the user pastes
+        // into Finder.
+        pasteboardManager.onTransferProgress = { [weak self] transferID, transferred, total in
+            guard let self = self else { return }
+            // Defensive ensure — KVO observation can fire before
+            // onTransferStart in rare orderings on the operation queue.
+            self.ensureProgressPanelVisible(for: transferID)
+            self.progressPanel?.updateProgress(
+                bytesTransferred: transferred,
+                totalBytes: total
+            )
+        }
+
+        // KVO-driven completion for the NSFilePromiseProvider path.
+        // Mirrors the auto-dismiss timing used by handleFileTransferProgress
+        // so the UX is uniform across both pipelines.
+        pasteboardManager.onTransferComplete = { [weak self] _, success, errorMessage in
+            guard let self = self else { return }
+            Log.info("[FileTransfer] Promise transfer complete: success=\(success)")
+            self.progressPanel?.completeTransfer(success: success, errorMessage: errorMessage)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                self?.progressPanel?.close()
+                self?.progressPanel = nil
+            }
+        }
+
         socketServer.onMessage = { [weak self] message in
             self?.handleMessage(message)
         }
