@@ -137,13 +137,20 @@ extension PasteboardManager: NSFilePromiseProviderDelegate {
         // XPC-driven progress UI (it expects writePromiseTo to return
         // promptly so the in-progress Progress is the one driving the
         // panel).
-        let progress = Progress(totalUnitCount: Int64(max(fileSize, 1)))
+        // Clamp the declared fileSize to the Int64 range — a malformed
+        // (or maliciously large) announcement could otherwise trap on
+        // the UInt64→Int64 conversion below.
+        let totalUnits = Int64(min(fileSize, UInt64(Int64.max)))
+        let progress = Progress(totalUnitCount: max(totalUnits, 1))
         progress.kind = .file
         progress.setUserInfoObject(url, forKey: .fileURLKey)
         progress.setUserInfoObject(
             Progress.FileOperationKind.downloading,
             forKey: .fileOperationKindKey)
-        progress.isCancellable = false
+        // Leave isCancellable at its default (true) so a stuck transfer
+        // still surfaces a working X button in Finder's copy panel —
+        // otherwise an upstream stall would leave the user with no way
+        // to dismiss the dialog short of force-quitting the helper.
         progress.isPausable = false
         progress.publish()
 

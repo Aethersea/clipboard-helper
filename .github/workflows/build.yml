@@ -39,6 +39,23 @@ jobs:
             if ((a[1]+0) < 5 || ((a[1]+0) == 5 && (a[2]+0) < 9)) exit 1
           }' || { echo "Swift $ver is older than the required 5.9" >&2; exit 1; }
 
+      # Regenerate .pb.swift sources against the SwiftProtobuf plugin
+      # version that ships with the current Homebrew bottle.  Without
+      # this the committed generated files drift (the
+      # `init(dictionaryLiteral:)` deprecation noise we shipped against
+      # an older plugin) and the build emits a wall of warnings the
+      # next dev has to mentally filter past.  Brew is idempotent — if
+      # protoc + protoc-gen-swift are already on the runner image,
+      # `brew install` is a near-instant no-op; otherwise it fetches
+      # the bottle (≈ a few seconds).  Running it BEFORE build means
+      # the build never compiles stale generated code, regardless of
+      # what's checked in.
+      - name: Install swift-protobuf (protoc + protoc-gen-swift)
+        run: brew install swift-protobuf
+
+      - name: Regenerate Swift protobuf sources
+        run: make generate-proto
+
       - name: Build universal binary (arm64 + x86_64)
         run: make build-universal
 

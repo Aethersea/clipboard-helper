@@ -266,61 +266,40 @@ final class PasteboardManager: NSObject {
         // Drain any stale semaphore signals from previous operations
         while renderSemaphore.wait(timeout: .now()) == .success {}
 
-        // Phase 2 dual-publish: for each file we add TWO pasteboard items —
-        //
-        //   (a) NSFilePromiseProvider  — preferred by promise-aware
-        //       consumers (Finder, Mail, Notes, modern AppKit). The OS
-        //       picks the destination URL and `writePromiseTo:` (in
-        //       FilePromiseHandler.swift) streams chunks directly there
-        //       via FileTransferCoordinator. No main-thread block.
-        //
-        //   (b) NSPasteboardItem with `.fileURL` lazy provider — fallback
-        //       for legacy/third-party consumers that only read
-        //       `.fileURL`. Goes through ensureFilesDownloaded → temp-dir
-        //       cache, the same path that existed pre-Phase-2.
-        //
-        // Consumers ask the pasteboard for specific types
-        // (readObjects(forClasses: [NSFilePromiseReceiver.self]) vs
-        // [NSURL.self]), so seeing 2N items doesn't cause double-paste —
-        // each consumer picks one type-class and gets exactly N items.
-        // The risk is a consumer that reads BOTH; in practice macOS
-        // built-ins and well-behaved third parties don't.
+        // NSFilePromiseProvider only.  Previous iterations also published
+        // an NSPasteboardItem with a `.fileURL` data provider as a
+        // "fallback" for legacy consumers, BUT modern Finder (and most
+        // current AppKit apps) reads BOTH item classes from the
+        // pasteboard.  When Finder probes the `.fileURL` provider it
+        // does so synchronously on its MAIN THREAD, which blocks waiting
+        // for ensureFilesDownloaded (up to 300 s) — that's the "Finder
+        // spinning beachball" symptom observed during Flow B testing.
+        // Apps that ONLY understand `.fileURL` (rare these days; macOS
+        // 10.12+ apps know NSFilePromiseReceiver) will see no clipboard
+        // content from us; the trade-off favours the dominant case
+        // (Finder paste) over the legacy fallback we have no evidence
+        // anyone actually uses.
         var writings: [NSPasteboardWriting] = []
-        for (i, file) in announcement.files.enumerated() {
+        for file in announcement.files {
             let provider = makeFilePromiseProvider(for: file,
                                                    transferID: announcement.transferID)
             activePromiseProviders.append(provider)
             writings.append(provider)
-
-            let item = NSPasteboardItem()
-            item.setString("\(i)", forType: .init("com.leviathan.clipboard.file-index"))
-            item.setDataProvider(self, forTypes: [.fileURL])
-            writings.append(item)
         }
 
         pasteboard.clearContents()
         pasteboard.writeObjects(writings)
         lastChangeCount = pasteboard.changeCount
 
-        // Eager pre-download for the `.fileURL` fallback path. Without
-        // this, a legacy consumer that pastes triggers ensureFilesDownloaded
-        // on the main thread — which then spins the run loop for up to
-        // 300 s. With this, the download is already in flight (or done)
-        // by the time the fallback callback fires, so ensureFilesDownloaded
-        // returns from cache near-instantly.
-        //
-        // Cost: bandwidth wasted if every consumer in the session is
-        // promise-aware (Finder etc.) and so never hits the fallback.
-        // Acceptable trade-off given the UX win for legacy consumers.
-        // Note: this is a no-op in server mode (no onDataRequest wired);
-        // the dispatch_async still happens but the inner closure exits
-        // early on missing callbacks.
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self = self else { return }
-            _ = self.ensureFilesDownloaded(announcement: announcement)
-        }
+        // The eager pre-download that used to live here was the
+        // companion to the `.fileURL` data-provider fallback we just
+        // removed.  Without that fallback there's nothing to feed —
+        // every paste flows through writePromiseTo → FileTransferCoordinator,
+        // which fetches bytes lazily per chunk.  Removing the eager kick
+        // also stops leviathan from spinning up a full dcTransfer batch
+        // download for every announcement (which then sat unread).
 
-        Log.info("Announced delayed files (dual-publish): \(announcement.files.count) file(s) hash=\(announcement.contentHash) transferID=\(announcement.transferID)")
+        Log.info("Announced delayed files (NSFilePromiseProvider only): \(announcement.files.count) file(s) hash=\(announcement.contentHash) transferID=\(announcement.transferID)")
     }
 
     // MARK: - Provide Data (response from parent)
