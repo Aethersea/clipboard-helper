@@ -157,6 +157,26 @@ bool RenderImageDuringWmRenderFormat(UINT format, const std::uint8_t* png, std::
 UINT GetCfFileDescriptor();
 UINT GetCfFileContents();
 
+// "ExcludeClipboardContentFromMonitorProcessing" — registered system-wide
+// format that, when advertised by an IDataObject, asks Windows Clipboard
+// History (Win+V) and other clipboard monitors to skip snapshotting.
+// Required for virtual-file delayed-render IDataObjects so the monitor's
+// immediate post-publish probe doesn't replace the live IDataObject with
+// a frozen descriptor-only snapshot the user's later Ctrl+V resolves
+// against (and silently fails because the snapshot has no IStream
+// wiring).
+UINT GetCfExcludeFromMonitorProcessing();
+
+// CFSTR_PREFERREDDROPEFFECT — registered system-wide format.  When an
+// IDataObject advertises this and returns DROPEFFECT_COPY as the value,
+// the shell paste target (Explorer, file dialogs, drag-drop sites) knows
+// the source intends a copy operation rather than a move/link.  Without
+// it, virtual-file IDataObjects can hit edge cases where the target either
+// silently bails the paste, or attempts a move that fails because our
+// SetData(CFSTR_PERFORMEDDROPEFFECT) is E_NOTIMPL.  Data is a single
+// DWORD = DROPEFFECT_COPY (1).
+UINT GetCfPreferredDropEffect();
+
 // Read virtual files (drag-from-Outlook, zip preview, etc.) off the
 // current clipboard via OleGetClipboard + GetData(CFSTR_FILEDESCRIPTORW).
 // On success, out.virtual_files is populated with per-file metadata and

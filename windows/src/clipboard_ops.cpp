@@ -547,6 +547,27 @@ UINT GetCfFileContents() {
     return cf;
 }
 
+// "ExcludeClipboardContentFromMonitorProcessing" — when present on a
+// clipboard data object, Windows Clipboard History (Win+V) and other
+// clipboard monitors skip snapshotting the clipboard.  Required for
+// virtual-file delayed-render IDataObjects: without it, Clipboard
+// History tries to snapshot our content right after OleSetClipboard
+// (observed at +6 ms in the trace), captures only the descriptor, and
+// the user's later Ctrl+V in Explorer gets served the cached snapshot
+// — which has the descriptor but no IStream wiring, so paste silently
+// produces nothing.  Microsoft docs:
+// https://learn.microsoft.com/en-us/windows/win32/dataxchg/clipboard-formats#disabling-the-clipboard-history-and-roaming
+UINT GetCfExcludeFromMonitorProcessing() {
+    static UINT cf = ::RegisterClipboardFormatW(
+        L"ExcludeClipboardContentFromMonitorProcessing");
+    return cf;
+}
+
+UINT GetCfPreferredDropEffect() {
+    static UINT cf = ::RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT);
+    return cf;
+}
+
 bool ReadVirtualFiles(ClipboardSnapshot& out) {
     out.virtual_files.clear();
     out.virtual_data_object = nullptr;

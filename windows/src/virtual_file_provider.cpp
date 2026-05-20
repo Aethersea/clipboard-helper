@@ -34,6 +34,34 @@ HGLOBAL BuildFileGroupDescriptor(const std::vector<VirtualFileSpec>& specs) {
         LH_LOG_WARN(buf);
         return nullptr;
     }
+    // Dump descriptor contents — Explorer rejects file pastes silently when
+    // file_size == 0 with FD_FILESIZE flag, or when cFileName has illegal
+    // chars (':' / '*' / '?' / '<' / '>' / '|' / '"' / '\') on Windows
+    // filesystems. Trace lets the operator diff the published descriptor
+    // against Explorer's drop-target validation rules.
+    {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+                      "[trace] BuildFileGroupDescriptor: count=%zu", specs.size());
+        LH_LOG_INFO(buf);
+        for (std::size_t i = 0; i < specs.size(); ++i) {
+            const auto& s = specs[i];
+            // Best-effort log of the UTF-16 name as ANSI — non-ASCII chars
+            // show as '?' but that's enough to spot path-separator issues.
+            std::string ansi;
+            ansi.reserve(s.name.size());
+            for (wchar_t c : s.name) {
+                ansi.push_back((c >= 0x20 && c < 0x7F) ? static_cast<char>(c) : '?');
+            }
+            std::snprintf(buf, sizeof(buf),
+                          "[trace]   spec[%zu] file_id=%s size=%llu is_dir=%d name=\"%s\"",
+                          i, s.file_id.c_str(),
+                          static_cast<unsigned long long>(s.size),
+                          s.is_directory ? 1 : 0,
+                          ansi.c_str());
+            LH_LOG_INFO(buf);
+        }
+    }
     // Pre-scan for cFileName truncations so the operator can correlate
     // paste failures on deeply-nested paths to MAX_PATH limits. The pure
     // BuildFileGroupDescriptorPayload helper is silent by design; we
@@ -103,6 +131,16 @@ public:
             ++pos_;
         }
         if (pceltFetched != nullptr) *pceltFetched = fetched;
+        {
+            char buf[128];
+            std::snprintf(buf, sizeof(buf),
+                          "[trace] VirtualFileEnum::Next celt=%lu fetched=%lu total=%zu pos=%lu",
+                          static_cast<unsigned long>(celt),
+                          static_cast<unsigned long>(fetched),
+                          formats_.size(),
+                          static_cast<unsigned long>(pos_));
+            LH_LOG_INFO(buf);
+        }
         return (fetched == celt) ? S_OK : S_FALSE;
     }
     HRESULT STDMETHODCALLTYPE Skip(ULONG celt) override {
@@ -174,6 +212,16 @@ public:
 
     // ── ISequentialStream ───────────────────────────────────────────────
     HRESULT STDMETHODCALLTYPE Read(void* pv, ULONG cb, ULONG* pcbRead) override {
+        {
+            char buf[160];
+            std::snprintf(buf, sizeof(buf),
+                          "[trace] VirtualFileStream::Read file_id=%s cb=%lu pos=%llu size=%llu",
+                          file_id_.c_str(),
+                          static_cast<unsigned long>(cb),
+                          static_cast<unsigned long long>(pos_),
+                          static_cast<unsigned long long>(size_));
+            LH_LOG_INFO(buf);
+        }
         if (pv == nullptr) return STG_E_INVALIDPOINTER;
         if (pcbRead != nullptr) *pcbRead = 0;
 
@@ -243,6 +291,16 @@ public:
     HRESULT STDMETHODCALLTYPE Seek(LARGE_INTEGER dlibMove,
                                    DWORD dwOrigin,
                                    ULARGE_INTEGER* plibNewPosition) override {
+        {
+            char buf[160];
+            std::snprintf(buf, sizeof(buf),
+                          "[trace] VirtualFileStream::Seek file_id=%s move=%lld origin=%lu pos=%llu",
+                          file_id_.c_str(),
+                          static_cast<long long>(dlibMove.QuadPart),
+                          static_cast<unsigned long>(dwOrigin),
+                          static_cast<unsigned long long>(pos_));
+            LH_LOG_INFO(buf);
+        }
         // All arithmetic in uint64 so a 2^63-byte file (purely theoretical
         // but undefined-cast-free) cannot wrap to a negative int64. We
         // bound the result against INT64_MAX so callers that try to seek
@@ -345,6 +403,15 @@ public:
         return STG_E_INVALIDFUNCTION;
     }
     HRESULT STDMETHODCALLTYPE Stat(STATSTG* pstatstg, DWORD grfStatFlag) override {
+        {
+            char buf[160];
+            std::snprintf(buf, sizeof(buf),
+                          "[trace] VirtualFileStream::Stat file_id=%s size=%llu flag=0x%lx",
+                          file_id_.c_str(),
+                          static_cast<unsigned long long>(size_),
+                          static_cast<unsigned long>(grfStatFlag));
+            LH_LOG_INFO(buf);
+        }
         if (pstatstg == nullptr) return STG_E_INVALIDPOINTER;
         std::memset(pstatstg, 0, sizeof(*pstatstg));
         pstatstg->type             = STGTY_STREAM;
@@ -405,7 +472,9 @@ public:
           transfer_id_(std::move(transfer_id)),
           provider_(provider),
           cf_descriptor_(GetCfFileDescriptor()),
-          cf_contents_(GetCfFileContents()) {}
+          cf_contents_(GetCfFileContents()),
+          cf_exclude_(GetCfExcludeFromMonitorProcessing()),
+          cf_drop_effect_(GetCfPreferredDropEffect()) {}
 
     // ── IUnknown ────────────────────────────────────────────────────────
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
@@ -413,9 +482,22 @@ public:
         if (riid == __uuidof(IUnknown) || riid == __uuidof(IDataObject)) {
             *ppv = static_cast<IDataObject*>(this);
             AddRef();
+            LH_LOG_INFO("[trace] VirtualClipboardDataObject::QueryInterface(IDataObject) → S_OK");
             return S_OK;
         }
         *ppv = nullptr;
+        {
+            // Log unknown IID requests so we can see when consumers probe
+            // for IAsyncOperation, IDataObjectAsyncCapability, etc.
+            char buf[160];
+            std::snprintf(buf, sizeof(buf),
+                          "[trace] VirtualClipboardDataObject::QueryInterface unknown IID "
+                          "{%08lX-%04hX-%04hX-...} → E_NOINTERFACE",
+                          static_cast<unsigned long>(riid.Data1),
+                          static_cast<unsigned short>(riid.Data2),
+                          static_cast<unsigned short>(riid.Data3));
+            LH_LOG_INFO(buf);
+        }
         return E_NOINTERFACE;
     }
     ULONG STDMETHODCALLTYPE AddRef() override {
@@ -433,23 +515,97 @@ public:
         std::memset(sm, 0, sizeof(*sm));
 
         const UINT fmt = fe->cfFormat;
+        {
+            char buf[192];
+            std::snprintf(buf, sizeof(buf),
+                          "[trace] VirtualClipboardDataObject::GetData "
+                          "cfFormat=%u (descriptor=%u contents=%u exclude=%u) lindex=%ld tymed=0x%lx",
+                          fmt, cf_descriptor_, cf_contents_, cf_exclude_,
+                          static_cast<long>(fe->lindex),
+                          static_cast<unsigned long>(fe->tymed));
+            LH_LOG_INFO(buf);
+        }
 
         // CFSTR_FILEDESCRIPTORW → FILEGROUPDESCRIPTORW HGLOBAL.
         if (fmt == cf_descriptor_) {
-            if ((fe->tymed & TYMED_HGLOBAL) == 0) return DV_E_TYMED;
+            if ((fe->tymed & TYMED_HGLOBAL) == 0) {
+                LH_LOG_INFO("[trace] GetData: DESCRIPTOR but tymed missing TYMED_HGLOBAL → DV_E_TYMED");
+                return DV_E_TYMED;
+            }
             HGLOBAL h = BuildFileGroupDescriptor(specs_);
             if (h == nullptr) return E_OUTOFMEMORY;
             sm->tymed          = TYMED_HGLOBAL;
             sm->hGlobal        = h;
             sm->pUnkForRelease = nullptr;  // OS frees via ReleaseStgMedium
+            LH_LOG_INFO("[trace] GetData: returning FILEGROUPDESCRIPTORW");
+            return S_OK;
+        }
+
+        // CFSTR_PREFERREDDROPEFFECT → DWORD DROPEFFECT_COPY (1) in HGLOBAL.
+        // The shell paste target reads this BEFORE asking for FILECONTENTS;
+        // without DROPEFFECT_COPY it sometimes silently aborts the paste
+        // (rather than the FILEDESCRIPTORW-only fallback we saw in the
+        // 2026-05-19 trace where Explorer fetched the descriptor and then
+        // never queried CONTENTS).
+        if (fmt == cf_drop_effect_) {
+            if ((fe->tymed & TYMED_HGLOBAL) == 0) {
+                LH_LOG_INFO("[trace] GetData: PREFERREDDROPEFFECT but tymed missing TYMED_HGLOBAL → DV_E_TYMED");
+                return DV_E_TYMED;
+            }
+            HGLOBAL h = ::GlobalAlloc(GMEM_MOVEABLE, sizeof(DWORD));
+            if (h == nullptr) return E_OUTOFMEMORY;
+            auto* p = static_cast<DWORD*>(::GlobalLock(h));
+            if (p == nullptr) {
+                ::GlobalFree(h);
+                return E_OUTOFMEMORY;
+            }
+            *p = DROPEFFECT_COPY;  // = 1
+            ::GlobalUnlock(h);
+            sm->tymed          = TYMED_HGLOBAL;
+            sm->hGlobal        = h;
+            sm->pUnkForRelease = nullptr;
+            LH_LOG_INFO("[trace] GetData: returning PREFERREDDROPEFFECT (DROPEFFECT_COPY=1)");
+            return S_OK;
+        }
+
+        // ExcludeClipboardContentFromMonitorProcessing → DWORD 0 in HGLOBAL.
+        // Microsoft docs: the data is a 4-byte DWORD value of 0; the format's
+        // presence (not its value) is what tells Clipboard History to skip
+        // this clipboard item.
+        if (fmt == cf_exclude_) {
+            if ((fe->tymed & TYMED_HGLOBAL) == 0) {
+                LH_LOG_INFO("[trace] GetData: EXCLUDE_FROM_MONITOR but tymed missing TYMED_HGLOBAL → DV_E_TYMED");
+                return DV_E_TYMED;
+            }
+            HGLOBAL h = ::GlobalAlloc(GMEM_MOVEABLE, sizeof(DWORD));
+            if (h == nullptr) return E_OUTOFMEMORY;
+            auto* p = static_cast<DWORD*>(::GlobalLock(h));
+            if (p == nullptr) {
+                ::GlobalFree(h);
+                return E_OUTOFMEMORY;
+            }
+            *p = 0;
+            ::GlobalUnlock(h);
+            sm->tymed          = TYMED_HGLOBAL;
+            sm->hGlobal        = h;
+            sm->pUnkForRelease = nullptr;
+            LH_LOG_INFO("[trace] GetData: returning EXCLUDE_FROM_MONITOR (DWORD 0)");
             return S_OK;
         }
 
         // CFSTR_FILECONTENTS → IStream for the lindex-th file.
         if (fmt == cf_contents_) {
-            if ((fe->tymed & TYMED_ISTREAM) == 0) return DV_E_TYMED;
+            if ((fe->tymed & TYMED_ISTREAM) == 0) {
+                LH_LOG_INFO("[trace] GetData: CONTENTS but tymed missing TYMED_ISTREAM → DV_E_TYMED");
+                return DV_E_TYMED;
+            }
             const LONG idx = fe->lindex;
             if (idx < 0 || static_cast<std::size_t>(idx) >= specs_.size()) {
+                char buf[128];
+                std::snprintf(buf, sizeof(buf),
+                              "[trace] GetData: CONTENTS lindex=%ld out of range (specs=%zu) → DV_E_LINDEX",
+                              static_cast<long>(idx), specs_.size());
+                LH_LOG_INFO(buf);
                 return DV_E_LINDEX;
             }
             const auto& spec = specs_[static_cast<std::size_t>(idx)];
@@ -462,15 +618,39 @@ public:
             sm->tymed          = TYMED_ISTREAM;
             sm->pstm           = stream;     // refcount=1, ownership xferred
             sm->pUnkForRelease = nullptr;
+            {
+                char buf[128];
+                std::snprintf(buf, sizeof(buf),
+                              "[trace] GetData: returning IStream for lindex=%ld file_id=%s",
+                              static_cast<long>(idx), spec.file_id.c_str());
+                LH_LOG_INFO(buf);
+            }
             return S_OK;
         }
 
+        {
+            char buf[192];
+            std::snprintf(buf, sizeof(buf),
+                          "[trace] GetData: cfFormat=%u not in [desc=%u, contents=%u, exclude=%u, drop=%u] → DV_E_FORMATETC",
+                          fmt, cf_descriptor_, cf_contents_, cf_exclude_, cf_drop_effect_);
+            LH_LOG_INFO(buf);
+        }
         return DV_E_FORMATETC;
     }
 
     HRESULT STDMETHODCALLTYPE GetDataHere(FORMATETC* fe, STGMEDIUM* sm) override {
-        (void)fe;
         (void)sm;
+        {
+            char buf[160];
+            const UINT fmt = fe ? fe->cfFormat : 0;
+            const long lindex = fe ? static_cast<long>(fe->lindex) : 0;
+            const unsigned long tymed = fe ? static_cast<unsigned long>(fe->tymed) : 0;
+            std::snprintf(buf, sizeof(buf),
+                          "[trace] VirtualClipboardDataObject::GetDataHere "
+                          "cfFormat=%u lindex=%ld tymed=0x%lx → E_NOTIMPL",
+                          fmt, lindex, tymed);
+            LH_LOG_INFO(buf);
+        }
         // GetDataHere requires the caller to have pre-allocated the
         // medium. Shell virtual-file consumers do not use this entry
         // point — they call GetData. Returning E_NOTIMPL is the
@@ -481,9 +661,24 @@ public:
     HRESULT STDMETHODCALLTYPE QueryGetData(FORMATETC* fe) override {
         if (fe == nullptr) return DV_E_FORMATETC;
         const UINT fmt = fe->cfFormat;
-        if (fmt == cf_descriptor_ && (fe->tymed & TYMED_HGLOBAL))  return S_OK;
-        if (fmt == cf_contents_   && (fe->tymed & TYMED_ISTREAM))  return S_OK;
-        return DV_E_FORMATETC;
+        HRESULT hr;
+        if (fmt == cf_descriptor_  && (fe->tymed & TYMED_HGLOBAL)) hr = S_OK;
+        else if (fmt == cf_contents_    && (fe->tymed & TYMED_ISTREAM)) hr = S_OK;
+        else if (fmt == cf_exclude_     && (fe->tymed & TYMED_HGLOBAL)) hr = S_OK;
+        else if (fmt == cf_drop_effect_ && (fe->tymed & TYMED_HGLOBAL)) hr = S_OK;
+        else                                                             hr = DV_E_FORMATETC;
+        {
+            char buf[224];
+            std::snprintf(buf, sizeof(buf),
+                          "[trace] VirtualClipboardDataObject::QueryGetData "
+                          "cfFormat=%u (descriptor=%u contents=%u exclude=%u drop=%u) lindex=%ld tymed=0x%lx → hr=0x%08lx",
+                          fmt, cf_descriptor_, cf_contents_, cf_exclude_, cf_drop_effect_,
+                          static_cast<long>(fe->lindex),
+                          static_cast<unsigned long>(fe->tymed),
+                          static_cast<unsigned long>(hr));
+            LH_LOG_INFO(buf);
+        }
+        return hr;
     }
 
     HRESULT STDMETHODCALLTYPE GetCanonicalFormatEtc(FORMATETC* in_fe,
@@ -516,16 +711,18 @@ public:
         *ppEnum = nullptr;
         if (dwDirection != DATADIR_GET) return E_NOTIMPL;
 
-        // Two FORMATETC entries:
+        // Four FORMATETC entries:
         //   1. CFSTR_FILEDESCRIPTORW  / TYMED_HGLOBAL / lindex = -1
         //   2. CFSTR_FILECONTENTS     / TYMED_ISTREAM / lindex = -1
+        //   3. ExcludeClipboardContentFromMonitorProcessing / TYMED_HGLOBAL
+        //   4. CFSTR_PREFERREDDROPEFFECT / TYMED_HGLOBAL / lindex = -1
         //
         // For CFSTR_FILECONTENTS the enumeration advertises lindex=-1
         // (meaning "applies to any lindex"); consumers iterate lindex
         // themselves when calling GetData. This matches the convention
         // used by Outlook's IDataObject and the docs in CFSTR_FILECONTENTS.
         std::vector<FORMATETC> formats;
-        formats.reserve(2);
+        formats.reserve(4);
 
         FORMATETC fe_desc{};
         fe_desc.cfFormat = static_cast<CLIPFORMAT>(cf_descriptor_);
@@ -543,9 +740,26 @@ public:
         fe_cont.tymed    = TYMED_ISTREAM;
         formats.push_back(fe_cont);
 
+        FORMATETC fe_drop{};
+        fe_drop.cfFormat = static_cast<CLIPFORMAT>(cf_drop_effect_);
+        fe_drop.ptd      = nullptr;
+        fe_drop.dwAspect = DVASPECT_CONTENT;
+        fe_drop.lindex   = -1;
+        fe_drop.tymed    = TYMED_HGLOBAL;
+        formats.push_back(fe_drop);
+
+        FORMATETC fe_exclude{};
+        fe_exclude.cfFormat = static_cast<CLIPFORMAT>(cf_exclude_);
+        fe_exclude.ptd      = nullptr;
+        fe_exclude.dwAspect = DVASPECT_CONTENT;
+        fe_exclude.lindex   = -1;
+        fe_exclude.tymed    = TYMED_HGLOBAL;
+        formats.push_back(fe_exclude);
+
         auto* en = new (std::nothrow) VirtualFileEnum(std::move(formats), 0);
         if (en == nullptr) return E_OUTOFMEMORY;
         *ppEnum = en;
+        LH_LOG_INFO("[trace] VirtualClipboardDataObject::EnumFormatEtc returned 4 formats (descriptor + contents + drop-effect + exclude-from-monitor)");
         return S_OK;
     }
 
@@ -566,6 +780,18 @@ private:
     ChunkProvider*                provider_;  // borrowed, must outlive `this`
     UINT                          cf_descriptor_;
     UINT                          cf_contents_;
+    // ExcludeClipboardContentFromMonitorProcessing — opts the clipboard
+    // out of Clipboard History (Win+V) snapshotting.  See
+    // GetCfExcludeFromMonitorProcessing() in clipboard_ops.cpp for the
+    // rationale.
+    UINT                          cf_exclude_;
+    // CFSTR_PREFERREDDROPEFFECT — DWORD value returned to the paste target
+    // (Explorer / shell drop sites) so it knows our IDataObject is a COPY
+    // source.  Without this, Explorer sometimes silently aborts the paste
+    // (target probes for DROPEFFECT and gets DV_E_FORMATETC; behavior is
+    // version-dependent).  See GetCfPreferredDropEffect() in
+    // clipboard_ops.cpp.
+    UINT                          cf_drop_effect_;
 };
 
 }  // namespace
