@@ -111,28 +111,49 @@ extension PasteboardManager: NSFilePromiseProviderDelegate {
             return
         }
 
-        // Per-file Progress, published to the system so the macOS
-        // copy-progress window (the one that floats over Finder during a
-        // file copy) can render a bar.  Without `publish()` + `.file`
-        // kind + fileURL/fileOperationKind, Finder has no way to
-        // discover the Progress and the user just sees a busy state
-        // with no visible progress UI — that was the "卡死 Finder + 沒進度條"
-        // symptom observed when Flow B (leviathan → shen-mac paste)
-        // first started routing through the lazy chunk fetch.
+        // System-discoverable Progress for the Finder copy panel.
+        //
+        // Because clipboard-helper runs as `LSUIElement` (background
+        // daemon, no dock icon), Finder can't infer file-write progress
+        // by observing our app — it needs an explicitly published
+        // Progress that names the destination URL and the operation
+        // kind.  Two API details matter:
+        //
+        //   * The URL + kind have to go through
+        //     setUserInfoObject(_:forKey:), NOT the `progress.fileURL` /
+        //     `progress.fileOperationKind` convenience setters.  The
+        //     convenience setters only propagate the value when Progress
+        //     has been initialised via `Progress(parent:userInfo:)`;
+        //     when we use `Progress(totalUnitCount:)` the system reads
+        //     the userInfo dictionary directly.
+        //   * `.downloading` is the right operation kind for a remote
+        //     stream (chunks arriving over WebRTC), not `.receiving`
+        //     (which is for "Save / Receive" semantics in Mail-style
+        //     apps).
+        //
+        // Async return is preserved — writePromiseTo's contract is to
+        // dispatch work and call completionHandler asynchronously.
+        // Blocking the operation queue thread here cripples Finder's
+        // XPC-driven progress UI (it expects writePromiseTo to return
+        // promptly so the in-progress Progress is the one driving the
+        // panel).
         let progress = Progress(totalUnitCount: Int64(max(fileSize, 1)))
         progress.kind = .file
-        progress.fileOperationKind = .receiving
-        progress.fileURL = url
+        progress.setUserInfoObject(url, forKey: .fileURLKey)
+        progress.setUserInfoObject(
+            Progress.FileOperationKind.downloading,
+            forKey: .fileOperationKindKey)
         progress.isCancellable = false
         progress.isPausable = false
         progress.publish()
 
-        // Make sure we unpublish even if the download path errors out — a
-        // leaked published Progress shows up as a stuck progress bar in
-        // the Finder copy UI long after the operation actually finished.
-        let wrappedCompletion: (Error?) -> Void = { err in
+        // Wrap the OS-provided completion so we always unpublish before
+        // the system marks the file done.  Skipping unpublish leaves a
+        // ghost progress bar in the Finder copy panel after the actual
+        // write has finished.
+        let wrappedCompletion: (Error?) -> Void = { error in
             progress.unpublish()
-            completionHandler(err)
+            completionHandler(error)
         }
 
         Log.info("FilePromise: writePromiseTo \(url.path) fileID=\(fileID) bytes=\(fileSize)")
