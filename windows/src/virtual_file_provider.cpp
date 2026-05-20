@@ -229,10 +229,12 @@ public:
             return S_OK;
         }
         if (pos_ >= size_) {
-            // Past EOF — well-defined: zero bytes read, S_OK. Some callers
-            // also accept S_FALSE here; S_OK with *pcbRead=0 is the more
-            // widely-supported convention (matches CFile / SHCreateStream).
-            return S_OK;
+            // FreeRDP convention: short/EOF read returns S_FALSE so the
+            // shell copy engine can distinguish "no more bytes" from
+            // "successful full read." This matches rdpclip.exe's IStream
+            // implementation which works reliably on Win11 paste paths
+            // where S_OK + pcbRead=0 sometimes confuses the consumer.
+            return S_FALSE;
         }
         // Clip the request to remaining file bytes so we never ask the
         // upstream provider for past-EOF chunks.
@@ -257,28 +259,80 @@ public:
         const HRESULT hr = provider_->FetchChunk(transfer_id_, file_id_,
                                                   pos_, want, chunk, is_last);
         if (FAILED(hr)) {
-            // Propagate as-is. STG_E_REVERTED, E_ABORT, E_FAIL all have
-            // defined IStream::Read semantics on the caller side and the
-            // shell copy engine respects them.
+            // Provider failed (timeout / peer error / cancellation).  Log so
+            // the operator can correlate Explorer's paste-abort dialog with
+            // the upstream cause; the helper would otherwise return silently
+            // and Explorer's UI just says "couldn't be copied" with no detail.
+            //
+            // STG_E_REVERTED, E_ABORT, E_FAIL all have defined IStream::Read
+            // semantics on the consumer side and the shell copy engine
+            // respects them — propagating the upstream hr as-is is the right
+            // call.
+            char buf[192];
+            std::snprintf(buf, sizeof(buf),
+                          "VirtualFileStream::Read: FetchChunk failed hr=0x%08lx "
+                          "(file_id=%s offset=%llu want=%u) — propagating to caller",
+                          static_cast<unsigned long>(hr),
+                          file_id_.c_str(),
+                          static_cast<unsigned long long>(pos_),
+                          want);
+            LH_LOG_WARN(buf);
             return hr;
         }
-        (void)is_last;  // advisory only — pcbRead conveys the same signal
 
         // Defensive clamp: a buggy ChunkProvider must never let us write
         // past the caller's buffer (`pv` is sized for `cb` bytes). `want`
         // is already ≤ cb, so capping at `want` doubles as the buffer cap.
         const ULONG got = static_cast<ULONG>(
             std::min<std::size_t>(chunk.size(), static_cast<std::size_t>(want)));
+
+        // Silent-truncation defense.  If the provider returned success but
+        // an empty chunk while there were supposed to be bytes left
+        // (`pos_ < size_` AND `want > 0`), the resulting `*pcbRead = 0` +
+        // `return S_FALSE` would be indistinguishable from EOF to the shell
+        // copy engine — Explorer would write a truncated file silently.
+        // Causes we've actually seen / can imagine:
+        //   * announcement size disagrees with the real source file size
+        //     (shen-side metadata stale by the time paste fires).
+        //   * source peer's chunk forwarder responded with empty data and
+        //     no error string (would be a peer bug; treat defensively).
+        // Failing the read loudly is strictly better than producing a
+        // wrong-content file: the operator sees an error dialog instead of
+        // discovering corruption later.
+        if (got == 0 && want > 0) {
+            char buf[224];
+            std::snprintf(buf, sizeof(buf),
+                          "VirtualFileStream::Read: provider returned empty chunk "
+                          "while %u bytes were still expected (file_id=%s pos=%llu size=%llu is_last=%d) — "
+                          "returning E_FAIL to avoid silent truncation",
+                          want, file_id_.c_str(),
+                          static_cast<unsigned long long>(pos_),
+                          static_cast<unsigned long long>(size_),
+                          is_last ? 1 : 0);
+            LH_LOG_WARN(buf);
+            return E_FAIL;
+        }
+        (void)is_last;  // advisory only — pcbRead conveys the same signal
+
         if (got > 0) {
             std::memcpy(pv, chunk.data(), got);
             pos_ += got;
         }
         if (pcbRead != nullptr) *pcbRead = got;
-        // S_OK regardless of short read — pcbRead conveys the count and
-        // the caller re-issues Read for the next region. This matches the
-        // behavior of file-system IStream wrappers and avoids the small
-        // population of callers that treat S_FALSE as a hard EOF flag.
-        return S_OK;
+        // EOF detection by stream POSITION, not chunk length.  Returning
+        // S_FALSE the moment got < cb (a "short fill") would silently
+        // truncate the file when the upstream provider returned fewer
+        // bytes than `want` mid-stream (shen-side bug, partial network
+        // delivery, etc.) — Explorer treats S_FALSE as "no more bytes,
+        // stop reading" and commits the truncated file.
+        //
+        // The right invariant: only return S_FALSE when we actually
+        // reached the declared end of file (pos_ == size_).  If we got a
+        // short fill mid-stream, return S_OK; Explorer will issue another
+        // Read at the new pos_ and either get the rest, hit the
+        // empty-chunk defense above (→ E_FAIL on a true zero-byte
+        // response), or naturally reach EOF.
+        return (pos_ >= size_) ? S_FALSE : S_OK;
     }
     HRESULT STDMETHODCALLTYPE Write(const void* pv, ULONG cb, ULONG* pcbWritten) override {
         (void)pv;
@@ -464,6 +518,18 @@ private:
 // ─── VirtualClipboardDataObject (IDataObject) ────────────────────────────
 
 class VirtualClipboardDataObject final : public IDataObject {
+    // IDataObjectAsyncCapability was multi-inherited briefly on 2026-05-20
+    // following agy's recommendation, but removed the same day because:
+    //   1. The OLE clipboard wrapper around our IDataObject only marshals
+    //      IDataObject — Explorer's QI for IDataObjectAsyncCapability
+    //      hits the proxy and never reaches our class (confirmed: our
+    //      QueryInterface trace never logged the async-cap IID even once).
+    //   2. Multi-inheriting two COM interfaces on the same class needed
+    //      manual disambiguation that the proxy's IUnknown probe could
+    //      have misinterpreted.
+    // Cross-process clipboard pastes don't need IDataObjectAsyncCapability
+    // anyway — the shell's clipboard paste path already runs GetData on
+    // a worker thread.  (drag-drop is the case where it's needed.)
 public:
     VirtualClipboardDataObject(std::vector<VirtualFileSpec> specs,
                                std::string                  transfer_id,
@@ -473,8 +539,14 @@ public:
           provider_(provider),
           cf_descriptor_(GetCfFileDescriptor()),
           cf_contents_(GetCfFileContents()),
-          cf_exclude_(GetCfExcludeFromMonitorProcessing()),
-          cf_drop_effect_(GetCfPreferredDropEffect()) {}
+          cf_drop_effect_(GetCfPreferredDropEffect()),
+          cf_file_attrs_(GetCfFileAttributesArray()) {}
+    // 2026-05-20: stripped Exclude-from-monitor and per-file lindex
+    // experiments back to a near-FreeRDP advertise list.  Kept
+    // CFSTR_PREFERREDDROPEFFECT because removing it makes Explorer 11
+    // not enable the Paste menu at all (different from the silent-abort
+    // failure mode — when paste is even available, the drop-effect entry
+    // is needed for Explorer to categorize us as a file source).
 
     // ── IUnknown ────────────────────────────────────────────────────────
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
@@ -488,7 +560,7 @@ public:
         *ppv = nullptr;
         {
             // Log unknown IID requests so we can see when consumers probe
-            // for IAsyncOperation, IDataObjectAsyncCapability, etc.
+            // for other interfaces (IStorageProviderUriSource, etc.).
             char buf[160];
             std::snprintf(buf, sizeof(buf),
                           "[trace] VirtualClipboardDataObject::QueryInterface unknown IID "
@@ -519,8 +591,8 @@ public:
             char buf[192];
             std::snprintf(buf, sizeof(buf),
                           "[trace] VirtualClipboardDataObject::GetData "
-                          "cfFormat=%u (descriptor=%u contents=%u exclude=%u) lindex=%ld tymed=0x%lx",
-                          fmt, cf_descriptor_, cf_contents_, cf_exclude_,
+                          "cfFormat=%u (descriptor=%u contents=%u) lindex=%ld tymed=0x%lx",
+                          fmt, cf_descriptor_, cf_contents_,
                           static_cast<long>(fe->lindex),
                           static_cast<unsigned long>(fe->tymed));
             LH_LOG_INFO(buf);
@@ -541,12 +613,63 @@ public:
             return S_OK;
         }
 
-        // CFSTR_PREFERREDDROPEFFECT → DWORD DROPEFFECT_COPY (1) in HGLOBAL.
-        // The shell paste target reads this BEFORE asking for FILECONTENTS;
-        // without DROPEFFECT_COPY it sometimes silently aborts the paste
-        // (rather than the FILEDESCRIPTORW-only fallback we saw in the
-        // 2026-05-19 trace where Explorer fetched the descriptor and then
-        // never queried CONTENTS).
+        // "File Attributes Array" → cItems + OR + AND + per-item attrs.
+        // Built from specs_[i].is_directory; mirrors what we already pack
+        // into FILEGROUPDESCRIPTORW.dwFileAttributes.
+        if (fmt == cf_file_attrs_) {
+            if ((fe->tymed & TYMED_HGLOBAL) == 0) {
+                LH_LOG_INFO("[trace] GetData: FILE_ATTRIBUTES_ARRAY but tymed missing TYMED_HGLOBAL → DV_E_TYMED");
+                return DV_E_TYMED;
+            }
+            const std::size_t n = specs_.size();
+            // Layout: UINT cItems; DWORD or; DWORD and; DWORD rg[n]; (cItems may be 0
+            // but our IDataObject rejects empty specs at construction so n >= 1.)
+            const std::size_t total = sizeof(UINT) + 2 * sizeof(DWORD)
+                                    + n * sizeof(DWORD);
+            HGLOBAL h = ::GlobalAlloc(GMEM_MOVEABLE, total);
+            if (h == nullptr) return E_OUTOFMEMORY;
+            auto* base = static_cast<std::uint8_t*>(::GlobalLock(h));
+            if (base == nullptr) {
+                ::GlobalFree(h);
+                return E_OUTOFMEMORY;
+            }
+            DWORD or_attrs  = 0;
+            DWORD and_attrs = 0xFFFFFFFFu;
+            for (std::size_t i = 0; i < n; ++i) {
+                const DWORD a = specs_[i].is_directory
+                    ? FILE_ATTRIBUTE_DIRECTORY
+                    : FILE_ATTRIBUTE_NORMAL;
+                or_attrs  |= a;
+                and_attrs &= a;
+            }
+            std::uint8_t* p = base;
+            const UINT count = static_cast<UINT>(n);
+            std::memcpy(p, &count, sizeof(count));           p += sizeof(count);
+            std::memcpy(p, &or_attrs, sizeof(or_attrs));     p += sizeof(or_attrs);
+            std::memcpy(p, &and_attrs, sizeof(and_attrs));   p += sizeof(and_attrs);
+            for (std::size_t i = 0; i < n; ++i) {
+                const DWORD a = specs_[i].is_directory
+                    ? FILE_ATTRIBUTE_DIRECTORY
+                    : FILE_ATTRIBUTE_NORMAL;
+                std::memcpy(p, &a, sizeof(a));               p += sizeof(a);
+            }
+            ::GlobalUnlock(h);
+            sm->tymed          = TYMED_HGLOBAL;
+            sm->hGlobal        = h;
+            sm->pUnkForRelease = nullptr;
+            {
+                char buf[160];
+                std::snprintf(buf, sizeof(buf),
+                              "[trace] GetData: returning FILE_ATTRIBUTES_ARRAY (cItems=%u or=0x%lx and=0x%lx)",
+                              count,
+                              static_cast<unsigned long>(or_attrs),
+                              static_cast<unsigned long>(and_attrs));
+                LH_LOG_INFO(buf);
+            }
+            return S_OK;
+        }
+
+        // CFSTR_PREFERREDDROPEFFECT → DWORD DROPEFFECT_COPY.
         if (fmt == cf_drop_effect_) {
             if ((fe->tymed & TYMED_HGLOBAL) == 0) {
                 LH_LOG_INFO("[trace] GetData: PREFERREDDROPEFFECT but tymed missing TYMED_HGLOBAL → DV_E_TYMED");
@@ -559,37 +682,12 @@ public:
                 ::GlobalFree(h);
                 return E_OUTOFMEMORY;
             }
-            *p = DROPEFFECT_COPY;  // = 1
+            *p = DROPEFFECT_COPY;
             ::GlobalUnlock(h);
             sm->tymed          = TYMED_HGLOBAL;
             sm->hGlobal        = h;
             sm->pUnkForRelease = nullptr;
-            LH_LOG_INFO("[trace] GetData: returning PREFERREDDROPEFFECT (DROPEFFECT_COPY=1)");
-            return S_OK;
-        }
-
-        // ExcludeClipboardContentFromMonitorProcessing → DWORD 0 in HGLOBAL.
-        // Microsoft docs: the data is a 4-byte DWORD value of 0; the format's
-        // presence (not its value) is what tells Clipboard History to skip
-        // this clipboard item.
-        if (fmt == cf_exclude_) {
-            if ((fe->tymed & TYMED_HGLOBAL) == 0) {
-                LH_LOG_INFO("[trace] GetData: EXCLUDE_FROM_MONITOR but tymed missing TYMED_HGLOBAL → DV_E_TYMED");
-                return DV_E_TYMED;
-            }
-            HGLOBAL h = ::GlobalAlloc(GMEM_MOVEABLE, sizeof(DWORD));
-            if (h == nullptr) return E_OUTOFMEMORY;
-            auto* p = static_cast<DWORD*>(::GlobalLock(h));
-            if (p == nullptr) {
-                ::GlobalFree(h);
-                return E_OUTOFMEMORY;
-            }
-            *p = 0;
-            ::GlobalUnlock(h);
-            sm->tymed          = TYMED_HGLOBAL;
-            sm->hGlobal        = h;
-            sm->pUnkForRelease = nullptr;
-            LH_LOG_INFO("[trace] GetData: returning EXCLUDE_FROM_MONITOR (DWORD 0)");
+            LH_LOG_INFO("[trace] GetData: returning DROPEFFECT_COPY");
             return S_OK;
         }
 
@@ -629,10 +727,10 @@ public:
         }
 
         {
-            char buf[192];
+            char buf[224];
             std::snprintf(buf, sizeof(buf),
-                          "[trace] GetData: cfFormat=%u not in [desc=%u, contents=%u, exclude=%u, drop=%u] → DV_E_FORMATETC",
-                          fmt, cf_descriptor_, cf_contents_, cf_exclude_, cf_drop_effect_);
+                          "[trace] GetData: cfFormat=%u not in [desc=%u, contents=%u, drop=%u] → DV_E_FORMATETC",
+                          fmt, cf_descriptor_, cf_contents_, cf_drop_effect_);
             LH_LOG_INFO(buf);
         }
         return DV_E_FORMATETC;
@@ -662,17 +760,16 @@ public:
         if (fe == nullptr) return DV_E_FORMATETC;
         const UINT fmt = fe->cfFormat;
         HRESULT hr;
-        if (fmt == cf_descriptor_  && (fe->tymed & TYMED_HGLOBAL)) hr = S_OK;
+        if      (fmt == cf_descriptor_  && (fe->tymed & TYMED_HGLOBAL)) hr = S_OK;
         else if (fmt == cf_contents_    && (fe->tymed & TYMED_ISTREAM)) hr = S_OK;
-        else if (fmt == cf_exclude_     && (fe->tymed & TYMED_HGLOBAL)) hr = S_OK;
         else if (fmt == cf_drop_effect_ && (fe->tymed & TYMED_HGLOBAL)) hr = S_OK;
         else                                                             hr = DV_E_FORMATETC;
         {
             char buf[224];
             std::snprintf(buf, sizeof(buf),
                           "[trace] VirtualClipboardDataObject::QueryGetData "
-                          "cfFormat=%u (descriptor=%u contents=%u exclude=%u drop=%u) lindex=%ld tymed=0x%lx → hr=0x%08lx",
-                          fmt, cf_descriptor_, cf_contents_, cf_exclude_, cf_drop_effect_,
+                          "cfFormat=%u (descriptor=%u contents=%u) lindex=%ld tymed=0x%lx → hr=0x%08lx",
+                          fmt, cf_descriptor_, cf_contents_,
                           static_cast<long>(fe->lindex),
                           static_cast<unsigned long>(fe->tymed),
                           static_cast<unsigned long>(hr));
@@ -683,6 +780,14 @@ public:
 
     HRESULT STDMETHODCALLTYPE GetCanonicalFormatEtc(FORMATETC* in_fe,
                                                     FORMATETC* out_fe) override {
+        {
+            const UINT fmt = in_fe ? in_fe->cfFormat : 0;
+            char buf[128];
+            std::snprintf(buf, sizeof(buf),
+                          "[trace] GetCanonicalFormatEtc in_cfFormat=%u → DATA_S_SAMEFORMATETC",
+                          fmt);
+            LH_LOG_INFO(buf);
+        }
         (void)in_fe;
         if (out_fe == nullptr) return E_POINTER;
         // MSDN: when returning DATA_S_SAMEFORMATETC the contents of *out_fe
@@ -695,13 +800,24 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE SetData(FORMATETC* fe, STGMEDIUM* sm, BOOL release) override {
-        (void)fe;
-        (void)sm;
-        (void)release;
-        // We are a read-only producer. Some shell components call SetData
-        // for CFSTR_PERFORMEDDROPEFFECT to inform the source about the
-        // outcome of a drag-drop; not relevant to clipboard paste. Phase
-        // 5 may revisit if a consumer relies on it.
+        // Accept shell post-paste notification formats and silently
+        // discard them.  The OLE clipboard proxy probes SetData with
+        // these during OleSetClipboard to confirm the source honors the
+        // paste-state contract; returning E_NOTIMPL here observably
+        // makes the proxy decline to forward subsequent GetData calls
+        // (paste_roundtrip_test went from 4/4 → flaky).
+        //   CFSTR_PERFORMEDDROPEFFECT       — DWORD: which DROPEFFECT_*
+        //   CFSTR_PASTESUCCEEDED            — DWORD: 0/1
+        //   CFSTR_LOGICALPERFORMEDDROPEFFECT — DWORD: logical effect
+        const UINT fmt = fe ? fe->cfFormat : 0;
+        const UINT cf_performed = ::RegisterClipboardFormatW(CFSTR_PERFORMEDDROPEFFECT);
+        const UINT cf_paste_ok  = ::RegisterClipboardFormatW(CFSTR_PASTESUCCEEDED);
+        const UINT cf_logical   = ::RegisterClipboardFormatW(CFSTR_LOGICALPERFORMEDDROPEFFECT);
+        if (fmt == cf_performed || fmt == cf_paste_ok || fmt == cf_logical) {
+            if (release && sm) ::ReleaseStgMedium(sm);
+            return S_OK;
+        }
+        (void)sm; (void)release;
         return E_NOTIMPL;
     }
 
@@ -711,34 +827,23 @@ public:
         *ppEnum = nullptr;
         if (dwDirection != DATADIR_GET) return E_NOTIMPL;
 
-        // Four FORMATETC entries:
-        //   1. CFSTR_FILEDESCRIPTORW  / TYMED_HGLOBAL / lindex = -1
-        //   2. CFSTR_FILECONTENTS     / TYMED_ISTREAM / lindex = -1
-        //   3. ExcludeClipboardContentFromMonitorProcessing / TYMED_HGLOBAL
-        //   4. CFSTR_PREFERREDDROPEFFECT / TYMED_HGLOBAL / lindex = -1
+        // Advertise list (kept lean — no Exclude-from-monitor; that one
+        // was tried and didn't change the failure mode):
         //
-        // For CFSTR_FILECONTENTS the enumeration advertises lindex=-1
-        // (meaning "applies to any lindex"); consumers iterate lindex
-        // themselves when calling GetData. This matches the convention
-        // used by Outlook's IDataObject and the docs in CFSTR_FILECONTENTS.
+        //   1. CFSTR_PREFERREDDROPEFFECT / TYMED_HGLOBAL / lindex = -1
+        //      DWORD = DROPEFFECT_COPY.  Without this Explorer 11 doesn't
+        //      enable the Paste menu against our IDataObject at all.
+        //   2. CFSTR_FILEDESCRIPTORW    / TYMED_HGLOBAL / lindex = -1
+        //      Single descriptor blob covering all files.
+        //   3. CFSTR_FILECONTENTS       / TYMED_ISTREAM / lindex = -1
+        //      Probe entry — OLE's intermediate clipboard object uses
+        //      this to QueryGetData "do you have CONTENTS at all" before
+        //      iterating per-file requests.
+        //   4. CFSTR_FILECONTENTS       / TYMED_ISTREAM / lindex = i
+        //      One entry per file in `specs_`.  Shell calls
+        //      GetData(contents, lindex=i, ISTREAM) for each.
         std::vector<FORMATETC> formats;
-        formats.reserve(4);
-
-        FORMATETC fe_desc{};
-        fe_desc.cfFormat = static_cast<CLIPFORMAT>(cf_descriptor_);
-        fe_desc.ptd      = nullptr;
-        fe_desc.dwAspect = DVASPECT_CONTENT;
-        fe_desc.lindex   = -1;
-        fe_desc.tymed    = TYMED_HGLOBAL;
-        formats.push_back(fe_desc);
-
-        FORMATETC fe_cont{};
-        fe_cont.cfFormat = static_cast<CLIPFORMAT>(cf_contents_);
-        fe_cont.ptd      = nullptr;
-        fe_cont.dwAspect = DVASPECT_CONTENT;
-        fe_cont.lindex   = -1;
-        fe_cont.tymed    = TYMED_ISTREAM;
-        formats.push_back(fe_cont);
+        formats.reserve(3 + specs_.size());
 
         FORMATETC fe_drop{};
         fe_drop.cfFormat = static_cast<CLIPFORMAT>(cf_drop_effect_);
@@ -748,18 +853,44 @@ public:
         fe_drop.tymed    = TYMED_HGLOBAL;
         formats.push_back(fe_drop);
 
-        FORMATETC fe_exclude{};
-        fe_exclude.cfFormat = static_cast<CLIPFORMAT>(cf_exclude_);
-        fe_exclude.ptd      = nullptr;
-        fe_exclude.dwAspect = DVASPECT_CONTENT;
-        fe_exclude.lindex   = -1;
-        fe_exclude.tymed    = TYMED_HGLOBAL;
-        formats.push_back(fe_exclude);
+        FORMATETC fe_desc{};
+        fe_desc.cfFormat = static_cast<CLIPFORMAT>(cf_descriptor_);
+        fe_desc.ptd      = nullptr;
+        fe_desc.dwAspect = DVASPECT_CONTENT;
+        fe_desc.lindex   = -1;
+        fe_desc.tymed    = TYMED_HGLOBAL;
+        formats.push_back(fe_desc);
 
+        FORMATETC fe_cont_probe{};
+        fe_cont_probe.cfFormat = static_cast<CLIPFORMAT>(cf_contents_);
+        fe_cont_probe.ptd      = nullptr;
+        fe_cont_probe.dwAspect = DVASPECT_CONTENT;
+        fe_cont_probe.lindex   = -1;
+        fe_cont_probe.tymed    = TYMED_ISTREAM;
+        formats.push_back(fe_cont_probe);
+
+        for (std::size_t i = 0; i < specs_.size(); ++i) {
+            FORMATETC fe_cont{};
+            fe_cont.cfFormat = static_cast<CLIPFORMAT>(cf_contents_);
+            fe_cont.ptd      = nullptr;
+            fe_cont.dwAspect = DVASPECT_CONTENT;
+            fe_cont.lindex   = static_cast<LONG>(i);
+            fe_cont.tymed    = TYMED_ISTREAM;
+            formats.push_back(fe_cont);
+        }
+
+        const std::size_t format_count = formats.size();
         auto* en = new (std::nothrow) VirtualFileEnum(std::move(formats), 0);
         if (en == nullptr) return E_OUTOFMEMORY;
         *ppEnum = en;
-        LH_LOG_INFO("[trace] VirtualClipboardDataObject::EnumFormatEtc returned 4 formats (descriptor + contents + drop-effect + exclude-from-monitor)");
+        {
+            char buf[160];
+            std::snprintf(buf, sizeof(buf),
+                          "[trace] VirtualClipboardDataObject::EnumFormatEtc returned %zu formats "
+                          "(drop-effect + descriptor + contents(-1) + %zu per-file contents)",
+                          format_count, specs_.size());
+            LH_LOG_INFO(buf);
+        }
         return S_OK;
     }
 
@@ -780,18 +911,14 @@ private:
     ChunkProvider*                provider_;  // borrowed, must outlive `this`
     UINT                          cf_descriptor_;
     UINT                          cf_contents_;
-    // ExcludeClipboardContentFromMonitorProcessing — opts the clipboard
-    // out of Clipboard History (Win+V) snapshotting.  See
-    // GetCfExcludeFromMonitorProcessing() in clipboard_ops.cpp for the
-    // rationale.
-    UINT                          cf_exclude_;
-    // CFSTR_PREFERREDDROPEFFECT — DWORD value returned to the paste target
-    // (Explorer / shell drop sites) so it knows our IDataObject is a COPY
-    // source.  Without this, Explorer sometimes silently aborts the paste
-    // (target probes for DROPEFFECT and gets DV_E_FORMATETC; behavior is
-    // version-dependent).  See GetCfPreferredDropEffect() in
-    // clipboard_ops.cpp.
+    // CFSTR_PREFERREDDROPEFFECT — DWORD = DROPEFFECT_COPY (1). Required
+    // for Explorer 11 to enable the Paste menu against our IDataObject;
+    // without it the paste UI doesn't even appear.
     UINT                          cf_drop_effect_;
+    // "File Attributes Array" — see Raymond Chen
+    // https://devblogs.microsoft.com/oldnewthing/20140609-00/?p=783.
+    // Lets the shell skip disk-attribute lookups during paste validation.
+    UINT                          cf_file_attrs_;
 };
 
 }  // namespace

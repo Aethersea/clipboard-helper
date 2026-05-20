@@ -59,12 +59,23 @@ std::vector<std::uint8_t> BuildFileGroupDescriptorPayload(
     fg->cItems = static_cast<UINT>(specs.size());
     for (std::size_t i = 0; i < specs.size(); ++i) {
         FILEDESCRIPTORW& fd = fg->fgd[i];
-        // FD_FILESIZE: nFileSizeLow/High are valid.
-        // FD_ATTRIBUTES: dwFileAttributes is valid (dir vs file).
-        // FD_PROGRESSUI: shell shows its standard copy progress dialog
-        //   while pulling bytes — visible win over the old CF_HDROP
-        //   path where Explorer just blocked silently.
-        fd.dwFlags          = FD_FILESIZE | FD_ATTRIBUTES | FD_PROGRESSUI;
+        // FreeRDP-minimal flag set (matches rdpclip / wf_cliprdr.c which
+        // pastes reliably on Win11 where our extended flag set silent-
+        // aborts):
+        //   FD_FILESIZE  — nFileSizeLow/High are valid.
+        //   FD_ATTRIBUTES — dwFileAttributes is valid (dir vs file).
+        //   FD_WRITESTIME — ftLastWriteTime is valid.
+        //   FD_PROGRESSUI — shell shows its standard copy progress dialog.
+        // FD_CREATETIME was removed 2026-05-20: extra ft* fields trigger
+        // an additional shell validator path that fails activation against
+        // PerAppRuntimeBroker on machines with the DCOM 10016 permission
+        // gap.  Single-timestamp (WRITESTIME only) is FreeRDP's working
+        // configuration.
+        fd.dwFlags          = FD_FILESIZE | FD_ATTRIBUTES
+                            | FD_WRITESTIME | FD_PROGRESSUI;
+        FILETIME now_ft{};
+        ::GetSystemTimeAsFileTime(&now_ft);
+        fd.ftLastWriteTime  = now_ft;
         fd.dwFileAttributes = specs[i].is_directory
             ? FILE_ATTRIBUTE_DIRECTORY
             : FILE_ATTRIBUTE_NORMAL;

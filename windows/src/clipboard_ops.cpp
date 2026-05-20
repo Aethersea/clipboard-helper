@@ -568,6 +568,18 @@ UINT GetCfPreferredDropEffect() {
     return cf;
 }
 
+// "File Attributes Array" — per Raymond Chen
+// https://devblogs.microsoft.com/oldnewthing/20140609-00/?p=783.
+// Layout: cItems + OR-aggregate + AND-aggregate + per-item attribute DWORD.
+// Lets the shell answer "is this a file vs directory / hidden / readonly"
+// without disk access.  We publish it alongside FILEGROUPDESCRIPTORW so
+// the shell's pre-paste attribute probe (whatever validator runs between
+// "read descriptor" and "open FILECONTENTS") has the answer in hand.
+UINT GetCfFileAttributesArray() {
+    static UINT cf = ::RegisterClipboardFormatW(L"File Attributes Array");
+    return cf;
+}
+
 bool ReadVirtualFiles(ClipboardSnapshot& out) {
     out.virtual_files.clear();
     out.virtual_data_object = nullptr;

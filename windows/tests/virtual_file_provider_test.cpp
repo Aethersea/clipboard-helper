@@ -84,7 +84,10 @@ TEST(BuildFileGroupDescriptor, DefaultFlagsCoverSizeAttributesAndProgressUI) {
     const auto buf = BuildFileGroupDescriptorPayload(
         {MakeFileSpec(L"a.txt", 0)});
     const auto* fg = HeaderOf(buf);
-    const DWORD expected = FD_FILESIZE | FD_ATTRIBUTES | FD_PROGRESSUI;
+    // FreeRDP-minimal flag set: FD_FILESIZE | FD_ATTRIBUTES | FD_WRITESTIME
+    // | FD_PROGRESSUI.  FD_CREATETIME was dropped 2026-05-20 to mimic
+    // rdpclip/wf_cliprdr.c on Win11.
+    const DWORD expected = FD_FILESIZE | FD_ATTRIBUTES | FD_WRITESTIME | FD_PROGRESSUI;
     EXPECT_EQ(static_cast<unsigned>(fg->fgd[0].dwFlags),
               static_cast<unsigned>(expected));
 }

@@ -337,6 +337,37 @@ private final class FileDownloadTask {
             return
         }
 
+        // Silent-truncation defense.  An empty chunk with no error AND no
+        // legitimate "we're at EOF" reason would otherwise be silently
+        // accepted: receivedBytes wouldn't grow, but nextRequestOffset had
+        // already been advanced by primeRequests, so the pipeline would
+        // keep firing requests for offsets past where the server has
+        // data; eventually `nextRequestOffset >= fileSize && inFlight==0`
+        // and finish(nil) would commit a sparse / truncated file as a
+        // success.  We've actually seen the equivalent failure mode in
+        // the Windows IDataObject path (announcement size disagreed with
+        // remote file size).  Treating empty mid-stream replies as a
+        // truncation error fails the paste loudly instead of producing
+        // a wrong-content file.
+        //
+        // "Legitimate empty" cases:
+        //   * Past-EOF read — only possible if the server (or chunk.offset
+        //     calculation) drifted; primeRequests is bounded by fileSize
+        //     so we shouldn't reach this on a healthy stream.
+        //   * Zero-byte file — fileSize would be 0, in which case
+        //     startFileDownload short-circuits before primeRequests runs;
+        //     handleChunkData isn't reached.
+        if chunk.data.isEmpty {
+            Log.warning(
+                "[FileTransfer] Empty FILE_CHUNK_DATA at offset=\(chunk.offset) " +
+                "(fileSize=\(fileSize), received=\(receivedBytes)) — " +
+                "treating as truncation error to avoid silent sparse-file completion"
+            )
+            finish(error: FileDownloadError.serverError(
+                "empty chunk reply at offset \(chunk.offset) (truncation)"))
+            return
+        }
+
         do {
             // seek + write must be on the same queue (they are: the
             // coordinator queue serializes all FileDownloadTask calls).

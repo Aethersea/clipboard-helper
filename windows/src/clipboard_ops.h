@@ -177,6 +177,13 @@ UINT GetCfExcludeFromMonitorProcessing();
 // DWORD = DROPEFFECT_COPY (1).
 UINT GetCfPreferredDropEffect();
 
+// "File Attributes Array" — registered clipboard format.  Payload is a
+// FILE_ATTRIBUTES_ARRAY (cItems + OR-aggregate + AND-aggregate + per-item
+// DWORD attributes) so shell consumers can answer "file vs dir / hidden /
+// readonly" without disk hits.  See Raymond Chen,
+// https://devblogs.microsoft.com/oldnewthing/20140609-00/?p=783.
+UINT GetCfFileAttributesArray();
+
 // Read virtual files (drag-from-Outlook, zip preview, etc.) off the
 // current clipboard via OleGetClipboard + GetData(CFSTR_FILEDESCRIPTORW).
 // On success, out.virtual_files is populated with per-file metadata and
