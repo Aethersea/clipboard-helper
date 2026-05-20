@@ -65,6 +65,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var pasteboardManager: PasteboardManager!
     private var fileTransferCoordinator: FileTransferCoordinator!
     private var progressPanel: TransferProgressPanel?
+    /// Transfer ID the current panel is showing.  Used by
+    /// ensureProgressPanelVisible to detect a transferID transition — if a
+    /// new transfer starts while the previous panel is still on screen
+    /// (e.g. inside the 1.5s post-complete dismiss window), we close the
+    /// stale panel and create a fresh one so the user doesn't see leftover
+    /// "Transfer complete" chrome.
+    private var activeTransferID: String?
+    /// Pending main-queue work item for the 1.5s panel auto-dismiss.
+    /// Held so we can cancel it if a new transfer starts before it fires —
+    /// otherwise the stale timer would close the new panel out from under
+    /// the new transfer.
+    private var pendingPanelCloseWorkItem: DispatchWorkItem?
     /// Retained for lifetime of the helper — cancelling the source unregisters
     /// the kqueue watch, so it must outlive setupParentPidWatchdog's scope.
     private var parentPidWatcher: DispatchSourceProcess?
@@ -162,10 +174,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self = self else { return }
             Log.info("[FileTransfer] Promise transfer complete: success=\(success)")
             self.progressPanel?.completeTransfer(success: success, errorMessage: errorMessage)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-                self?.progressPanel?.close()
-                self?.progressPanel = nil
-            }
+            self.scheduleProgressPanelDismiss()
         }
 
         socketServer.onMessage = { [weak self] message in
@@ -287,11 +296,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if progress.isComplete {
             Log.info("[FileTransfer] Transfer \(progress.transferID) complete: success=\(progress.success)")
             progressPanel?.completeTransfer(success: progress.success, errorMessage: progress.errorMessage)
-            // Auto-dismiss after a short delay
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-                self?.progressPanel?.close()
-                self?.progressPanel = nil
-            }
+            scheduleProgressPanelDismiss()
         } else {
             progressPanel?.updateProgress(
                 bytesTransferred: progress.bytesTransferred,
@@ -312,13 +317,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ///   * `handleFileTransferProgress` — defensive recreate, in case
     ///     the terminal isComplete frame arrives before any intermediate
     ///     progress frame (small/fast transfers).
+    ///
+    /// If a panel already exists but for a DIFFERENT transferID, we tear
+    /// it down and rebuild — this covers the window where a new paste
+    /// starts during the 1.5s post-complete auto-dismiss delay (the
+    /// previous panel would otherwise be stuck on "Transfer complete"
+    /// with a disabled Cancel button).  Any pending dismiss timer is
+    /// always cancelled so it can't close the new panel later.
+    ///
+    /// Same-transferID re-entry: NSFilePromiseProvider invokes
+    /// `writePromiseTo` once per file, and every file in a multi-file
+    /// paste shares the same announcement-scoped transferID (it's
+    /// `pending.content_hash`).  If file N just completed (panel now in
+    /// "Transfer complete" terminal state + dismiss timer pending) and
+    /// file N+1 starts within 1.5 s, we cancel the timer and reset the
+    /// panel's UI back to running so the user doesn't see a stale
+    /// terminal panel while file N+1 silently downloads.  Detecting the
+    /// pending timer (vs. always resetting) keeps the very-first
+    /// ensureProgressPanelVisible-of-a-fresh-paste cheap.
     private func ensureProgressPanelVisible(for transferID: String) {
-        guard progressPanel == nil else { return }
-        progressPanel = TransferProgressPanel()
-        progressPanel?.onCancel = { [weak self] in
-            self?.pasteboardManager.cancelFileDownload(transferID: transferID)
+        let hadPendingDismiss = pendingPanelCloseWorkItem != nil
+        pendingPanelCloseWorkItem?.cancel()
+        pendingPanelCloseWorkItem = nil
+
+        if progressPanel != nil && activeTransferID != transferID {
+            progressPanel?.close()
+            progressPanel = nil
         }
-        progressPanel?.showPanel()
+
+        if progressPanel == nil {
+            progressPanel = TransferProgressPanel()
+            progressPanel?.onCancel = { [weak self] in
+                self?.pasteboardManager.cancelFileDownload(transferID: transferID)
+            }
+            progressPanel?.showPanel()
+        } else if hadPendingDismiss {
+            progressPanel?.resetForNextTransfer()
+        }
+        activeTransferID = transferID
+    }
+
+    /// Mark the current panel as terminal (success or failure), then
+    /// schedule auto-dismiss in 1.5 s.  The scheduled work item is held
+    /// in `pendingPanelCloseWorkItem` so a fresh transfer arriving
+    /// inside the window can cancel it via ensureProgressPanelVisible.
+    /// Capturing `panel` weakly inside the timer ensures we only null
+    /// out the field when we close the SAME panel we scheduled against.
+    private func scheduleProgressPanelDismiss() {
+        pendingPanelCloseWorkItem?.cancel()
+        let scheduledPanel = progressPanel
+        let workItem = DispatchWorkItem { [weak self, weak scheduledPanel] in
+            guard let self = self else { return }
+            scheduledPanel?.close()
+            if self.progressPanel === scheduledPanel {
+                self.progressPanel = nil
+                self.activeTransferID = nil
+            }
+            self.pendingPanelCloseWorkItem = nil
+        }
+        pendingPanelCloseWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: workItem)
     }
 
     /// Called when the Go parent needs a chunk of a locally-copied file

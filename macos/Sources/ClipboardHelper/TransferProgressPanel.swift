@@ -141,6 +141,25 @@ final class TransferProgressPanel: NSObject {
         bytesLabel?.stringValue = "\(transferred) / \(total)  (\(pct)%)"
     }
 
+    /// Reset the panel back to "in-flight, indeterminate" state.  Used
+    /// when a multi-file paste rolls from one file's completion straight
+    /// into the next file's start within the auto-dismiss window — we
+    /// want to keep the same window on screen (no flicker) but undo the
+    /// "Transfer complete"/disabled-Cancel terminal state from the
+    /// previous file, otherwise the user sees a stale terminal panel
+    /// while the next file is silently downloading.
+    func resetForNextTransfer() {
+        guard let progressIndicator else { return }
+        statusLabel?.stringValue = "Transferring files…"
+        cancelButton?.isEnabled = true
+        bytesLabel?.stringValue = ""
+        progressIndicator.doubleValue = 0
+        if !progressIndicator.isIndeterminate {
+            progressIndicator.isIndeterminate = true
+            progressIndicator.startAnimation(nil)
+        }
+    }
+
     func completeTransfer(success: Bool, errorMessage: String) {
         cancelButton?.isEnabled = false
         // Tidy up any leftover indeterminate animation — the panel may
