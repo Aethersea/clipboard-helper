@@ -114,6 +114,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.handleDataRequest(request)
         }
 
+        // Upstream cancel notification.  Encoded as a HELPER_MESSAGE_TYPE
+        // _ERROR with a structured prefix that shen-mac native parses
+        // (see clipboard/macos.rs handler for HelperMessageType::Error)
+        // so we avoid adding a new HelperMessage variant + the matching
+        // proto regen across three repos.
+        pasteboardManager.onCancelTransfer = { [weak self] transferID in
+            guard let self = self else { return }
+            var msg = Leviathan_HelperMessage()
+            msg.type = .error
+            msg.errorMessage = "FILE_TRANSFER_CANCEL:\(transferID)"
+            msg.timestamp = UInt64(Date().timeIntervalSince1970 * 1000)
+            self.socketServer.send(msg)
+            Log.info("Sent upstream FILE_TRANSFER_CANCEL for transfer \(transferID)")
+        }
+
         socketServer.onMessage = { [weak self] message in
             self?.handleMessage(message)
         }
