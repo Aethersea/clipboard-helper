@@ -129,6 +129,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Log.info("Sent upstream FILE_TRANSFER_CANCEL for transfer \(transferID)")
         }
 
+        // User pressed Cmd+V — pop the panel immediately in
+        // indeterminate state so the user always has visible feedback,
+        // even when the transfer completes before any intermediate
+        // progress frame arrives.
+        pasteboardManager.onTransferStart = { [weak self] transferID in
+            guard let self = self else { return }
+            self.ensureProgressPanelVisible(for: transferID)
+        }
+
         socketServer.onMessage = { [weak self] message in
             self?.handleMessage(message)
         }
@@ -238,6 +247,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Handle file transfer progress from the Go parent process.
     /// Shows or updates a floating progress panel during file downloads.
     private func handleFileTransferProgress(_ progress: Leviathan_HelperFileTransferProgress) {
+        // Always ensure the panel exists — even on a terminal isComplete
+        // frame.  Without this, a small/fast transfer whose only
+        // progress frame is `isComplete=true` would never get a panel
+        // (completeTransfer is a no-op on a nil panel) and the user
+        // would see nothing despite the paste happening.
+        ensureProgressPanelVisible(for: progress.transferID)
+
         if progress.isComplete {
             Log.info("[FileTransfer] Transfer \(progress.transferID) complete: success=\(progress.success)")
             progressPanel?.completeTransfer(success: progress.success, errorMessage: progress.errorMessage)
@@ -247,25 +263,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.progressPanel = nil
             }
         } else {
-            // Show or update progress
-            if progressPanel == nil {
-                progressPanel = TransferProgressPanel()
-                // Cancel button → PasteboardManager.  The transferID we
-                // pass through lets PasteboardManager filter out late
-                // cancels for a transfer that already completed, in
-                // case the user clicks Cancel within the 1.5 s
-                // auto-dismiss window after the final progress frame.
-                let transferID = progress.transferID
-                progressPanel?.onCancel = { [weak self] in
-                    self?.pasteboardManager.cancelFileDownload(transferID: transferID)
-                }
-                progressPanel?.showPanel()
-            }
             progressPanel?.updateProgress(
                 bytesTransferred: progress.bytesTransferred,
                 totalBytes: progress.totalBytes
             )
         }
+    }
+
+    /// Create + show the progress panel if it doesn't already exist.
+    /// Wires the Cancel button to PasteboardManager.cancelFileDownload
+    /// with the given transferID so late cancels for stale transfers
+    /// get filtered out at the PasteboardManager layer.
+    ///
+    /// Called from two paths:
+    ///   * `pasteboardManager.onTransferStart` — immediately when the
+    ///     user pastes, before any progress frame has been received.
+    ///     Panel comes up in indeterminate state.
+    ///   * `handleFileTransferProgress` — defensive recreate, in case
+    ///     the terminal isComplete frame arrives before any intermediate
+    ///     progress frame (small/fast transfers).
+    private func ensureProgressPanelVisible(for transferID: String) {
+        guard progressPanel == nil else { return }
+        progressPanel = TransferProgressPanel()
+        progressPanel?.onCancel = { [weak self] in
+            self?.pasteboardManager.cancelFileDownload(transferID: transferID)
+        }
+        progressPanel?.showPanel()
     }
 
     /// Called when the Go parent needs a chunk of a locally-copied file

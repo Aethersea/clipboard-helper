@@ -55,6 +55,15 @@ final class PasteboardManager: NSObject {
     /// WebRTC ClipboardMessageType::FileTransferCancel.
     var onCancelTransfer: ((String) -> Void)?
 
+    /// Fired the moment ensureFilesDownloaded first runs for an
+    /// announcement, BEFORE any FILE_TRANSFER_PROGRESS frame arrives.
+    /// Wired by ClipboardHelperApp to pop up the TransferProgressPanel
+    /// in indeterminate state so the user sees immediate feedback even
+    /// if the dcTransfer never emits an intermediate progress callback
+    /// (e.g. very small files where the only progress frame is the
+    /// terminal is_complete=true one).
+    var onTransferStart: ((String) -> Void)?
+
     // File download coordination (for NSPasteboardItemDataProvider)
     private var fileDownloadPaths: [String]?
     private var fileDownloadTriggered = false
@@ -797,6 +806,19 @@ extension PasteboardManager: NSPasteboardItemDataProvider {
         if !fileDownloadTriggered {
             fileDownloadTriggered = true
             fileDownloadCondition.unlock()
+
+            // Notify upstream that the user-paste is in motion BEFORE
+            // any DATA_REQUEST round-trip starts.  ClipboardHelperApp
+            // uses this to pop up the progress panel in indeterminate
+            // state immediately, so the user has visible feedback even
+            // if the dcTransfer never emits an intermediate progress
+            // callback (small/fast files emit only a terminal
+            // is_complete=true frame).  Dispatch to main because
+            // panel construction touches AppKit.
+            let transferID = announcement.transferID
+            DispatchQueue.main.async { [weak self] in
+                self?.onTransferStart?(transferID)
+            }
 
             // Send DATA_REQUEST to parent process
             var request = Leviathan_ClipboardDataRequest()

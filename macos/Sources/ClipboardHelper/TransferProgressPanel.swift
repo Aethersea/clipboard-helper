@@ -71,13 +71,18 @@ final class TransferProgressPanel: NSObject {
         contentView.addSubview(status)
         statusLabel = status
 
-        // Progress bar
+        // Progress bar — starts indeterminate so the user sees motion
+        // immediately when the panel pops up, before the first real
+        // FILE_TRANSFER_PROGRESS frame arrives.  Switches to determinate
+        // mode on the first updateProgress(bytesTransferred:totalBytes:)
+        // call.
         let progress = NSProgressIndicator(frame: NSRect(x: 16, y: 36, width: panelWidth - 32, height: 14))
         progress.style = .bar
-        progress.isIndeterminate = false
+        progress.isIndeterminate = true
         progress.minValue = 0
         progress.maxValue = 1.0
         progress.doubleValue = 0
+        progress.startAnimation(nil)
         contentView.addSubview(progress)
         progressIndicator = progress
 
@@ -118,6 +123,15 @@ final class TransferProgressPanel: NSObject {
     func updateProgress(bytesTransferred: UInt64, totalBytes: UInt64) {
         guard let progressIndicator else { return }
 
+        // First real progress frame — flip from indeterminate (which
+        // showed motion while the transfer was bootstrapping) to a
+        // determinate bar driven by actual byte counts.
+        if progressIndicator.isIndeterminate {
+            progressIndicator.stopAnimation(nil)
+            progressIndicator.isIndeterminate = false
+            statusLabel?.stringValue = "Transferring files…"
+        }
+
         let fraction = progressFraction(transferred: bytesTransferred, total: totalBytes)
         progressIndicator.doubleValue = fraction
 
@@ -129,6 +143,15 @@ final class TransferProgressPanel: NSObject {
 
     func completeTransfer(success: Bool, errorMessage: String) {
         cancelButton?.isEnabled = false
+        // Tidy up any leftover indeterminate animation — the panel may
+        // have gone straight from showPanel() to completeTransfer()
+        // without a single intermediate updateProgress (small / fast
+        // transfers where the only progress frame is the terminal
+        // is_complete=true one).
+        if progressIndicator?.isIndeterminate == true {
+            progressIndicator?.stopAnimation(nil)
+            progressIndicator?.isIndeterminate = false
+        }
         if success {
             statusLabel?.stringValue = "Transfer complete"
             progressIndicator?.doubleValue = 1.0
