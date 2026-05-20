@@ -154,13 +154,48 @@ extension PasteboardManager: NSFilePromiseProviderDelegate {
         progress.isPausable = false
         progress.publish()
 
-        // Wrap the OS-provided completion so we always unpublish before
-        // the system marks the file done.  Skipping unpublish leaves a
-        // ghost progress bar in the Finder copy panel after the actual
-        // write has finished.
+        // Bridge the coordinator's NSProgress updates into our self-
+        // owned TransferProgressPanel.  The NSFilePromiseProvider path
+        // doesn't go through the IPC FILE_TRANSFER_PROGRESS chain
+        // (those are only emitted by the legacy `.fileURL` /
+        // dcTransfer path on shen-mac native), so without this KVO
+        // bridge the panel would never see any byte counts and would
+        // stay stuck in indeterminate.
+        let pm = self
+        var observation: NSKeyValueObservation?
+        observation = progress.observe(\.fractionCompleted) { p, _ in
+            let transferred = UInt64(max(p.completedUnitCount, 0))
+            let total = UInt64(max(p.totalUnitCount, 0))
+            DispatchQueue.main.async {
+                pm.onTransferProgress?(transferID, transferred, total)
+            }
+        }
+
+        // Wrap completion to (a) tear down the KVO observation, (b)
+        // unpublish so the Finder copy panel transitions in-progress
+        // → done atomically, (c) notify the helper-side panel via
+        // onTransferComplete so it closes (the IPC FILE_TRANSFER_PROGRESS
+        // path is not in play for this lazy NSFilePromiseProvider flow).
         let wrappedCompletion: (Error?) -> Void = { error in
+            observation?.invalidate()
+            observation = nil
             progress.unpublish()
+            DispatchQueue.main.async {
+                pm.onTransferComplete?(transferID,
+                                       error == nil,
+                                       error?.localizedDescription ?? "")
+            }
             completionHandler(error)
+        }
+
+        // Pop the panel NOW — this is the actual user-paste moment for
+        // the NSFilePromiseProvider path (Finder invoked writePromiseTo
+        // because the user pressed Cmd+V or drag-completed).  Done
+        // BEFORE startFileDownload so even an instantaneous local
+        // completion still sees the panel exist long enough to swap
+        // into "Transfer complete" mode.
+        DispatchQueue.main.async {
+            pm.onTransferStart?(transferID)
         }
 
         Log.info("FilePromise: writePromiseTo \(url.path) fileID=\(fileID) bytes=\(fileSize)")

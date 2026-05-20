@@ -55,14 +55,29 @@ final class PasteboardManager: NSObject {
     /// WebRTC ClipboardMessageType::FileTransferCancel.
     var onCancelTransfer: ((String) -> Void)?
 
-    /// Fired the moment ensureFilesDownloaded first runs for an
-    /// announcement, BEFORE any FILE_TRANSFER_PROGRESS frame arrives.
-    /// Wired by ClipboardHelperApp to pop up the TransferProgressPanel
-    /// in indeterminate state so the user sees immediate feedback even
-    /// if the dcTransfer never emits an intermediate progress callback
-    /// (e.g. very small files where the only progress frame is the
-    /// terminal is_complete=true one).
+    /// Fired the moment the user actually pastes (either via Finder's
+    /// NSFilePromiseProvider writePromiseTo path or via the legacy
+    /// `.fileURL` data-provider path) — NOT on announcement.  Wired by
+    /// ClipboardHelperApp to pop up the TransferProgressPanel in
+    /// indeterminate state so the user always has immediate feedback.
     var onTransferStart: ((String) -> Void)?
+
+    /// Fired per byte-progress update for the NSFilePromiseProvider
+    /// path.  Driven by KVO on the parentProgress object inside
+    /// FilePromiseHandler.writePromiseTo — the `.fileURL` legacy path
+    /// already drives the panel via IPC FILE_TRANSFER_PROGRESS messages
+    /// so it doesn't need this callback.
+    var onTransferProgress: ((_ transferID: String,
+                              _ bytesTransferred: UInt64,
+                              _ totalBytes: UInt64) -> Void)?
+
+    /// Fired when an NSFilePromiseProvider transfer finishes (success
+    /// or failure).  Closes the panel.  The `.fileURL` legacy path
+    /// signals completion through the IPC FILE_TRANSFER_PROGRESS frame
+    /// with `is_complete=true`.
+    var onTransferComplete: ((_ transferID: String,
+                              _ success: Bool,
+                              _ errorMessage: String) -> Void)?
 
     // File download coordination (for NSPasteboardItemDataProvider)
     private var fileDownloadPaths: [String]?
@@ -704,6 +719,17 @@ extension PasteboardManager: NSPasteboardItemDataProvider {
 
         Log.info("File data provider: requested file at index \(index)")
 
+        // ACTUAL user-paste moment for the legacy `.fileURL` path — pop
+        // the panel now (the eager pre-download trigger this method
+        // also feeds into doesn't go anywhere near onTransferStart).
+        // For Finder consumers that use the NSFilePromiseProvider path
+        // instead, FilePromiseHandler.writePromiseTo fires its own
+        // onTransferStart.
+        let transferID = announcement.transferID
+        DispatchQueue.main.async { [weak self] in
+            self?.onTransferStart?(transferID)
+        }
+
         guard let paths = ensureFilesDownloaded(announcement: announcement) else {
             Log.error("File data provider: ensureFilesDownloaded returned nil (download failed or timed out)")
             return
@@ -807,20 +833,19 @@ extension PasteboardManager: NSPasteboardItemDataProvider {
             fileDownloadTriggered = true
             fileDownloadCondition.unlock()
 
-            // Notify upstream that the user-paste is in motion BEFORE
-            // any DATA_REQUEST round-trip starts.  ClipboardHelperApp
-            // uses this to pop up the progress panel in indeterminate
-            // state immediately, so the user has visible feedback even
-            // if the dcTransfer never emits an intermediate progress
-            // callback (small/fast files emit only a terminal
-            // is_complete=true frame).  Dispatch to main because
-            // panel construction touches AppKit.
-            let transferID = announcement.transferID
-            DispatchQueue.main.async { [weak self] in
-                self?.onTransferStart?(transferID)
-            }
-
-            // Send DATA_REQUEST to parent process
+            // Send DATA_REQUEST to parent process.  NOTE: do NOT fire
+            // onTransferStart here.  ensureFilesDownloaded is called
+            // BOTH from the user-paste path (.fileURL data provider)
+            // AND from the announcement-time eager pre-download below
+            // (announceDelayedFiles dispatches it on a background queue
+            // so the legacy `.fileURL` consumers have their data ready
+            // by the time they actually paste).  Firing the panel here
+            // would pop the panel at announcement time — way before
+            // the user actually pasted — which is the wrong UX.
+            // Panel show is now triggered by the actual user-paste
+            // sites (FilePromiseHandler.writePromiseTo for the modern
+            // path, the `.fileURL` data provider callback for the
+            // legacy path).
             var request = Leviathan_ClipboardDataRequest()
             request.contentHash = announcement.contentHash
             request.contentType = .files
