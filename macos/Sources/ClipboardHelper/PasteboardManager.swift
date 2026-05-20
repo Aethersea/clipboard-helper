@@ -48,6 +48,12 @@ final class PasteboardManager: NSObject {
     // Callbacks
     var onClipboardChanged: ((Leviathan_ClipboardData) -> Void)?
     var onDataRequest: ((Leviathan_ClipboardDataRequest) -> Void)?
+    /// Fired when the user clicks Cancel on the TransferProgressPanel.
+    /// Wired by ClipboardHelperApp to send a HELPER_MESSAGE_TYPE_ERROR
+    /// with body `FILE_TRANSFER_CANCEL:<transferID>` upstream, which
+    /// shen-mac native parses and propagates to leviathan as a
+    /// WebRTC ClipboardMessageType::FileTransferCancel.
+    var onCancelTransfer: ((String) -> Void)?
 
     // File download coordination (for NSPasteboardItemDataProvider)
     private var fileDownloadPaths: [String]?
@@ -747,6 +753,18 @@ extension PasteboardManager: NSPasteboardItemDataProvider {
         // wait(timeout:) returns promptly instead of having to wait
         // for the next 50 ms tick.
         renderSemaphore.signal()
+
+        // Notify upstream so shen-mac (and leviathan) can stop the
+        // in-flight dcTransfer and reclaim bandwidth.  Without this
+        // the helper-local cancel still leaves the WebRTC peer
+        // streaming the rest of the file to disk that no one will
+        // read.  Uses the existing HELPER_MESSAGE_TYPE_ERROR channel
+        // with a structured prefix so we don't need a proto change;
+        // shen-mac's helper-message handler watches for the prefix.
+        let cancelTransferID = currentTransferID.isEmpty ? transferID : currentTransferID
+        if !cancelTransferID.isEmpty {
+            onCancelTransfer?(cancelTransferID)
+        }
     }
 
     /// Coordinates the one-time file download across potentially multiple
