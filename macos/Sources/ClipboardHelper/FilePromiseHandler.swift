@@ -111,10 +111,29 @@ extension PasteboardManager: NSFilePromiseProviderDelegate {
             return
         }
 
-        // Each promise gets its own standalone Progress for now. Phase 2
-        // may aggregate sibling promises under a single parent Progress so
-        // Finder shows a "Copying N items" group instead of per-file.
+        // Per-file Progress, published to the system so the macOS
+        // copy-progress window (the one that floats over Finder during a
+        // file copy) can render a bar.  Without `publish()` + `.file`
+        // kind + fileURL/fileOperationKind, Finder has no way to
+        // discover the Progress and the user just sees a busy state
+        // with no visible progress UI — that was the "卡死 Finder + 沒進度條"
+        // symptom observed when Flow B (leviathan → shen-mac paste)
+        // first started routing through the lazy chunk fetch.
         let progress = Progress(totalUnitCount: Int64(max(fileSize, 1)))
+        progress.kind = .file
+        progress.fileOperationKind = .receiving
+        progress.fileURL = url
+        progress.isCancellable = false
+        progress.isPausable = false
+        progress.publish()
+
+        // Make sure we unpublish even if the download path errors out — a
+        // leaked published Progress shows up as a stuck progress bar in
+        // the Finder copy UI long after the operation actually finished.
+        let wrappedCompletion: (Error?) -> Void = { err in
+            progress.unpublish()
+            completionHandler(err)
+        }
 
         Log.info("FilePromise: writePromiseTo \(url.path) fileID=\(fileID) bytes=\(fileSize)")
         coordinator.startFileDownload(
@@ -123,7 +142,7 @@ extension PasteboardManager: NSFilePromiseProviderDelegate {
             fileSize: fileSize,
             to: url,
             parentProgress: progress,
-            completion: completionHandler
+            completion: wrappedCompletion
         )
     }
 
