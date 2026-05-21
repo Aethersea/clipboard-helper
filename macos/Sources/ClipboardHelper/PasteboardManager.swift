@@ -38,6 +38,13 @@ final class PasteboardManager: NSObject {
     private var isRequestInFlight = false
     private var lastSetHash: String?
 
+    /// Wall-clock time of the last announceDelayedFiles publication.
+    /// Used purely as a diagnostic in `pasteboard:provideDataForType:`
+    /// logging so we can distinguish "system probe < 1 s after announce"
+    /// (Universal Clipboard, indexers) from "real user Cmd+V" (typically
+    /// seconds-to-minutes later).
+    private var lastAnnounceTime: Date?
+
     // File transfer coordinator (injected by AppDelegate in client mode)
     var fileTransferCoordinator: FileTransferCoordinator?
 
@@ -364,6 +371,7 @@ final class PasteboardManager: NSObject {
         pasteboard.clearContents()
         pasteboard.writeObjects(writings)
         lastChangeCount = pasteboard.changeCount
+        lastAnnounceTime = Date()
 
         // No eager pre-download.  An earlier version dispatched
         // ensureFilesDownloaded here so the `.fileURL` data provider
@@ -765,7 +773,30 @@ extension PasteboardManager: NSPasteboardItemDataProvider {
             return
         }
 
-        Log.info("File data provider: requested file at index \(index)")
+        // Diagnostic: log who is asking for the .fileURL data so we can
+        // tell a real user-paste from a system probe (macOS Universal
+        // Clipboard / Continuity / clipboard managers that don't honour
+        // the org.nspasteboard.* TransientType markers).  No reliable
+        // API exposes the caller's pid from inside a data-provider
+        // callback, so we approximate via the frontmost app — real
+        // Cmd+V originates from whatever app is focused, while system
+        // probes typically run with no UI focus change or with the
+        // helper / a daemon as the "frontmost" app.
+        let frontmost = NSWorkspace.shared.frontmostApplication
+        let frontmostName = frontmost?.localizedName ?? "<nil>"
+        let frontmostBundle = frontmost?.bundleIdentifier ?? "<nil>"
+        let frontmostPid = frontmost?.processIdentifier ?? -1
+        let timeSinceAnnounce: TimeInterval
+        if let t = lastAnnounceTime {
+            timeSinceAnnounce = -t.timeIntervalSinceNow
+        } else {
+            timeSinceAnnounce = -1
+        }
+        Log.info(
+            "File data provider: requested file at index \(index) " +
+            "[frontmost='\(frontmostName)' bundle=\(frontmostBundle) " +
+            "pid=\(frontmostPid) tSinceAnnounce=\(String(format: "%.3f", timeSinceAnnounce))s]"
+        )
 
         // ACTUAL user-paste moment for the legacy `.fileURL` path — pop
         // the panel now (the eager pre-download trigger this method
@@ -809,12 +840,22 @@ extension PasteboardManager: NSPasteboardItemDataProvider {
     /// callback.  Both ensureFilesDownloaded spin loops poll the
     /// `fileDownloadCancelled` flag and exit promptly when it flips.
     ///
-    /// The `transferID` argument lets us ignore a stale cancel that
-    /// arrives via the panel's 1.5 s auto-dismiss window after a
-    /// fresh announcement has already rotated state — without the
-    /// match check we'd nuke a freshly-started transfer that the
-    /// user wanted to keep.  An empty `transferID` is treated as
-    /// "match any" so legacy callers continue to work.
+    /// `transferID` is the ID to use for the upstream FILE_TRANSFER_CANCEL
+    /// IPC message.  The caller in ClipboardHelperApp prefers the
+    /// dcTransfer session UUID (captured from FILE_TRANSFER_PROGRESS
+    /// frames) over the announcement's content_hash, because leviathan's
+    /// dcTransfer session map is keyed by the UUID.  If empty, falls
+    /// back to the announcement's transferID so something at least
+    /// propagates upstream.
+    ///
+    /// Previously this routine carried a "stale transferID" check that
+    /// rejected any ID not matching `pendingAnnouncement.transferID`.
+    /// That broke once `transferID` started arriving as the dcTransfer
+    /// UUID (which intentionally differs from the announcement's content
+    /// hash), turning the cancel into a silent no-op.  Stale-cancel
+    /// protection now lives in panel-lifecycle management (the panel is
+    /// closed before a new announcement opens its replacement), so
+    /// dropping the check here is safe.
     func cancelFileDownload(transferID: String) {
         let currentTransferID: String = {
             stateLock.lock()
@@ -822,12 +863,9 @@ extension PasteboardManager: NSPasteboardItemDataProvider {
             return pendingAnnouncement?.transferID ?? ""
         }()
 
-        if !transferID.isEmpty && transferID != currentTransferID {
-            Log.info("cancelFileDownload: ignoring stale cancel for transfer \(transferID) (current=\(currentTransferID))")
-            return
-        }
+        let cancelTransferID = transferID.isEmpty ? currentTransferID : transferID
 
-        Log.info("cancelFileDownload: marking download cancelled (transfer=\(currentTransferID))")
+        Log.info("cancelFileDownload: marking download cancelled (transfer=\(cancelTransferID))")
         fileDownloadCondition.lock()
         fileDownloadCancelled = true
         fileDownloadCondition.broadcast()
@@ -844,7 +882,6 @@ extension PasteboardManager: NSPasteboardItemDataProvider {
         // read.  Uses the existing HELPER_MESSAGE_TYPE_ERROR channel
         // with a structured prefix so we don't need a proto change;
         // shen-mac's helper-message handler watches for the prefix.
-        let cancelTransferID = currentTransferID.isEmpty ? transferID : currentTransferID
         if !cancelTransferID.isEmpty {
             onCancelTransfer?(cancelTransferID)
         }

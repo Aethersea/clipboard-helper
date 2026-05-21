@@ -65,18 +65,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var pasteboardManager: PasteboardManager!
     private var fileTransferCoordinator: FileTransferCoordinator!
     private var progressPanel: TransferProgressPanel?
-    /// Transfer ID the current panel is showing.  Used by
-    /// ensureProgressPanelVisible to detect a transferID transition — if a
-    /// new transfer starts while the previous panel is still on screen
-    /// (e.g. inside the 1.5s post-complete dismiss window), we close the
-    /// stale panel and create a fresh one so the user doesn't see leftover
-    /// "Transfer complete" chrome.
-    private var activeTransferID: String?
     /// Pending main-queue work item for the 1.5s panel auto-dismiss.
     /// Held so we can cancel it if a new transfer starts before it fires —
     /// otherwise the stale timer would close the new panel out from under
     /// the new transfer.
     private var pendingPanelCloseWorkItem: DispatchWorkItem?
+    /// The dcTransfer-side session UUID for the currently active paste.
+    /// Captured from the FIRST `FILE_TRANSFER_PROGRESS` IPC frame that
+    /// arrives after an announcement.  Differs from
+    /// `announcement.transferID` because leviathan's dcTransfer generates
+    /// its own session UUID at `handleFileTransferToClient` time; the
+    /// announcement carries our local content_hash.
+    /// Cancel propagation MUST use this UUID — leviathan's session map
+    /// is keyed by it, and a `FileTransferCancel` with the announcement
+    /// content_hash won't match any session and the download keeps
+    /// going.
+    private var dcTransferIDForCurrentAnnouncement: String?
     /// Retained for lifetime of the helper — cancelling the source unregisters
     /// the kqueue watch, so it must outlive setupParentPidWatchdog's scope.
     private var parentPidWatcher: DispatchSourceProcess?
@@ -145,9 +149,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // indeterminate state so the user always has visible feedback,
         // even when the transfer completes before any intermediate
         // progress frame arrives.
-        pasteboardManager.onTransferStart = { [weak self] transferID in
+        pasteboardManager.onTransferStart = { [weak self] _ in
             guard let self = self else { return }
-            self.ensureProgressPanelVisible(for: transferID)
+            // Drop any stale dcTransfer UUID from a previous paste —
+            // if the user pasted again before the prior panel's dismiss
+            // timer fired, dcTransferIDForCurrentAnnouncement still
+            // holds the old session's UUID, and a Cancel click between
+            // now and the FIRST progress frame of the NEW session would
+            // otherwise route to the stale UUID and silently miss.
+            self.dcTransferIDForCurrentAnnouncement = nil
+            self.ensureProgressPanelVisible()
         }
 
         // KVO-driven progress from the NSFilePromiseProvider path
@@ -158,9 +169,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // into Finder.
         pasteboardManager.onTransferProgress = { [weak self] transferID, transferred, total in
             guard let self = self else { return }
+            // Capture the dcTransfer-side UUID (same routing rationale
+            // as handleFileTransferProgress) so a Cancel click can hit
+            // the right session even when the only progress signal is
+            // the KVO bridge.
+            if !transferID.isEmpty {
+                self.dcTransferIDForCurrentAnnouncement = transferID
+            }
             // Defensive ensure — KVO observation can fire before
             // onTransferStart in rare orderings on the operation queue.
-            self.ensureProgressPanelVisible(for: transferID)
+            self.ensureProgressPanelVisible()
             self.progressPanel?.updateProgress(
                 bytesTransferred: transferred,
                 totalBytes: total
@@ -229,7 +247,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .announceDelayed:
             if case .announcement(let ann) = message.payload {
                 DispatchQueue.main.async { [weak self] in
-                    self?.pasteboardManager.announceDelayed(ann)
+                    guard let self = self else { return }
+                    // A fresh announcement supersedes whatever was on the
+                    // pasteboard before — drop the cached dcTransfer UUID
+                    // from any previous in-flight session so a Cancel
+                    // click after this point doesn't try to cancel the
+                    // OLD session's UUID and miss the new one.
+                    self.dcTransferIDForCurrentAnnouncement = nil
+                    self.pasteboardManager.announceDelayed(ann)
                 }
             }
 
@@ -286,12 +311,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Handle file transfer progress from the Go parent process.
     /// Shows or updates a floating progress panel during file downloads.
     private func handleFileTransferProgress(_ progress: Leviathan_HelperFileTransferProgress) {
+        // Capture the dcTransfer-side UUID for cancel routing.  Leviathan
+        // generates its own session UUID inside handleFileTransferToClient,
+        // which differs from the announcement's content_hash; a
+        // FileTransferCancel sent with the announcement's content_hash
+        // would not match any session on the leviathan side and the
+        // download would continue after the user clicked Cancel.
+        if !progress.transferID.isEmpty {
+            dcTransferIDForCurrentAnnouncement = progress.transferID
+        }
+
         // Always ensure the panel exists — even on a terminal isComplete
         // frame.  Without this, a small/fast transfer whose only
         // progress frame is `isComplete=true` would never get a panel
         // (completeTransfer is a no-op on a nil panel) and the user
         // would see nothing despite the paste happening.
-        ensureProgressPanelVisible(for: progress.transferID)
+        ensureProgressPanelVisible()
 
         if progress.isComplete {
             Log.info("[FileTransfer] Transfer \(progress.transferID) complete: success=\(progress.success)")
@@ -306,9 +341,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Create + show the progress panel if it doesn't already exist.
-    /// Wires the Cancel button to PasteboardManager.cancelFileDownload
-    /// with the given transferID so late cancels for stale transfers
-    /// get filtered out at the PasteboardManager layer.
+    /// Wires the Cancel button to a closure that reads the live cancel
+    /// state out of self at click time — capturing a transferID at panel-
+    /// creation time would be wrong because the dcTransfer UUID isn't
+    /// known yet at that point (it arrives later, in the first
+    /// FILE_TRANSFER_PROGRESS frame).
     ///
     /// Called from two paths:
     ///   * `pasteboardManager.onTransferStart` — immediately when the
@@ -318,47 +355,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ///     the terminal isComplete frame arrives before any intermediate
     ///     progress frame (small/fast transfers).
     ///
-    /// If a panel already exists but for a DIFFERENT transferID, we tear
-    /// it down and rebuild — this covers the window where a new paste
-    /// starts during the 1.5s post-complete auto-dismiss delay (the
-    /// previous panel would otherwise be stuck on "Transfer complete"
-    /// with a disabled Cancel button).  Any pending dismiss timer is
-    /// always cancelled so it can't close the new panel later.
-    ///
-    /// Same-transferID re-entry: NSFilePromiseProvider invokes
-    /// `writePromiseTo` once per file, and every file in a multi-file
-    /// paste shares the same announcement-scoped transferID (it's
-    /// `pending.content_hash`).  If file N just completed (panel now in
-    /// "Transfer complete" terminal state + dismiss timer pending) and
-    /// file N+1 starts within 1.5 s, we cancel the timer and reset the
-    /// panel's UI back to running so the user doesn't see a stale
-    /// terminal panel while file N+1 silently downloads.  Detecting the
-    /// pending timer (vs. always resetting) keeps the very-first
-    /// ensureProgressPanelVisible-of-a-fresh-paste cheap.
-    private func ensureProgressPanelVisible(for transferID: String) {
+    /// If a panel already exists and a pending dismiss timer is in flight
+    /// (= previous transfer just completed but 1.5s window hasn't closed
+    /// it yet), reset the panel's UI back to running for the new
+    /// transfer.  Multi-file pastes share `pending.content_hash` as
+    /// transferID and pipeline through this same panel.
+    private func ensureProgressPanelVisible() {
         let hadPendingDismiss = pendingPanelCloseWorkItem != nil
         pendingPanelCloseWorkItem?.cancel()
         pendingPanelCloseWorkItem = nil
-
-        if progressPanel != nil && activeTransferID != transferID {
-            progressPanel?.close()
-            progressPanel = nil
-        }
 
         if progressPanel == nil {
             progressPanel = TransferProgressPanel()
             progressPanel?.onCancel = { [weak self] in
                 guard let self = self else { return }
-                self.pasteboardManager.cancelFileDownload(transferID: transferID)
+                // Prefer the dcTransfer session UUID (captured from the
+                // first progress frame) so the FileTransferCancel routed
+                // to leviathan actually matches the live session.
+                // Falls back to the announcement's transferID if cancel
+                // fires before any progress frame has arrived (e.g. user
+                // cancels while waiting on the initial DATA_REQUEST →
+                // dcTransfer offer round trip).
+                let cancelID = self.dcTransferIDForCurrentAnnouncement ?? ""
+                self.pasteboardManager.cancelFileDownload(transferID: cancelID)
                 // Drive the panel to a terminal state and start the
-                // auto-dismiss timer immediately.  cancelFileDownload
-                // only signals upstream + flips the spin-loop flag; for
-                // the NSFilePromiseProvider path the in-flight chunk
-                // requests have to time out before wrappedCompletion
-                // fires onTransferComplete, leaving the panel stuck on
-                // "Cancelling…" until then.  Closing the panel locally
-                // is correct UX: the user already asked to cancel, they
-                // shouldn't see the panel linger.
+                // auto-dismiss timer immediately.  The upstream pipeline
+                // tear-down is async (chunk-request timeouts feed into
+                // wrappedCompletion → onTransferComplete), so without
+                // closing locally the panel would sit on "Cancelling…"
+                // until those timeouts.
                 self.progressPanel?.completeTransfer(success: false, errorMessage: "Cancelled")
                 self.scheduleProgressPanelDismiss()
             }
@@ -366,7 +391,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else if hadPendingDismiss {
             progressPanel?.resetForNextTransfer()
         }
-        activeTransferID = transferID
     }
 
     /// Mark the current panel as terminal (success or failure), then
@@ -383,7 +407,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             scheduledPanel?.close()
             if self.progressPanel === scheduledPanel {
                 self.progressPanel = nil
-                self.activeTransferID = nil
+                self.dcTransferIDForCurrentAnnouncement = nil
             }
             self.pendingPanelCloseWorkItem = nil
         }
