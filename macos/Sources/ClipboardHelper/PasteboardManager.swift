@@ -819,7 +819,11 @@ extension PasteboardManager: NSPasteboardItemDataProvider {
         } else {
             timeSinceAnnounce = -1
         }
-        let liveChangeCount = pasteboard.changeCount
+        // `self.pasteboard` (the instance property — non-optional NSPasteboard)
+        // — the `pasteboard` parameter to this NSPasteboardItemDataProvider
+        // callback is optional (`NSPasteboard?`) and shadows the property
+        // name inside this function.
+        let liveChangeCount = self.pasteboard.changeCount
         let changeCountDelta = liveChangeCount - lastChangeCount
         let thread = Thread.current
         let threadName = thread.name ?? ""
