@@ -875,19 +875,24 @@ extension PasteboardManager: NSPasteboardItemDataProvider {
         //     and ensureProgressPanelVisible shows the floating HUD
         //     before the user has done anything.
         //
-        // Time gate: 100 ms.  Human reaction (paste action) is bounded
-        // by network announce latency (≥ a few ms WAN) + IPC + user
-        // perception + finger movement (≥ 150 ms).  Anything < 100 ms
-        // is definitively a probe, not a user-driven paste.  Probes
-        // get an empty reply (no setString) — the pasteboard does NOT
-        // cache an empty reply, so a subsequent real user paste
-        // re-invokes this provider and gets the actual URL.
+        // Time gate: 1 s.  A real user paste requires the user to
+        // perceive the source-side copy succeeded, switch focus / open
+        // the destination (Finder, Mail, …), then move the cursor and
+        // press Cmd+V.  Even an ALREADY-focused destination + an
+        // extremely fast user takes hundreds of milliseconds.  Maccy /
+        // Continuity / similar probers fire within tens of ms.  1 s
+        // gives a very wide safety margin without affecting any
+        // plausible interactive flow.
+        //
+        // Probes get an empty reply (no setString) — the pasteboard
+        // does NOT cache an empty reply, so a subsequent real user
+        // paste re-invokes this provider and gets the actual URL.
         //
         // Trade-off: Continuity / Maccy / other probers get back no
         // `.fileURL` data.  Acceptable — large file pastes are not
         // sensible candidates for iCloud sync or clipboard-history
         // archival anyway.
-        let probeThreshold: TimeInterval = 0.100
+        let probeThreshold: TimeInterval = 1.0
         if timeSinceAnnounce >= 0 && timeSinceAnnounce < probeThreshold {
             Log.info(
                 "File data provider: suppressing probe at index \(index) (tSinceAnnounce=\(String(format: "%.3f", timeSinceAnnounce))s < \(probeThreshold)s) — likely Continuity / Maccy / system service; not triggering download"
