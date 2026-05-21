@@ -66,14 +66,19 @@ final class TransferProgressPanel: NSObject {
         p.level = .floating
         p.collectionBehavior = [.canJoinAllSpaces, .transient]
         p.isMovableByWindowBackground = true
-        // Defer becoming key until a control inside actually needs key
-        // status (i.e. the user clicks Cancel).  Keeps the panel from
-        // momentarily stealing key focus on showPanel() while still
-        // allowing the button to route its click — combined with the
-        // `canBecomeKey` override on ClickableHUDPanel, this gives the
-        // "background daemon shows HUD that responds to clicks but
-        // doesn't yank focus" behaviour we want.
-        p.becomesKeyOnlyIfNeeded = true
+        // Leave `becomesKeyOnlyIfNeeded` at its default (false) and
+        // explicitly makeKey below.  An earlier version set this to
+        // true thinking it'd avoid stealing focus, but combined with
+        // `.nonactivatingPanel` + `.hudWindow` the side effect was that
+        // the panel never became key on display, which made AppKit
+        // draw the Cancel `NSButton` in its non-key/inactive style —
+        // the button looked permanently greyed-out / disabled even
+        // though `isEnabled == true`.
+        //
+        // `.nonactivatingPanel` still applies: the helper APP does NOT
+        // activate (system frontmost stays on the user's paste-target
+        // app); only the panel's intra-app key state flips, which is
+        // what NSButton needs to render in its active style.
 
         let contentView = NSView(frame: NSRect(x: 0, y: 0, width: panelWidth, height: panelHeight))
 
@@ -127,7 +132,15 @@ final class TransferProgressPanel: NSObject {
         bytesLabel = bytes
 
         p.contentView = contentView
+        // `orderFront` alone doesn't make the panel key (it just brings
+        // it visually forward).  Without key status, NSButton inside a
+        // `.hudWindow` panel renders in its non-key style which looks
+        // disabled.  `makeKey()` flips the panel to key WITHIN our
+        // process — the `.nonactivatingPanel` styleMask ensures the
+        // helper app itself does NOT activate / steal system frontmost
+        // from the user's paste-target app.
         p.orderFront(nil)
+        p.makeKey()
         panel = p
     }
 
