@@ -1079,7 +1079,17 @@ extension PasteboardManager: NSPasteboardItemDataProvider {
                 } else if !isStillCurrent() {
                     superseded = true
                 } else if Thread.isMainThread {
-                    RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.05))
+                    // `.common` (not `.default`) — macOS dispatches mouse /
+                    // button-click events in `.eventTracking` mode, which
+                    // `.default` does NOT include.  Spinning in `.default`
+                    // left the user's Cancel click queued forever (beach-
+                    // ball) until the spin loop exited on its own timeout.
+                    // `.common` is the meta-mode that automatically covers
+                    // any mode registered via NSRunLoop's commonModes —
+                    // includes `.default` AND `.eventTracking` AND modal
+                    // panel modes — so the Cancel button reaches its
+                    // target/action during this 50 ms slice.
+                    RunLoop.current.run(mode: .common, before: Date(timeIntervalSinceNow: 0.05))
                 } else {
                     Thread.sleep(forTimeInterval: 0.05)
                 }
