@@ -1,6 +1,30 @@
 import AppKit
 import Foundation
 
+/// NSPanel subclass that overrides `canBecomeKey` to return true.
+///
+/// Required because TransferProgressPanel uses `.nonactivatingPanel` in
+/// the styleMask so popping the panel doesn't yank focus away from
+/// whichever app the user is in.  The default NSPanel behaviour for
+/// `.nonactivatingPanel` is `canBecomeKey == false`, which is fine for
+/// purely-display HUDs — but our HUD has a Cancel `NSButton`, and
+/// `NSButton`'s click → `target/action` dispatch needs the panel to be
+/// a key window for the click to flow through the responder chain.
+/// Without this override the Cancel button visually depresses (or not,
+/// depending on appearance) but the `@objc cancelButtonClicked` selector
+/// never fires.
+///
+/// Combined with `.nonactivatingPanel`: app itself does NOT activate
+/// (helper stays a background daemon, user's foreground app keeps
+/// focus), but the panel CAN become key when the user clicks inside it
+/// — which is exactly what's needed to route Cancel.
+private final class ClickableHUDPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    // Stay out of the main-window pool — only key, never main.  Main
+    // status is for document-style windows, not floating HUDs.
+    override var canBecomeMain: Bool { false }
+}
+
 /// A floating HUD-style panel that shows file transfer progress.
 /// Displayed by the clipboard-helper when the Go server reports download progress.
 final class TransferProgressPanel: NSObject {
@@ -30,7 +54,7 @@ final class TransferProgressPanel: NSObject {
         let panelX = screenFrame.maxX - panelWidth - 16
         let panelY = screenFrame.minY + 16
 
-        let p = NSPanel(
+        let p = ClickableHUDPanel(
             contentRect: NSRect(x: panelX, y: panelY, width: panelWidth, height: panelHeight),
             styleMask: [.titled, .hudWindow, .utilityWindow, .nonactivatingPanel],
             backing: .buffered,
@@ -42,6 +66,14 @@ final class TransferProgressPanel: NSObject {
         p.level = .floating
         p.collectionBehavior = [.canJoinAllSpaces, .transient]
         p.isMovableByWindowBackground = true
+        // Defer becoming key until a control inside actually needs key
+        // status (i.e. the user clicks Cancel).  Keeps the panel from
+        // momentarily stealing key focus on showPanel() while still
+        // allowing the button to route its click — combined with the
+        // `canBecomeKey` override on ClickableHUDPanel, this gives the
+        // "background daemon shows HUD that responds to clicks but
+        // doesn't yank focus" behaviour we want.
+        p.becomesKeyOnlyIfNeeded = true
 
         let contentView = NSView(frame: NSRect(x: 0, y: 0, width: panelWidth, height: panelHeight))
 
