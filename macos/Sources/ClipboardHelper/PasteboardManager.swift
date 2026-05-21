@@ -646,8 +646,14 @@ final class PasteboardManager: NSObject {
             return data
         }
 
-        // Try file URLs first — files on clipboard also have text/image representations,
-        // so this must be checked before text to avoid misclassifying file copies as text.
+        // Type-priority probe order matters: many clipboard sources
+        // (browsers, chat apps, email clients) ALSO write a text /
+        // HTML representation alongside a real file or image — Safari's
+        // "Copy Image" puts both `.png` and `.string` (the image URL or
+        // alt text) on the pasteboard.  If we check text before file
+        // URLs / image bytes, we misclassify these as text and ship
+        // 400-byte HTML snippets to leviathan instead of the real
+        // image.  Order: files → image (PNG / TIFF) → text → fallback.
         if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [
             .urlReadingFileURLsOnly: true
         ]) as? [URL], !urls.isEmpty {
@@ -656,15 +662,8 @@ final class PasteboardManager: NSObject {
             return result.data
         }
 
-        // Try text
-        if let text = pasteboard.string(forType: .string), !text.isEmpty {
-            data.contentType = .text
-            data.payload = Data(text.utf8)
-            data.contentHash = sha256Hex(data.payload)
-            return data
-        }
-
-        // Try image (PNG)
+        // Try image (PNG) BEFORE text — image-copy sources commonly
+        // include a text representation that would otherwise win.
         if let imageData = pasteboard.data(forType: .png) {
             data.contentType = .image
             data.payload = imageData
@@ -679,6 +678,14 @@ final class PasteboardManager: NSObject {
             data.contentType = .image
             data.payload = pngData
             data.contentHash = sha256Hex(pngData)
+            return data
+        }
+
+        // Try text (fallback after images — see header comment).
+        if let text = pasteboard.string(forType: .string), !text.isEmpty {
+            data.contentType = .text
+            data.payload = Data(text.utf8)
+            data.contentHash = sha256Hex(data.payload)
             return data
         }
 
