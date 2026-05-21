@@ -572,16 +572,29 @@ final class PasteboardManager: NSObject {
     private func checkForChanges() {
         let currentCount = pasteboard.changeCount
         guard currentCount != lastChangeCount else { return }
+        let prev = lastChangeCount
         lastChangeCount = currentCount
+        // Diagnostic: every time we observe a changeCount bump that
+        // is NOT our own, we log it.  If the leviathan→shen→helper
+        // path is somehow triggering a CLIPBOARD_CHANGED echo back to
+        // shen (which would then re-announce to leviathan = the loop
+        // the user suspects), it'd show up here.
+        Log.info(
+            "checkForChanges: changeCount \(prev) → \(currentCount), lastSetHash=\(lastSetHash ?? "<nil>")"
+        )
 
         let data = readPasteboard()
 
         // Suppress echo: don't report changes we caused ourselves
         if let lastHash = lastSetHash, data.contentHash == lastHash {
+            Log.info("checkForChanges: echo-suppressed (matches lastSetHash)")
             return
         }
 
-        guard data.contentType != .unspecified else { return }
+        guard data.contentType != .unspecified else {
+            Log.info("checkForChanges: unspecified contentType (likely our own files announce skipped by defensive guard) — not emitting CLIPBOARD_CHANGED")
+            return
+        }
 
         Log.info("Local clipboard changed: \(data.contentType) hash=\(data.contentHash)")
         onClipboardChanged?(data)
@@ -773,15 +786,29 @@ extension PasteboardManager: NSPasteboardItemDataProvider {
             return
         }
 
-        // Diagnostic: log who is asking for the .fileURL data so we can
-        // tell a real user-paste from a system probe (macOS Universal
-        // Clipboard / Continuity / clipboard managers that don't honour
-        // the org.nspasteboard.* TransientType markers).  No reliable
-        // API exposes the caller's pid from inside a data-provider
-        // callback, so we approximate via the frontmost app — real
-        // Cmd+V originates from whatever app is focused, while system
-        // probes typically run with no UI focus change or with the
-        // helper / a daemon as the "frontmost" app.
+        // Diagnostic: identify what's actually reading our `.fileURL`.
+        //
+        // macOS deliberately hides the caller from data-provider
+        // callbacks — there's no `auditToken` or `pid_t` exposed, so we
+        // can't directly name the reader.  But we CAN gather indirect
+        // evidence:
+        //
+        //   * frontmostApp — user-focused window (NOT the reader; the
+        //     reader can be a background daemon while shen is focused)
+        //   * tSinceAnnounce — < 50 ms strongly suggests a synchronous
+        //     system service (Continuity, indexers) that hooks into
+        //     the pasteboard server's change-count bump.  > 1 s is
+        //     more consistent with a polling clipboard manager OR a
+        //     real user Cmd+V
+        //   * changeCount delta — if pasteboard.changeCount > our
+        //     lastChangeCount, somebody ELSE wrote to the pasteboard
+        //     between our announce and now (third-party clipboard
+        //     manager echoing a transient copy)
+        //   * thread name / call stack symbols — sometimes the AppKit
+        //     dispatch path leaves a fingerprint (e.g. "PBSync" /
+        //     "ContinuityClipboard" in the stack indicates Continuity)
+        //   * known-running clipboard processes — `pboard`, `pbs`,
+        //     known managers — filter NSWorkspace.runningApplications
         let frontmost = NSWorkspace.shared.frontmostApplication
         let frontmostName = frontmost?.localizedName ?? "<nil>"
         let frontmostBundle = frontmost?.bundleIdentifier ?? "<nil>"
@@ -792,11 +819,41 @@ extension PasteboardManager: NSPasteboardItemDataProvider {
         } else {
             timeSinceAnnounce = -1
         }
-        Log.info(
-            "File data provider: requested file at index \(index) " +
-            "[frontmost='\(frontmostName)' bundle=\(frontmostBundle) " +
-            "pid=\(frontmostPid) tSinceAnnounce=\(String(format: "%.3f", timeSinceAnnounce))s]"
-        )
+        let liveChangeCount = pasteboard.changeCount
+        let changeCountDelta = liveChangeCount - lastChangeCount
+        let thread = Thread.current
+        let threadName = thread.name ?? ""
+        let threadDescription = thread.description
+        // Walk the first ~20 stack frames — AppKit / pasteboard server
+        // dispatch paths often carry a tell-tale symbol like
+        // `_pasteboard_pbpaste`, `__NSCallback`, or
+        // `_CFPasteboardSyncWithRemote`.  Truncate to keep the log line
+        // sane; the symbols are typically the most informative ones.
+        let stackSymbols = Thread.callStackSymbols.prefix(20).joined(separator: " | ")
+        // List clipboard-suspect processes that are running right now
+        // (so we can correlate which one most plausibly fired the read).
+        let suspects = NSWorkspace.shared.runningApplications.compactMap { app -> String? in
+            guard let bundle = app.bundleIdentifier?.lowercased() else { return nil }
+            let suspectKeywords = [
+                "pboard", "pbs", "continuity",
+                "maccy", "raycast", "alfred", "paste",
+                "copyclip", "pastebot", "flycut",
+            ]
+            for keyword in suspectKeywords where bundle.contains(keyword) {
+                return "\(app.bundleIdentifier ?? "?")(pid=\(app.processIdentifier))"
+            }
+            return nil
+        }.joined(separator: ", ")
+
+        Log.info("""
+            File data provider: requested file at index \(index)
+              frontmost='\(frontmostName)' bundle=\(frontmostBundle) pid=\(frontmostPid)
+              tSinceAnnounce=\(String(format: "%.3f", timeSinceAnnounce))s
+              changeCount=\(liveChangeCount) (delta from last write: \(changeCountDelta))
+              thread='\(threadName)' \(threadDescription)
+              clipboardSuspects=[\(suspects)]
+              stack=\(stackSymbols)
+            """)
 
         // ACTUAL user-paste moment for the legacy `.fileURL` path — pop
         // the panel now (the eager pre-download trigger this method
