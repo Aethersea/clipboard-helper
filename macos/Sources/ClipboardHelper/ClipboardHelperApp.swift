@@ -348,7 +348,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if progressPanel == nil {
             progressPanel = TransferProgressPanel()
             progressPanel?.onCancel = { [weak self] in
-                self?.pasteboardManager.cancelFileDownload(transferID: transferID)
+                guard let self = self else { return }
+                self.pasteboardManager.cancelFileDownload(transferID: transferID)
+                // Drive the panel to a terminal state and start the
+                // auto-dismiss timer immediately.  cancelFileDownload
+                // only signals upstream + flips the spin-loop flag; for
+                // the NSFilePromiseProvider path the in-flight chunk
+                // requests have to time out before wrappedCompletion
+                // fires onTransferComplete, leaving the panel stuck on
+                // "Cancelling…" until then.  Closing the panel locally
+                // is correct UX: the user already asked to cancel, they
+                // shouldn't see the panel linger.
+                self.progressPanel?.completeTransfer(success: false, errorMessage: "Cancelled")
+                self.scheduleProgressPanelDismiss()
             }
             progressPanel?.showPanel()
         } else if hadPendingDismiss {

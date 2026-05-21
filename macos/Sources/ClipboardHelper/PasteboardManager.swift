@@ -335,19 +335,23 @@ final class PasteboardManager: NSObject {
         pasteboard.writeObjects(writings)
         lastChangeCount = pasteboard.changeCount
 
-        // Eager pre-download for the `.fileURL` fallback path.  Without
-        // this, when Finder pastes via the `.fileURL` data provider,
-        // ensureFilesDownloaded fires from the main thread and spins
-        // the run loop waiting up to 300 s for the entire download to
-        // complete.  Pre-kicking the download asynchronously here lets
-        // the eventual main-thread ensureFilesDownloaded call return
-        // from cache near-instantly (or with the download already in
-        // flight).  Cost: bandwidth wasted if the user copies and
-        // never pastes — acceptable trade-off.
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self = self else { return }
-            _ = self.ensureFilesDownloaded(announcement: announcement)
-        }
+        // No eager pre-download.  An earlier version dispatched
+        // ensureFilesDownloaded here so the `.fileURL` data provider
+        // could return from cache, but that triggers a full dcTransfer
+        // download at announcement time — even when the user never
+        // pastes — and also pops the TransferProgressPanel via the
+        // resulting IPC FILE_TRANSFER_PROGRESS frames, which is the
+        // wrong UX (the user hasn't pasted yet).  Both pipelines now
+        // start the download lazily when the user actually pastes:
+        //
+        //   * Finder (NSFilePromiseProvider path): writePromiseTo →
+        //     FileTransferCoordinator chunked download via
+        //     FILE_CHUNK_REQUEST, progress surfaced through KVO on
+        //     NSProgress to the helper's TransferProgressPanel.
+        //   * Other targets (`.fileURL` path): pasteboard:provideDataForType:
+        //     synchronously drives ensureFilesDownloaded on first paste,
+        //     blocking the main run loop spin until the download
+        //     completes — which is the price for not wasting bandwidth.
 
         Log.info("Announced delayed files (dual-publish): \(announcement.files.count) file(s) hash=\(announcement.contentHash) transferID=\(announcement.transferID)")
     }
