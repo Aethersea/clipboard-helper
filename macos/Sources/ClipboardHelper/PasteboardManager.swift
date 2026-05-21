@@ -859,6 +859,42 @@ extension PasteboardManager: NSPasteboardItemDataProvider {
               stack=\(stackSymbols)
             """)
 
+        // Time-gated probe suppression.
+        //
+        // Diagnostic established (via runtime stack capture) that pboard
+        // dispatches `provideDataForType:` within ~4 ms of writeObjects
+        // because an external XPC requester — macOS Universal Clipboard
+        // / Continuity, Maccy, or similar — eagerly fetches our promised
+        // `.fileURL` the instant our changeCount bumps.  These probes:
+        //
+        //   * Burn bandwidth: each probe triggers ensureFilesDownloaded
+        //     → DATA_REQUEST → full dcTransfer download for content the
+        //     user may never paste.
+        //   * Pop the progress panel at announce time: the resulting
+        //     IPC FILE_TRANSFER_PROGRESS frames flow back to the helper
+        //     and ensureProgressPanelVisible shows the floating HUD
+        //     before the user has done anything.
+        //
+        // Time gate: 100 ms.  Human reaction (paste action) is bounded
+        // by network announce latency (≥ a few ms WAN) + IPC + user
+        // perception + finger movement (≥ 150 ms).  Anything < 100 ms
+        // is definitively a probe, not a user-driven paste.  Probes
+        // get an empty reply (no setString) — the pasteboard does NOT
+        // cache an empty reply, so a subsequent real user paste
+        // re-invokes this provider and gets the actual URL.
+        //
+        // Trade-off: Continuity / Maccy / other probers get back no
+        // `.fileURL` data.  Acceptable — large file pastes are not
+        // sensible candidates for iCloud sync or clipboard-history
+        // archival anyway.
+        let probeThreshold: TimeInterval = 0.100
+        if timeSinceAnnounce >= 0 && timeSinceAnnounce < probeThreshold {
+            Log.info(
+                "File data provider: suppressing probe at index \(index) (tSinceAnnounce=\(String(format: "%.3f", timeSinceAnnounce))s < \(probeThreshold)s) — likely Continuity / Maccy / system service; not triggering download"
+            )
+            return
+        }
+
         // ACTUAL user-paste moment for the legacy `.fileURL` path — pop
         // the panel now (the eager pre-download trigger this method
         // also feeds into doesn't go anywhere near onTransferStart).
