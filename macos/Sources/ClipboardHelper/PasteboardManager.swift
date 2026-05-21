@@ -156,7 +156,19 @@ final class PasteboardManager: NSObject {
         activePromiseProviders.removeAll()
         activeTransferID = nil
 
-        pasteboard.clearContents()
+        // `prepareForNewContents(with: .currentHostOnly)` replaces
+        // `clearContents()` and explicitly opts the new pasteboard
+        // contents out of Universal Clipboard / Continuity / Handoff
+        // sync.  Apple's documented mechanism to suppress `sharingd`'s
+        // synchronous probe right after writeObjects.
+        //
+        // Trade-off: the user can't paste this content on their iPhone
+        // / other Macs.  Correct for our case — the content is on a
+        // remote server and the `.fileURL` we publish points to a
+        // local cache directory that doesn't exist on other devices,
+        // so a Universal Clipboard "paste" elsewhere would be useless
+        // anyway.
+        pasteboard.prepareForNewContents(with: .currentHostOnly)
 
         switch data.contentType {
         case .text:
@@ -380,7 +392,12 @@ final class PasteboardManager: NSObject {
             writings.append(provider)
         }
 
-        pasteboard.clearContents()
+        // See `setClipboard`'s identical call for the rationale.  The
+        // `.currentHostOnly` opt-out is what blocks Continuity /
+        // Universal Clipboard / sharingd from synchronously probing
+        // our `.fileURL` data provider milliseconds after writeObjects
+        // — Apple's documented suppression mechanism (10.13+).
+        pasteboard.prepareForNewContents(with: .currentHostOnly)
         pasteboard.writeObjects(writings)
         lastChangeCount = pasteboard.changeCount
         lastAnnounceTime = Date()
