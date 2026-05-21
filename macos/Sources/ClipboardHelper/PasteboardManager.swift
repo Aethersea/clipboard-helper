@@ -1079,32 +1079,43 @@ extension PasteboardManager: NSPasteboardItemDataProvider {
                 } else if !isStillCurrent() {
                     superseded = true
                 } else if Thread.isMainThread {
-                    // Alternate `.default` ↔ `.eventTracking` per 50 ms
-                    // slice, each 25 ms.  `.default` covers
-                    // DispatchQueue.main async blocks (e.g. our own
-                    // `onTransferStart` dispatch that creates / shows
-                    // the progress panel), timers, port-based input
-                    // sources.  `.eventTracking` covers mouse events
-                    // (the user clicking Cancel on the panel).  We
-                    // need BOTH to fire during the spin so the panel
-                    // appears DURING the download (not after) and
-                    // Cancel clicks reach their target.
+                    // Drain AppKit events + DispatchQueue.main blocks for
+                    // ~50 ms.  This is the pattern Apple uses internally
+                    // for modal panels (NSApp.runModal does the same):
+                    // pull NSEvents from our process's event queue with
+                    // `NSApp.nextEvent(...)` and forward them through
+                    // `NSApp.sendEvent(_:)`, which is what actually
+                    // routes mouse-click / key events to the responder
+                    // chain (window → contentView → … → NSButton →
+                    // target/action).
                     //
-                    // Previous attempts:
-                    //   * `.default` only → Cancel click queued forever
-                    //     (beach-ball) because mouse events live in
-                    //     `.eventTracking`.
-                    //   * `.common` → `.common` is a meta-mode used with
-                    //     RunLoop.add(_:forMode:) for multi-mode
-                    //     registration, NOT a runnable mode.  Passing
-                    //     it to `run(mode:)` ran in effectively-no
-                    //     mode: DispatchQueue.main blocks (including
-                    //     the panel's showPanel) didn't fire until the
-                    //     spin loop exited at completion time.
-                    let half = Date(timeIntervalSinceNow: 0.025)
-                    RunLoop.current.run(mode: .default, before: half)
-                    let full = Date(timeIntervalSinceNow: 0.025)
-                    RunLoop.current.run(mode: .eventTracking, before: full)
+                    // Why `RunLoop.run(mode:)` alone isn't enough:
+                    // RunLoop.run processes input sources (Mach ports,
+                    // timers, dispatch_main_q), but the NSEvent queue
+                    // is a SEPARATE Cocoa-level queue.  NSApplication.run
+                    // is what normally pumps it via nextEvent / sendEvent
+                    // on every iteration.  Skipping that step left mouse
+                    // events stuck in the queue — the Cancel button
+                    // click arrived but never reached `cancelButtonClicked`,
+                    // appearing to the user as a permanent beachball.
+                    //
+                    // `inMode: .default` matches the mode NSApplication.run
+                    // uses by default — covers mouse, key, and dispatch
+                    // events alike on a non-modal app.
+                    let deadline = Date(timeIntervalSinceNow: 0.05)
+                    while Date() < deadline {
+                        guard
+                            let event = NSApp.nextEvent(
+                                matching: .any,
+                                until: deadline,
+                                inMode: .default,
+                                dequeue: true
+                            )
+                        else {
+                            break
+                        }
+                        NSApp.sendEvent(event)
+                    }
                 } else {
                     Thread.sleep(forTimeInterval: 0.05)
                 }
