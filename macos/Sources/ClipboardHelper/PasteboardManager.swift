@@ -1079,17 +1079,32 @@ extension PasteboardManager: NSPasteboardItemDataProvider {
                 } else if !isStillCurrent() {
                     superseded = true
                 } else if Thread.isMainThread {
-                    // `.common` (not `.default`) — macOS dispatches mouse /
-                    // button-click events in `.eventTracking` mode, which
-                    // `.default` does NOT include.  Spinning in `.default`
-                    // left the user's Cancel click queued forever (beach-
-                    // ball) until the spin loop exited on its own timeout.
-                    // `.common` is the meta-mode that automatically covers
-                    // any mode registered via NSRunLoop's commonModes —
-                    // includes `.default` AND `.eventTracking` AND modal
-                    // panel modes — so the Cancel button reaches its
-                    // target/action during this 50 ms slice.
-                    RunLoop.current.run(mode: .common, before: Date(timeIntervalSinceNow: 0.05))
+                    // Alternate `.default` ↔ `.eventTracking` per 50 ms
+                    // slice, each 25 ms.  `.default` covers
+                    // DispatchQueue.main async blocks (e.g. our own
+                    // `onTransferStart` dispatch that creates / shows
+                    // the progress panel), timers, port-based input
+                    // sources.  `.eventTracking` covers mouse events
+                    // (the user clicking Cancel on the panel).  We
+                    // need BOTH to fire during the spin so the panel
+                    // appears DURING the download (not after) and
+                    // Cancel clicks reach their target.
+                    //
+                    // Previous attempts:
+                    //   * `.default` only → Cancel click queued forever
+                    //     (beach-ball) because mouse events live in
+                    //     `.eventTracking`.
+                    //   * `.common` → `.common` is a meta-mode used with
+                    //     RunLoop.add(_:forMode:) for multi-mode
+                    //     registration, NOT a runnable mode.  Passing
+                    //     it to `run(mode:)` ran in effectively-no
+                    //     mode: DispatchQueue.main blocks (including
+                    //     the panel's showPanel) didn't fire until the
+                    //     spin loop exited at completion time.
+                    let half = Date(timeIntervalSinceNow: 0.025)
+                    RunLoop.current.run(mode: .default, before: half)
+                    let full = Date(timeIntervalSinceNow: 0.025)
+                    RunLoop.current.run(mode: .eventTracking, before: full)
                 } else {
                     Thread.sleep(forTimeInterval: 0.05)
                 }
