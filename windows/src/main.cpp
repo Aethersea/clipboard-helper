@@ -13,6 +13,7 @@
 #include <shellapi.h>
 
 #include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -108,6 +109,38 @@ std::wstring ParsePipeNameOverride(int argc, wchar_t** argv) {
     return {};
 }
 
+// Returns the inherited parent-process handle parsed from --parent-handle=,
+// or nullptr when absent.
+//
+// The parent duplicates a SYNCHRONIZE-capable, *inheritable* handle to itself
+// and passes the numeric value here; we wait on it directly. This is the only
+// reliable parent-death signal when the parent runs as NT AUTHORITY\SYSTEM and
+// the helper runs as a user-token process in another session: OpenProcess on
+// the SYSTEM parent is then denied (ERROR_ACCESS_DENIED), an OpenProcess-based
+// watchdog stays permanently disabled, and the helper orphans — it keeps the
+// FILE_FLAG_FIRST_PIPE_INSTANCE pipe so every future helper fails
+// CreateNamedPipeW with ACCESS_DENIED forever. An inherited handle sidesteps
+// the parent's DACL entirely (the access was granted by the parent, which has
+// full rights to itself, at duplication time), so the wait works regardless of
+// our token or session.
+HANDLE ParseParentHandle(int argc, wchar_t** argv) {
+    constexpr std::wstring_view kFlag = L"--parent-handle=";
+    for (int i = 1; i < argc; ++i) {
+        std::wstring_view arg(argv[i]);
+        if (arg.rfind(kFlag, 0) == 0) {
+            try {
+                // Parse as 64-bit so a full pointer-width handle round-trips.
+                const unsigned long long v =
+                    std::stoull(std::wstring(arg.substr(kFlag.size())));
+                return reinterpret_cast<HANDLE>(static_cast<std::uintptr_t>(v));
+            } catch (...) {
+                return nullptr;
+            }
+        }
+    }
+    return nullptr;
+}
+
 // Watchdog state shared between wmain and the watchdog thread. The cancel
 // event lets wmain unblock the thread cleanly so it can be joined.
 struct Watchdog {
@@ -118,7 +151,7 @@ struct Watchdog {
 };
 
 void RunParentWatchdog(Watchdog* w) {
-    if (w->parent_pid == 0 || w->parent_handle == nullptr) {
+    if (w->parent_handle == nullptr) {
         return;
     }
     char buf[64];
@@ -190,8 +223,13 @@ int wmain(int argc, wchar_t** argv) {
     wd.cancel_event  = ::CreateEventW(nullptr, /*manualReset=*/TRUE, /*initial=*/FALSE, nullptr);
     wd.server        = &server;
 
-    if (wd.parent_pid == 0) {
-        LH_LOG_WARN("No --parent-pid provided; watchdog disabled");
+    // Prefer an inherited handle to the parent (works across the SYSTEM→user
+    // session boundary); fall back to OpenProcess by PID for same-token
+    // launches where we can open the parent ourselves.
+    if (HANDLE inherited = ParseParentHandle(argc, argv); inherited != nullptr) {
+        wd.parent_handle = inherited;
+    } else if (wd.parent_pid == 0) {
+        LH_LOG_WARN("No --parent-pid/--parent-handle provided; watchdog disabled");
     } else {
         wd.parent_handle = ::OpenProcess(SYNCHRONIZE, FALSE, wd.parent_pid);
         if (wd.parent_handle == nullptr) {
