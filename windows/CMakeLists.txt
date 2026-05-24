@@ -18,6 +18,20 @@ if(NOT MSVC)
     message(FATAL_ERROR "leviathan-clipboard-helper requires clang-cl or MSVC (got compiler: ${CMAKE_CXX_COMPILER_ID})")
 endif()
 
+# Statically link the MSVC C++ / UCRT runtime (/MT, /MTd for Debug).
+#
+# The helper otherwise imports only Windows system DLLs (ole32, user32,
+# windowscodecs, ...), so a static CRT makes the exe fully self-contained:
+# leviathan ships it next to leviathan.exe and it runs on any Windows 10/11
+# host WITHOUT requiring the "Visual C++ 2015-2022 Redistributable"
+# (msvcp140.dll / vcruntime140*.dll / api-ms-win-crt-*). The +~150 KB of
+# inlined CRT is negligible against avoiding that deployment dependency.
+#
+# Requires CMP0091=NEW (default at cmake_minimum_required 3.20) so this knob
+# drives the runtime selection instead of the legacy /MD flags. clang-cl
+# honours MSVC_RUNTIME_LIBRARY and emits the matching /MT[d].
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
 # ─── Helper executable ─────────────────────────────────────────────────────
 #
 # We deliberately do NOT depend on libprotobuf. The HelperMessage schema has a
