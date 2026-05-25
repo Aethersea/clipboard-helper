@@ -39,19 +39,34 @@ jobs:
             if ((a[1]+0) < 5 || ((a[1]+0) == 5 && (a[2]+0) < 9)) exit 1
           }' || { echo "Swift $ver is older than the required 5.9" >&2; exit 1; }
 
-      # Regenerate .pb.swift sources against the SwiftProtobuf plugin
-      # version that ships with the current Homebrew bottle.  Without
-      # this the committed generated files drift (the
-      # `init(dictionaryLiteral:)` deprecation noise we shipped against
-      # an older plugin) and the build emits a wall of warnings the
-      # next dev has to mentally filter past.  Brew is idempotent — if
-      # protoc + protoc-gen-swift are already on the runner image,
-      # `brew install` is a near-instant no-op; otherwise it fetches
-      # the bottle (≈ a few seconds).  Running it BEFORE build means
-      # the build never compiles stale generated code, regardless of
-      # what's checked in.
-      - name: Install swift-protobuf (protoc + protoc-gen-swift)
-        run: brew install swift-protobuf
+      # protoc (the compiler front-end) is version-agnostic for our purposes —
+      # only the Swift code generator plugin's output matters — so install just
+      # the compiler from Homebrew. (The `protobuf` formula brings protoc; we
+      # deliberately do NOT `brew install swift-protobuf`, which would also pull
+      # the latest protoc-gen-swift bottle — see the next step for why.)
+      - name: Install protoc
+        run: brew install protobuf
+
+      # Build protoc-gen-swift from a PINNED swift-protobuf tag instead of the
+      # rolling Homebrew bottle. As of 1.38.0, protoc-gen-swift emits
+      # type-/extension-level `nonisolated` modifiers (SE-0449), which the
+      # macos-14 runner's stock Swift 5.10 rejects ("'nonisolated' modifier
+      # cannot be applied to this declaration"). Pinning the generator to
+      # 1.34.1 — the same version SwiftPM resolves for the runtime on Swift
+      # 5.10 (see macos/Package.swift) — keeps generated code, the linked
+      # runtime, and the compiler in lockstep and makes the build reproducible
+      # regardless of Homebrew drift. The 1.34.1 tag ships a
+      # Package@swift-5.10.swift manifest, so it builds on the stock toolchain.
+      # If you bump the pin here, bump macos/Package.swift to match.
+      - name: Build pinned protoc-gen-swift (1.34.1)
+        run: |
+          tag=1.34.1
+          git clone --depth 1 --branch "$tag" \
+            https://github.com/apple/swift-protobuf.git "$RUNNER_TEMP/swift-protobuf"
+          swift build -c release \
+            --package-path "$RUNNER_TEMP/swift-protobuf" \
+            --product protoc-gen-swift
+          echo "$RUNNER_TEMP/swift-protobuf/.build/release" >> "$GITHUB_PATH"
 
       - name: Regenerate Swift protobuf sources
         run: make generate-proto
