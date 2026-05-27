@@ -16,6 +16,7 @@ add_executable(clipboard_helper_tests
     socket_server_test.cpp
     parent_watchdog_test.cpp
     uri_list_format_test.cpp
+    webp_decode_test.cpp
     ${CMAKE_SOURCE_DIR}/src/proto_wire.cpp
     ${CMAKE_SOURCE_DIR}/src/backend_detector.cpp
     ${CMAKE_SOURCE_DIR}/src/log.cpp
@@ -23,6 +24,7 @@ add_executable(clipboard_helper_tests
     ${CMAKE_SOURCE_DIR}/src/socket_server.cpp
     ${CMAKE_SOURCE_DIR}/src/parent_watchdog.cpp
     ${CMAKE_SOURCE_DIR}/src/uri_list_format.cpp
+    ${CMAKE_SOURCE_DIR}/src/webp_decode.cpp
 )
 
 target_include_directories(clipboard_helper_tests PRIVATE
@@ -41,6 +43,7 @@ target_compile_options(clipboard_helper_tests PRIVATE
 )
 
 target_link_libraries(clipboard_helper_tests PRIVATE
+    PkgConfig::LIBWEBP
     pthread
 )
 

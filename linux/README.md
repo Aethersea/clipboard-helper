@@ -6,7 +6,7 @@ Speaks the same length-prefixed `HelperMessage` protobuf wire protocol; runtime-
 
 > **Status — P3 complete (TEXT + IMAGE + FILES)**: IPC layer, dispatch, parent watchdog, backend detector all in. **Wayland (`wlr-data-control` + `ext-data-control`) and X11 backends handle all three content types in delayed rendering.**
 
-The IMAGE path decodes the lossless WebP shen sends on the wire via QImage (qt6-image-formats-plugins) and re-encodes per paste consumer's MIME (PNG / BMP / Qt-native QImage).
+The IMAGE path decodes the lossless WebP shen sends on the wire via **libwebp** directly (see `src/webp_decode.*`) and re-encodes per paste consumer's MIME (PNG / BMP / Qt-native QImage) using qtbase's built-in image writers. Decoding via libwebp avoids depending on the optional Qt WebP image-format plugin (`qt6-image-formats-plugins` / `qt6-qtimageformats`), which is trivially absent on a minimal install and silently breaks image paste.
 
 The FILES path mirrors the macOS helper's flow: shen downloads files locally and returns newline-joined absolute paths via PROVIDE_DATA; the helper formats those into `file://` URIs joined by CRLF per RFC 2483 and writes them to the paste consumer's fd as `text/uri-list`.
 
@@ -34,7 +34,7 @@ clipboard-helper
 | CMake | 3.21 | `cmake` | `cmake` |
 | clang or gcc | clang 16+ / gcc 12+ | `clang` | `clang` |
 | Qt 6 (Core + Gui) | 6.4 (Debian 13 / Ubuntu 24.04 stock) | `qt6-base-dev` | `qt6-qtbase-devel` |
-| Qt 6 image format plugins (for WebP decode) | 6.4 | `qt6-image-formats-plugins` | `qt6-qtimageformats` |
+| libwebp (WebP image decode) | any | `libwebp-dev` | `libwebp-devel` |
 
 ### Runtime portability
 

@@ -54,6 +54,15 @@ find_package(Qt6 6.4 REQUIRED COMPONENTS Core Gui)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(WAYLAND_CLIENT REQUIRED IMPORTED_TARGET wayland-client)
 
+# ─── libwebp (WebP image decode) ───────────────────────────────────────────
+#
+# The clipboard IMAGE wire format is lossless WebP. We decode it via libwebp
+# directly (see src/webp_decode.*) rather than the optional Qt image-format
+# plugin (qt6-image-formats-plugins / qt6-qtimageformats), which is trivially
+# missing on a minimal install and silently breaks image paste. PNG/BMP
+# re-encoding still uses qtbase's built-in image writers (no plugin needed).
+pkg_check_modules(LIBWEBP REQUIRED IMPORTED_TARGET libwebp)
+
 find_program(WAYLAND_SCANNER_EXECUTABLE
     NAMES wayland-scanner
     DOC "wayland-scanner code generator (from libwayland-dev / wayland-devel)")
@@ -124,6 +133,7 @@ add_executable(clipboard-helper
     src/clipboard_manager_x11.cpp
     src/wayland_display.cpp
     src/uri_list_format.cpp
+    src/webp_decode.cpp
     "${WLR_PRIVATE_CODE}"
     "${EXT_PRIVATE_CODE}"
 )
@@ -155,6 +165,7 @@ target_link_libraries(clipboard-helper PRIVATE
     Qt6::Core
     Qt6::Gui
     PkgConfig::WAYLAND_CLIENT
+    PkgConfig::LIBWEBP
     pthread
 )
 

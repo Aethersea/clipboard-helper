@@ -20,7 +20,6 @@
 #include <QByteArray>
 #include <QCoreApplication>
 #include <QGuiApplication>
-#include <QImageReader>
 #include <QList>
 #include <QMetaObject>
 #include <QSocketNotifier>
@@ -235,29 +234,14 @@ int main(int argc, char** argv) {
     }
     QGuiApplication app(argc, argv);
 
-    // Sanity-check that QImage can decode WebP, which is what shen
-    // sends on the wire for IMAGE clipboards. The qt6-image-formats-
-    // plugins / qt6-qtimageformats package is separate from qt6-base
-    // and is easy to miss in a minimal install — without it,
-    // IMAGE pastes silently produce empty results (loadFromData
-    // returns false, the backends log a per-paste warning, and the
-    // user sees nothing). One critical log line at startup is much
-    // easier to spot in field reports.
-    {
-        const auto fmts = QImageReader::supportedImageFormats();
-        bool have_webp = false;
-        for (const auto& f : fmts) {
-            if (f.toLower() == QByteArray("webp")) { have_webp = true; break; }
-        }
-        if (have_webp) {
-            LH_LOG_INFO("QImage WebP decoder available (image clipboards will work)");
-        } else {
-            LH_LOG_ERROR(
-                "QImage cannot decode WebP — install qt6-image-formats-plugins "
-                "(Debian/Ubuntu) or qt6-qtimageformats (Fedora). IMAGE clipboards "
-                "from shen will paste as empty until this is fixed.");
-        }
-    }
+    // WebP decoding for IMAGE clipboards (the on-wire format shen sends)
+    // is handled by libwebp directly — see webp_decode.*. libwebp is a hard
+    // link-time dependency, so unlike the old optional Qt image-format
+    // plugin (qt6-image-formats-plugins / qt6-qtimageformats) there is no
+    // silent "missing decoder" state to guard against: if libwebp.so were
+    // absent the dynamic linker would fail to start the process outright.
+    LH_LOG_INFO("WebP image decoding provided by libwebp "
+                "(no Qt image-format plugin required)");
 
     // ── Self-pipe for signal-driven shutdown ──
     int sig_pipe[2];

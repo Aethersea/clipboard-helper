@@ -35,7 +35,7 @@ pwsh -File windows/build.ps1 -Config Release
 ```
 
 ### Linux
-See [linux/README.md](linux/README.md). Requires Qt 6.5+ (`apt install qt6-base-dev` / `dnf install qt6-qtbase-devel`).
+See [linux/README.md](linux/README.md). Requires Qt 6.4+ (`apt install qt6-base-dev` / `dnf install qt6-qtbase-devel`) and libwebp (`apt install libwebp-dev` / `dnf install libwebp-devel`) — WebP clipboard images are decoded via libwebp directly, not the optional Qt image-format plugin.
 ```bash
 cd linux && ./build.sh                  # Release build + tests
 cd linux && ./build.sh debug            # Debug build + tests

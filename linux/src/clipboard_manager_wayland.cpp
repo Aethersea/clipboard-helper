@@ -75,6 +75,7 @@
 #include "log.h"
 #include "uri_list_format.h"
 #include "wayland_display.h"
+#include "webp_decode.h"
 
 namespace leviathan::clipboard_helper {
 
@@ -139,13 +140,16 @@ std::vector<std::uint8_t> ConvertImageForMime(
         const char* mime) {
     if (webp_bytes.empty() || mime == nullptr) return {};
 
-    QImage img;
-    if (!img.loadFromData(webp_bytes.data(),
-                          static_cast<int>(webp_bytes.size()))) {
-        LH_LOG_WARN("[wlr/image] QImage::loadFromData failed; "
-                    "is qt6-image-formats-plugins installed?");
+    const auto dec = webp_decode::DecodeWebP(webp_bytes.data(), webp_bytes.size());
+    if (!dec.ok()) {
+        LH_LOG_WARN("[wlr/image] WebP decode failed (libwebp); "
+                    "dropping image clipboard");
         return {};
     }
+    // .copy() so `img` owns its pixels — `dec` is freed at function exit.
+    const QImage img = QImage(dec.rgba.data(), dec.width, dec.height,
+                              QImage::Format_RGBA8888)
+                           .copy();
 
     QByteArray out;
     QBuffer buf(&out);
