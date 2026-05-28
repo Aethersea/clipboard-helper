@@ -2,10 +2,10 @@
 #
 # Like the Windows helper's tests, we rebuild the small set of
 # production sources we want to exercise as part of the test
-# executable rather than depending on an OBJECT library. That keeps
-# the test binary free of any Qt6 transitive dependencies (which
-# the production main() pulls in via QCoreApplication) — every test
-# here runs in pure POSIX with no display required.
+# executable rather than depending on an OBJECT library. Most tests
+# stay free of Qt6 transitive deps (pure POSIX, no display required);
+# the echo_suppressor tests link Qt6::Core only — QMimeData + QPointer
+# are pure QtCore state and need no QGuiApplication / display.
 
 add_executable(clipboard_helper_tests
     main.cpp
@@ -18,6 +18,7 @@ add_executable(clipboard_helper_tests
     parent_watchdog_test.cpp
     uri_list_format_test.cpp
     webp_decode_test.cpp
+    echo_suppressor_test.cpp
     ${CMAKE_SOURCE_DIR}/src/proto_wire.cpp
     ${CMAKE_SOURCE_DIR}/src/backend_detector.cpp
     ${CMAKE_SOURCE_DIR}/src/log.cpp
@@ -27,6 +28,7 @@ add_executable(clipboard_helper_tests
     ${CMAKE_SOURCE_DIR}/src/parent_watchdog.cpp
     ${CMAKE_SOURCE_DIR}/src/uri_list_format.cpp
     ${CMAKE_SOURCE_DIR}/src/webp_decode.cpp
+    ${CMAKE_SOURCE_DIR}/src/echo_suppressor.cpp
 )
 
 target_include_directories(clipboard_helper_tests PRIVATE
@@ -46,6 +48,7 @@ target_compile_options(clipboard_helper_tests PRIVATE
 
 target_link_libraries(clipboard_helper_tests PRIVATE
     PkgConfig::LIBWEBP
+    Qt6::Core
     pthread
 )
 

@@ -135,6 +135,7 @@ add_executable(clipboard-helper
     src/wayland_probe.cpp
     src/uri_list_format.cpp
     src/webp_decode.cpp
+    src/echo_suppressor.cpp
     "${WLR_PRIVATE_CODE}"
     "${EXT_PRIVATE_CODE}"
 )

@@ -47,6 +47,7 @@
 #include <utility>
 #include <vector>
 
+#include "echo_suppressor.h"
 #include "log.h"
 #include "uri_list_format.h"
 #include "webp_decode.h"
@@ -321,22 +322,28 @@ public:
         m << "[x11] SetClipboardText(len=" << utf8.size() << ")";
         LH_LOG_INFO(m.str());
 
+        // Cache the text in shared state (guarded by state_->mu, safe
+        // from this wire-handler thread).
+        {
+            std::lock_guard<std::mutex> g(state_->mu);
+            state_->cached_clipboard_text = utf8;
+        }
+
         // Eager set: bypass DelayedClipboardMimeData and hand Qt a plain
         // QMimeData with the text already in it. Faster path; the
-        // delayed flow is reserved for ANNOUNCE_DELAYED.
+        // delayed flow is reserved for ANNOUNCE_DELAYED. echo_ is
+        // single-threaded (main-thread only), so RecordEagerSetText is
+        // called from inside the lambda — after setMimeData but still
+        // on the same thread as OnClipboardChanged that will later read it.
         const QString text = QString::fromUtf8(utf8.c_str(), static_cast<qsizetype>(utf8.size()));
-        InvokeOnMain([text] {
+        InvokeOnMain([this, text, utf8] {
             auto* cb = QGuiApplication::clipboard();
             if (cb == nullptr) return;
             auto* mime = new QMimeData;
             mime->setText(text);
             cb->setMimeData(mime, QClipboard::Clipboard);
-        });
-        // Record what we just set so OnClipboardChanged's content-based
-        // suppression can recognize the echo. A bare latch would have a
-        // race where an external change between our setMimeData and the
-        // dataChanged signal silently disappears.
-        SetOwnedClipboardText(utf8);
+            echo_.RecordEagerSetText(utf8);
+        }, /*context=*/this);
     }
 
     void SetClipboardImage(const std::vector<std::uint8_t>& webp_bytes) override {
@@ -356,7 +363,12 @@ public:
                                   QImage::Format_RGBA8888)
                                .copy();
 
-        InvokeOnMain([img] {
+        // Capture the QMimeData pointer inside the lambda so we can record
+        // it with echo_ AFTER setMimeData. Pointer-identity echo suppression
+        // is robust against external copies arriving before our own echo
+        // (see EchoSuppressor docs) — replaces the previous one-shot flag
+        // that consumed unconditionally on the next dataChanged.
+        InvokeOnMain([this, img] {
             auto* cb = QGuiApplication::clipboard();
             if (cb == nullptr) return;
             // setImageData implicitly fills application/x-qt-image,
@@ -365,12 +377,8 @@ public:
             auto* mime = new QMimeData;
             mime->setImageData(img);
             cb->setMimeData(mime, QClipboard::Clipboard);
-        });
-
-        // No content-based echo suppression for images (would require
-        // comparing decoded pixels — expensive + lossy round-trip
-        // checks). Use the one-shot expectation flag instead.
-        expecting_self_echo_.store(true, std::memory_order_release);
+            echo_.RecordAnnouncedMime(mime);
+        }, /*context=*/this);
     }
 
     void AnnounceDelayedText(const std::string& content_hash) override {
@@ -402,19 +410,19 @@ public:
         state_->cv.notify_all();  // wake any old retrieveData waiters
 
         auto state = state_;
-        InvokeOnMain([state, content_hash, kind] {
+        InvokeOnMain([this, state, content_hash, kind] {
             auto* cb = QGuiApplication::clipboard();
             if (cb == nullptr) return;
             // Each set_selection-equivalent requires a fresh QMimeData;
             // Qt takes ownership and deletes the previous one.
             auto* mime = new DelayedClipboardMimeData(state, content_hash, kind);
             cb->setMimeData(mime, QClipboard::Clipboard);
-        });
-        // For delayed slots we don't know the content yet; the echo
-        // suppression on AnnounceDelayed relies on a one-shot expectation
-        // recorded here. OnClipboardChanged consumes it on the next event
-        // regardless of content.
-        expecting_self_echo_.store(true, std::memory_order_release);
+            // Record pointer-identity for echo suppression. The QPointer
+            // auto-nulls when Qt later destroys this mime (i.e., another
+            // owner replaces it), so the expectation correctly expires
+            // without us needing a notification.
+            echo_.RecordAnnouncedMime(mime);
+        }, /*context=*/this);
     }
 
     void ProvideData(const std::string&            content_hash,
@@ -457,27 +465,24 @@ private slots:
         auto* cb = QGuiApplication::clipboard();
         if (cb == nullptr) return;
         const QMimeData* mime = cb->mimeData(QClipboard::Clipboard);
-        if (mime == nullptr || !mime->hasText()) return;
+        if (mime == nullptr) return;
+
+        // CHEAP pointer-identity check first — skips the expensive text()
+        // call for our own AnnounceDelayed echo. If we triggered text()
+        // on our own DelayedClipboardMimeData, retrieveData would fire an
+        // unwanted DATA_REQUEST and block the main thread for up to 10s
+        // waiting on ProvideData.
+        if (echo_.IsAnnouncedMime(mime)) return;
+
+        if (!mime->hasText()) return;
         const QString text = mime->text();
         const std::string utf8 = text.toUtf8().toStdString();
 
-        // Echo suppression:
-        //  1. If this matches the text WE just set via SetClipboardText,
-        //     it's our own echo — drop it. Content-based, so a bare
-        //     race between setMimeData and dataChanged can't accidentally
-        //     swallow a real external change with different content.
-        //  2. AnnounceDelayedText flips a separate one-shot flag (no
-        //     content available there); we honour it once then clear.
-        {
-            std::lock_guard<std::mutex> g(echo_mu_);
-            if (last_set_text_ && *last_set_text_ == utf8) {
-                last_set_text_.reset();
-                return;
-            }
-        }
-        if (expecting_self_echo_.exchange(false, std::memory_order_acq_rel)) {
-            return;
-        }
+        // One-shot content match for SetClipboardText's own echo. A real
+        // external copy with a different string between our setMimeData
+        // and its dataChanged would NOT consume this expectation — see
+        // EchoSuppressor regression tests.
+        if (echo_.ConsumeEagerSetTextEcho(utf8)) return;
 
         std::function<void(const std::string&)> cb_fn;
         {
@@ -489,42 +494,37 @@ private slots:
     }
 
 private:
+    // Posts `fn` onto the Qt main thread. If `context` is non-null, the
+    // QueuedConnection is anchored on that QObject — Qt auto-cancels any
+    // pending invocation when the context is destroyed, preventing
+    // use-after-free if the manager is torn down while a lambda capturing
+    // `this` is still queued. Pass `this` for any lambda that touches
+    // manager-owned state (echo_, etc.); pass nullptr (default) for
+    // self-contained lambdas that capture only by value / shared_ptr.
     template <typename F>
-    void InvokeOnMain(F&& fn) {
+    void InvokeOnMain(F&& fn, QObject* context = nullptr) {
         if (QCoreApplication::instance() == nullptr) return;
         if (QThread::currentThread() == QCoreApplication::instance()->thread()) {
             fn();
-        } else {
-            QMetaObject::invokeMethod(
-                QCoreApplication::instance(),
-                std::forward<F>(fn),
-                Qt::QueuedConnection);
+            return;
         }
-    }
-
-    void SetOwnedClipboardText(const std::string& utf8) {
-        {
-            std::lock_guard<std::mutex> g(state_->mu);
-            state_->cached_clipboard_text = utf8;
-        }
-        {
-            std::lock_guard<std::mutex> g(echo_mu_);
-            last_set_text_ = utf8;
-        }
+        QObject* target = (context != nullptr)
+                              ? context
+                              : QCoreApplication::instance();
+        QMetaObject::invokeMethod(
+            target,
+            std::forward<F>(fn),
+            Qt::QueuedConnection);
     }
 
     std::shared_ptr<DelayedState> state_;
 
-    // Echo-suppression state. Two patterns:
-    //   - last_set_text_: the text we last handed to QClipboard via
-    //     SetClipboardText. OnClipboardChanged compares incoming text
-    //     to this; equal → echo, drop. Cleared on first match.
-    //   - expecting_self_echo_: one-shot flag set by AnnounceDelayedText
-    //     (no text content available at announce time); consumed by the
-    //     next OnClipboardChanged unconditionally.
-    std::mutex                    echo_mu_;
-    std::optional<std::string>    last_set_text_;
-    std::atomic<bool>             expecting_self_echo_{false};
+    // Echo-suppression state. Both expectation flavours live in
+    // EchoSuppressor (see src/echo_suppressor.h for the full state
+    // machine + unit tests). Driven only from the Qt main thread —
+    // every recording call sits inside an InvokeOnMain lambda, and
+    // OnClipboardChanged (a Qt slot) is invoked on main by construction.
+    EchoSuppressor                echo_;
 };
 
 std::unique_ptr<ClipboardManager> MakeX11Manager() {
