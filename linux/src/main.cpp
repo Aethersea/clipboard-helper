@@ -42,6 +42,7 @@
 #include "log.h"
 #include "parent_watchdog.h"
 #include "socket_server.h"
+#include "wayland_probe.h"
 
 namespace ch = leviathan::clipboard_helper;
 
@@ -219,6 +220,39 @@ int main(int argc, char** argv) {
     LH_LOG_INFO(std::string("Backend: ") + backend.reason);
     if (backend.kind == ch::BackendKind::None) {
         return 71;  // EX_OSERR — no display available
+    }
+
+    // Wayland → XWayland fallback when the compositor does not implement
+    // ext_data_control_v1 / zwlr_data_control_unstable_v1. Without this,
+    // MakeWaylandManager() returns null and main below drops to the stub
+    // manager — which silently does no clipboard monitoring and no OS
+    // clipboard writes, breaking both directions with no log to point at.
+    // GNOME is already handled by the backend detector; this catches
+    // everything else (Weston default, Mir, COSMIC pre-data-control, ...).
+    //
+    // The probe MUST run before QGuiApplication: Qt's QPA platform plugin
+    // is locked at app construction, so we can only switch from minimal
+    // to xcb up here. ProbeWaylandDataControl() uses raw libwayland and
+    // does not touch Qt.
+    if (backend.kind == ch::BackendKind::Wayland) {
+        if (!ch::ProbeWaylandDataControl()) {
+            const char* display_env = std::getenv("DISPLAY");
+            const bool have_display = display_env != nullptr && *display_env != '\0';
+            if (have_display) {
+                LH_LOG_INFO(
+                    "Wayland compositor advertises neither ext_data_control_v1 "
+                    "nor zwlr_data_control_unstable_v1; DISPLAY is set, "
+                    "falling back to XWayland (X11 backend)");
+                backend.kind = ch::BackendKind::ForceXWayland;
+                ::setenv("QT_QPA_PLATFORM", "xcb", /*overwrite=*/1);
+            } else {
+                LH_LOG_ERROR(
+                    "Wayland compositor advertises neither ext_data_control_v1 "
+                    "nor zwlr_data_control_unstable_v1, AND DISPLAY is unset so "
+                    "XWayland is unavailable. Clipboard sync will fall back to "
+                    "the stub (no monitoring, no OS clipboard writes).");
+            }
+        }
     }
 
     // Both backends now use QGuiApplication so QImage (in QtGui) can
