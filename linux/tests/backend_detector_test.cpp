@@ -13,6 +13,7 @@ using leviathan::clipboard_helper::BackendDecision;
 using leviathan::clipboard_helper::BackendKind;
 using leviathan::clipboard_helper::DetectBackend;
 using leviathan::clipboard_helper::GetEnvFn;
+using leviathan::clipboard_helper::ShouldFallbackToXWayland;
 
 namespace {
 
@@ -166,4 +167,31 @@ TEST(BackendDetector, EmptyValuesAreIgnored) {
     });
     auto d = DetectBackend(env);
     EXPECT_EQ(static_cast<int>(d.kind), static_cast<int>(BackendKind::None));
+}
+
+// ─── ShouldFallbackToXWayland — full truth table ────────────────────────────
+
+TEST(ShouldFallbackToXWayland, FallsBackWhenNoDataControlAndDisplayAvailable) {
+    // The canonical "rescuable" case: non-wlroots Wayland (Weston, COSMIC,
+    // Mir, ...) lacking data-control, but XWayland is running so we can
+    // route through Qt's xcb QClipboard.
+    EXPECT_TRUE(ShouldFallbackToXWayland(/*has_data_control=*/false,
+                                         /*have_display=*/true));
+}
+
+TEST(ShouldFallbackToXWayland, KeepsWaylandWhenDataControlAvailable) {
+    // wlroots / KDE Plasma 6.5+ etc. — Wayland backend will work; do not
+    // pre-empt it with XWayland even if DISPLAY happens to also be set.
+    EXPECT_FALSE(ShouldFallbackToXWayland(/*has_data_control=*/true,
+                                          /*have_display=*/true));
+    EXPECT_FALSE(ShouldFallbackToXWayland(/*has_data_control=*/true,
+                                          /*have_display=*/false));
+}
+
+TEST(ShouldFallbackToXWayland, KeepsWaylandWhenNoDisplay) {
+    // Pure-Wayland session with no XWayland — fallback is impossible.
+    // Caller logs the error and lets the Wayland branch drop to stub
+    // (nothing else to do).
+    EXPECT_FALSE(ShouldFallbackToXWayland(/*has_data_control=*/false,
+                                          /*have_display=*/false));
 }

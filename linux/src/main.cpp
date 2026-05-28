@@ -235,23 +235,22 @@ int main(int argc, char** argv) {
     // to xcb up here. ProbeWaylandDataControl() uses raw libwayland and
     // does not touch Qt.
     if (backend.kind == ch::BackendKind::Wayland) {
-        if (!ch::ProbeWaylandDataControl()) {
-            const char* display_env = std::getenv("DISPLAY");
-            const bool have_display = display_env != nullptr && *display_env != '\0';
-            if (have_display) {
-                LH_LOG_INFO(
-                    "Wayland compositor advertises neither ext_data_control_v1 "
-                    "nor zwlr_data_control_unstable_v1; DISPLAY is set, "
-                    "falling back to XWayland (X11 backend)");
-                backend.kind = ch::BackendKind::ForceXWayland;
-                ::setenv("QT_QPA_PLATFORM", "xcb", /*overwrite=*/1);
-            } else {
-                LH_LOG_ERROR(
-                    "Wayland compositor advertises neither ext_data_control_v1 "
-                    "nor zwlr_data_control_unstable_v1, AND DISPLAY is unset so "
-                    "XWayland is unavailable. Clipboard sync will fall back to "
-                    "the stub (no monitoring, no OS clipboard writes).");
-            }
+        const bool has_data_control = ch::ProbeWaylandDataControl();
+        const char* display_env = std::getenv("DISPLAY");
+        const bool have_display = display_env != nullptr && *display_env != '\0';
+        if (ch::ShouldFallbackToXWayland(has_data_control, have_display)) {
+            LH_LOG_INFO(
+                "Wayland compositor advertises neither ext_data_control_v1 "
+                "nor zwlr_data_control_unstable_v1; DISPLAY is set, "
+                "falling back to XWayland (X11 backend)");
+            backend.kind = ch::BackendKind::ForceXWayland;
+            ::setenv("QT_QPA_PLATFORM", "xcb", /*overwrite=*/1);
+        } else if (!has_data_control) {
+            LH_LOG_ERROR(
+                "Wayland compositor advertises neither ext_data_control_v1 "
+                "nor zwlr_data_control_unstable_v1, AND DISPLAY is unset so "
+                "XWayland is unavailable. Clipboard sync will fall back to "
+                "the stub (no monitoring, no OS clipboard writes).");
         }
     }
 

@@ -104,6 +104,10 @@ BackendDecision DetectBackend(const GetEnvFn& getenv) {
             {}, {}};
 }
 
+bool ShouldFallbackToXWayland(bool wayland_has_data_control, bool have_display) {
+    return !wayland_has_data_control && have_display;
+}
+
 BackendDecision DetectBackendAndApplyEnv() {
     auto decision = DetectBackend(OsGetEnv);
     if (!decision.env_override_name.empty()) {
