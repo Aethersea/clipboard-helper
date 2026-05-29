@@ -134,8 +134,27 @@ jobs:
           path: windows/clipboard-helper-windows.exe
 
   build-linux:
-    name: Linux (x64, Qt 6 + clang)
-    runs-on: ubuntu-24.04
+    name: Linux (${{ matrix.arch }}, Qt 6 + clang)
+    # GitHub-hosted ubuntu-24.04-arm runners are free for public repos
+    # (announced 2025-01); same Ubuntu 24.04 image as the x64 runner, so
+    # the apt-get steps below work identically on both. The matrix
+    # asset_name keeps the historical filename `clipboard-helper-linux`
+    # for x64 so older shen builds that hard-code that name keep
+    # downloading the right asset; arm64 ships under a suffixed name
+    # that newer shen download scripts pick up by process.arch.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runs_on: ubuntu-24.04
+            asset_name: clipboard-helper-linux
+            artifact_name: clipboard-helper-linux-x64
+          - arch: arm64
+            runs_on: ubuntu-24.04-arm
+            asset_name: clipboard-helper-linux-arm64
+            artifact_name: clipboard-helper-linux-arm64
+    runs-on: ${{ matrix.runs_on }}
     defaults:
       run:
         working-directory: linux
@@ -205,14 +224,14 @@ jobs:
 
       - name: Rename binary
         run: |
-          cp build/clipboard-helper clipboard-helper-linux
-          chmod +x clipboard-helper-linux
+          cp build/clipboard-helper "${{ matrix.asset_name }}"
+          chmod +x "${{ matrix.asset_name }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: clipboard-helper-linux-x64
-          path: linux/clipboard-helper-linux
+          name: ${{ matrix.artifact_name }}
+          path: linux/${{ matrix.asset_name }}
 
   release:
     needs: [build-macos, build-windows, build-linux]
@@ -231,10 +250,15 @@ jobs:
         with:
           name: clipboard-helper-windows-x64
 
-      - name: Download Linux artifact
+      - name: Download Linux x64 artifact
         uses: actions/download-artifact@v8
         with:
           name: clipboard-helper-linux-x64
+
+      - name: Download Linux arm64 artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: clipboard-helper-linux-arm64
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
@@ -243,6 +267,7 @@ jobs:
             clipboard-helper-macos
             clipboard-helper-windows.exe
             clipboard-helper-linux
+            clipboard-helper-linux-arm64
           generate_release_notes: true
 
   release-latest:
@@ -262,10 +287,15 @@ jobs:
         with:
           name: clipboard-helper-windows-x64
 
-      - name: Download Linux artifact
+      - name: Download Linux x64 artifact
         uses: actions/download-artifact@v8
         with:
           name: clipboard-helper-linux-x64
+
+      - name: Download Linux arm64 artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: clipboard-helper-linux-arm64
 
       - name: Update latest release
         uses: softprops/action-gh-release@v3
@@ -277,5 +307,6 @@ jobs:
             clipboard-helper-macos
             clipboard-helper-windows.exe
             clipboard-helper-linux
+            clipboard-helper-linux-arm64
           prerelease: true
           make_latest: false
