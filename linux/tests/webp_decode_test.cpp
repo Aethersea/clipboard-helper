@@ -31,16 +31,47 @@ std::vector<std::uint8_t> SampleRgba() {
 
 // Lossless-encode an RGBA buffer to WebP via libwebp. Returns empty on
 // failure. Mirrors what shen produces on the wire.
+//
+// Uses the advanced WebPConfig API with `exact = 1` rather than the simple
+// WebPEncodeLosslessRGBA() one-shot. The simple encoder leaves `exact` at its
+// default 0, which lets libwebp REWRITE the RGB channels of fully-transparent
+// (alpha == 0) pixels to whatever compresses best — a legal lossless transform
+// since those pixels are invisible. Our sample image deliberately carries a
+// transparent pixel with non-zero RGB (0xD0,0xE0,0xF0,0x00) to exercise the
+// alpha path, so without exact=1 the round-trip would not be byte-identical and
+// the equality assertion below would spuriously fail. exact=1 forces libwebp to
+// preserve the hidden RGB verbatim, giving a true byte-exact round trip.
 std::vector<std::uint8_t> EncodeLossless(const std::vector<std::uint8_t>& rgba,
                                          int w, int h) {
-    std::uint8_t* out = nullptr;
-    const std::size_t n =
-        WebPEncodeLosslessRGBA(rgba.data(), w, h, /*stride=*/w * 4, &out);
+    WebPConfig config;
+    if (!WebPConfigInit(&config)) return {};
+    config.lossless = 1;
+    config.exact = 1;
+    config.quality = 100.0f;  // lossless effort, not a lossy quality factor
+
+    WebPPicture pic;
+    if (!WebPPictureInit(&pic)) return {};
+    pic.use_argb = 1;  // required for the lossless encoder
+    pic.width = w;
+    pic.height = h;
+
     std::vector<std::uint8_t> encoded;
-    if (n != 0 && out != nullptr) {
-        encoded.assign(out, out + n);
+    if (!WebPPictureImportRGBA(&pic, rgba.data(), /*rgba_stride=*/w * 4)) {
+        WebPPictureFree(&pic);
+        return {};
     }
-    WebPFree(out);
+
+    WebPMemoryWriter writer;
+    WebPMemoryWriterInit(&writer);
+    pic.writer = WebPMemoryWrite;
+    pic.custom_ptr = &writer;
+
+    if (WebPEncode(&config, &pic) && writer.mem != nullptr) {
+        encoded.assign(writer.mem, writer.mem + writer.size);
+    }
+
+    WebPPictureFree(&pic);
+    WebPMemoryWriterClear(&writer);
     return encoded;
 }
 
