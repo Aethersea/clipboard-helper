@@ -127,6 +127,56 @@ add_test(NAME clipboard_helper_paste_roundtrip_test
          COMMAND clipboard_helper_paste_roundtrip_test)
 
 # ──────────────────────────────────────────────────────────────────────
+# WIC image test — PngToBgra / BgraToPng need a live COM apartment, so they
+# get their own exe (the pure-codec test exe deliberately excludes WIC /
+# windowscodecs). wic_decode_test.cpp ships its own main() that brackets
+# RunAll with CoInitializeEx / ResetWicFactoryForThread / CoUninitialize,
+# so it does NOT link the shared main.cpp.
+# ──────────────────────────────────────────────────────────────────────
+add_executable(clipboard_helper_wic_test
+    wic_decode_test.cpp
+    ${CMAKE_SOURCE_DIR}/src/wic_image.cpp
+    ${CMAKE_SOURCE_DIR}/src/log.cpp
+)
+
+target_include_directories(clipboard_helper_wic_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+target_compile_definitions(clipboard_helper_wic_test PRIVATE
+    UNICODE
+    _UNICODE
+    NOMINMAX
+    WIN32_LEAN_AND_MEAN
+    _WIN32_WINNT=0x0A00
+)
+
+target_compile_options(clipboard_helper_wic_test PRIVATE
+    /W4
+    /WX
+    /permissive-
+    /utf-8
+    /EHsc
+    $<$<CONFIG:Release>:/O2>
+    $<$<CONFIG:Debug>:/Od /Zi>
+)
+
+# ole32 — CoCreateInstance(WICImagingFactory). windowscodecs — WIC codecs.
+# uuid — CLSID_WICImagingFactory / IID_IWICImagingFactory symbols.
+target_link_libraries(clipboard_helper_wic_test PRIVATE
+    ole32 windowscodecs uuid
+)
+
+set_target_properties(clipboard_helper_wic_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+    OUTPUT_NAME clipboard_helper_wic_test
+)
+
+add_test(NAME clipboard_helper_wic_test
+         COMMAND clipboard_helper_wic_test)
+
+# ──────────────────────────────────────────────────────────────────────
 # virtual_paste_publish — manual Explorer-paste repro tool.  Not a unit
 # test (no ctest registration); run by hand, sits in an STA message pump
 # holding the OLE clipboard so the operator can paste from Explorer.

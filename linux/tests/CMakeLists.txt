@@ -13,6 +13,7 @@ add_executable(clipboard_helper_tests
     backend_detector_test.cpp
     log_test.cpp
     dispatch_codec_test.cpp
+    dispatch_test.cpp
     socket_server_test.cpp
     parent_watchdog_test.cpp
     uri_list_format_test.cpp
@@ -21,6 +22,7 @@ add_executable(clipboard_helper_tests
     ${CMAKE_SOURCE_DIR}/src/backend_detector.cpp
     ${CMAKE_SOURCE_DIR}/src/log.cpp
     ${CMAKE_SOURCE_DIR}/src/dispatch_codec.cpp
+    ${CMAKE_SOURCE_DIR}/src/dispatch.cpp
     ${CMAKE_SOURCE_DIR}/src/socket_server.cpp
     ${CMAKE_SOURCE_DIR}/src/parent_watchdog.cpp
     ${CMAKE_SOURCE_DIR}/src/uri_list_format.cpp
