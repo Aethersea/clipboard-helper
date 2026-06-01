@@ -144,20 +144,24 @@ jobs:
       - uses: actions/checkout@v6
 
       # System packages cover everything we need at build time AND
-      # runtime: qt6-base-dev pulls in Qt's QtCore+QtGui dev files;
-      # qt6-image-formats-plugins is the runtime WebP plugin (loaded by
-      # QImage::loadFromData at paste time — the helper logs a loud
-      # error on startup if it's missing); libwayland-dev gives us
-      # both libwayland-client (link target) and wayland-scanner
-      # (codegen for the protocol XMLs); pkg-config is required by
-      # the wayland-client find_package call. Ubuntu 24.04 ships
-      # Qt 6.4.2 by default, matching our CMakeLists floor.
+      # runtime: qt6-base-dev pulls in Qt's QtCore+QtGui dev files
+      # (whose built-in PNG/BMP writers re-encode the decoded image —
+      # no optional image-format plugin needed); libwebp-dev provides
+      # the WebP decoder we link against directly (src/webp_decode.*),
+      # replacing the old optional qt6-image-formats-plugins WebP plugin
+      # that was trivially absent on a minimal install and silently
+      # broke image paste; libwayland-dev gives us both libwayland-client
+      # (link target) and wayland-scanner (codegen for the protocol XMLs);
+      # pkg-config is required by the wayland-client and libwebp
+      # find_package calls. Ubuntu 24.04 ships Qt 6.4.2 by default,
+      # matching our CMakeLists floor.
       - name: Install build + runtime deps
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             cmake clang \
-            qt6-base-dev qt6-image-formats-plugins \
+            qt6-base-dev \
+            libwebp-dev \
             libwayland-dev pkg-config curl
 
       # The XMLs are fetched from the canonical upstream sources by
@@ -189,17 +193,19 @@ jobs:
       - name: Run unit tests
         run: ctest --test-dir build --output-on-failure
 
-      # Verify the WebP plugin is actually loadable from the binary's
-      # runtime environment. main.cpp does the same check at startup
-      # and logs ERROR if missing; this is an extra CI-time guard so
-      # we never publish a release where the apt dep got dropped.
-      # `find` is arch-agnostic — the plugin lives under
-      # /usr/lib/<triple>/qt6/plugins/imageformats/ where the triple
-      # varies (x86_64-linux-gnu, aarch64-linux-gnu, ...).
-      - name: Verify WebP plugin available
+      # WebP decoding is now a hard link-time dependency on libwebp
+      # (src/webp_decode.*), not the old optional Qt image-format plugin.
+      # Verify the built binary is actually linked against libwebp — a
+      # CI-time guard that the apt dep didn't get silently dropped, so we
+      # never publish a release whose IMAGE clipboards can't decode. If
+      # libwebp.so were missing the dynamic linker would refuse to start
+      # the process outright, but catching it here keeps the failure
+      # obvious in the workflow timeline instead of at runtime.
+      - name: Verify libwebp linkage
         run: |
-          if ! find /usr/lib -name 'libqwebp*.so' -print -quit | grep -q .; then
-            echo "qt6-image-formats-plugins didn't install the WebP plugin" >&2
+          if ! ldd build/clipboard-helper | grep -qi 'libwebp'; then
+            echo "clipboard-helper is not linked against libwebp" >&2
+            ldd build/clipboard-helper >&2
             exit 1
           fi
 

@@ -221,7 +221,7 @@ int main(int argc, char** argv) {
     }
 
     // Both backends now use QGuiApplication so QImage (in QtGui) can
-    // load WebP via qt6-image-formats-plugins and re-encode to PNG/BMP
+    // re-encode the libwebp-decoded image (src/webp_decode.*) to PNG/BMP
     // for the OS clipboard. The X11 backend wants the real xcb QPA so
     // Qt's QClipboard handles selection ownership; the Wayland backend
     // sets QT_QPA_PLATFORM=minimal so Qt loads the no-op QPA — no
