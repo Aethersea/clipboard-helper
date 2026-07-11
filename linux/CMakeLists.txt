@@ -132,6 +132,7 @@ add_executable(clipboard-helper
     src/clipboard_manager_ext.cpp
     src/clipboard_manager_x11.cpp
     src/wayland_display.cpp
+    src/wayland_probe.cpp
     src/uri_list_format.cpp
     src/webp_decode.cpp
     "${WLR_PRIVATE_CODE}"

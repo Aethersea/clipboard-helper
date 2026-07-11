@@ -74,4 +74,24 @@ BackendDecision DetectBackend(const GetEnvFn& getenv);
 // is empty). Returns the decision so callers can log / branch on it.
 BackendDecision DetectBackendAndApplyEnv();
 
+// Second-pass decision: when DetectBackend initially picked
+// BackendKind::Wayland but a runtime probe (see wayland_probe.h) found
+// the compositor does not advertise ext-data-control / wlr-data-control,
+// should the helper fall back to ForceXWayland (route through Qt's xcb
+// QClipboard on XWayland) instead of dropping to the no-op stub?
+//
+// Returns true iff:
+//   - wayland_has_data_control == false (the compositor can't drive a
+//     background clipboard owner via either Wayland data-control
+//     extension), AND
+//   - have_display == true (XWayland is reachable, so the X11 backend
+//     can actually take over).
+//
+// Pure: facts in, decision out. The caller (main.cpp) is responsible for
+// running the probe and reading $DISPLAY; this function exists so the
+// decision logic is unit-testable in isolation (all four input
+// combinations) and lives in one named place rather than inlined in
+// main.cpp where it would be invisible to the test surface.
+bool ShouldFallbackToXWayland(bool wayland_has_data_control, bool have_display);
+
 }  // namespace leviathan::clipboard_helper
