@@ -86,11 +86,20 @@ final class PasteboardManager: NSObject {
                               _ success: Bool,
                               _ errorMessage: String) -> Void)?
 
-    // File download coordination (for NSPasteboardItemDataProvider)
-    private var fileDownloadPaths: [String]?
-    private var fileDownloadTriggered = false
-    private var fileDownloadCancelled = false
-    private let fileDownloadCondition = NSCondition()
+    // File download coordination (for NSPasteboardItemDataProvider).
+    // The wait/cancel/supersede rules live in FileDownloadGate so they
+    // can be unit-tested without AppKit; this class supplies the
+    // pasteboard-facing closures (DATA_REQUEST send, run-loop pump).
+    private let fileDownloadGate: FileDownloadGate
+    /// Re-publishes performed for the current announcement after a
+    /// stalled/failed paste (see scheduleFailedPasteRepublish).  Main
+    /// thread only; reset by announceDelayed for each new announcement.
+    private var failedPasteRepublishCount = 0
+    /// True while a re-publish is queued on the main queue and has not
+    /// run yet.  A primary and the secondaries that inherit its failure
+    /// all report the same failure; they must collapse into ONE
+    /// re-publish (and one increment of the counter above).
+    private var failedPasteRepublishPending = false
 
     // Phase 2 (NSFilePromiseProvider dual-publish, see plan-mac-virtual-file-
     // clipboard.md).
@@ -108,8 +117,15 @@ final class PasteboardManager: NSObject {
     fileprivate var activePromiseProviders: [NSFilePromiseProvider] = []
     fileprivate var activeTransferID: String?
 
-    init(pollInterval: TimeInterval = 0.5) {
+    /// - Parameters:
+    ///   - pollInterval: How often the local pasteboard is polled for
+    ///     changes (server mode).
+    ///   - fileDownloadTimeout: Wall-clock bound on how long a `.fileURL`
+    ///     paste waits for the parent's PROVIDE_DATA before giving up.
+    init(pollInterval: TimeInterval = 0.5,
+         fileDownloadTimeout: TimeInterval = FileDownloadGate.defaultTimeout) {
         self.pollInterval = pollInterval
+        self.fileDownloadGate = FileDownloadGate(timeout: fileDownloadTimeout)
         self.lastChangeCount = NSPasteboard.general.changeCount
         super.init()
     }
@@ -234,6 +250,8 @@ final class PasteboardManager: NSObject {
         }
         activePromiseProviders.removeAll()
         activeTransferID = nil
+        failedPasteRepublishCount = 0
+        failedPasteRepublishPending = false
 
         stateLock.lock()
         pendingAnnouncement = announcement
@@ -308,11 +326,7 @@ final class PasteboardManager: NSObject {
         stateLock.unlock()
 
         // Reset file download state
-        fileDownloadCondition.lock()
-        fileDownloadPaths = nil
-        fileDownloadTriggered = false
-        fileDownloadCancelled = false
-        fileDownloadCondition.unlock()
+        fileDownloadGate.reset()
 
         // Drain any stale semaphore signals from previous operations
         while renderSemaphore.wait(timeout: .now()) == .success {}
@@ -931,8 +945,23 @@ extension PasteboardManager: NSPasteboardItemDataProvider {
             self?.onTransferStart?(transferID)
         }
 
-        guard let paths = ensureFilesDownloaded(announcement: announcement) else {
-            Log.error("File data provider: ensureFilesDownloaded returned nil (download failed or timed out)")
+        let paths: [String]
+        switch ensureFilesDownloaded(announcement: announcement) {
+        case .completed(let list):
+            paths = list
+        case .timedOut:
+            Log.error("File data provider: download stalled (no PROVIDE_DATA or progress for \(fileDownloadGate.timeout) s)")
+            scheduleFailedPasteRepublish(announcement, reason: "stalled")
+            return
+        case .failed(let reason):
+            Log.error("File data provider: download failed — \(reason)")
+            scheduleFailedPasteRepublish(announcement, reason: reason)
+            return
+        case .cancelled:
+            Log.info("File data provider: download cancelled by user")
+            return
+        case .superseded:
+            Log.warning("File data provider: announcement superseded mid-paste")
             return
         }
 
@@ -960,7 +989,7 @@ extension PasteboardManager: NSPasteboardItemDataProvider {
     /// Mark the in-flight file download as cancelled.  Wired by
     /// ClipboardHelperApp to the TransferProgressPanel's onCancel
     /// callback.  Both ensureFilesDownloaded spin loops poll the
-    /// `fileDownloadCancelled` flag and exit promptly when it flips.
+    /// gate's cancel flag and exit promptly when it flips.
     ///
     /// `transferID` is the ID to use for the upstream FILE_TRANSFER_CANCEL
     /// IPC message.  The caller in ClipboardHelperApp prefers the
@@ -988,10 +1017,7 @@ extension PasteboardManager: NSPasteboardItemDataProvider {
         let cancelTransferID = transferID.isEmpty ? currentTransferID : transferID
 
         Log.info("cancelFileDownload: marking download cancelled (transfer=\(cancelTransferID))")
-        fileDownloadCondition.lock()
-        fileDownloadCancelled = true
-        fileDownloadCondition.broadcast()
-        fileDownloadCondition.unlock()
+        fileDownloadGate.cancel()
         // Also poke the render semaphore so the primary waiter's
         // wait(timeout:) returns promptly instead of having to wait
         // for the next 50 ms tick.
@@ -1012,22 +1038,18 @@ extension PasteboardManager: NSPasteboardItemDataProvider {
     /// Coordinates the one-time file download across potentially multiple
     /// concurrent data-provider callbacks (one per file).  The first caller
     /// triggers the download; subsequent callers block until it completes.
+    /// The wait/cancel/supersede rules are in `FileDownloadGate`; this
+    /// wrapper supplies the pasteboard-side pieces and returns the gate's
+    /// outcome so the caller can distinguish a stall/failure (worth
+    /// re-publishing for a retry) from a cancel or supersede (not).
     ///
     /// IMPORTANT: The NSPasteboardItemDataProvider callback runs on the main
     /// thread.  A plain semaphore wait would block the main run loop, which
     /// prevents DispatchQueue.main.async blocks (e.g. FileTransferProgress
-    /// updates that drive the progress panel) from executing.  Instead we
-    /// spin the run loop in small increments so that dispatched UI work —
-    /// including the progress panel — can still be processed.
-    private func ensureFilesDownloaded(announcement: Leviathan_ClipboardAnnouncement) -> [String]? {
-        fileDownloadCondition.lock()
-
-        // Already completed — return cached paths
-        if let paths = fileDownloadPaths {
-            fileDownloadCondition.unlock()
-            return paths
-        }
-
+    /// updates that drive the progress panel) from executing.  Instead the
+    /// gate yields to `idleBriefly` between polls so that dispatched UI work
+    /// — including the progress panel — can still be processed.
+    private func ensureFilesDownloaded(announcement: Leviathan_ClipboardAnnouncement) -> FileDownloadWaitOutcome {
         let isStillCurrent: () -> Bool = { [weak self] in
             guard let self = self else { return false }
             self.stateLock.lock()
@@ -1035,147 +1057,124 @@ extension PasteboardManager: NSPasteboardItemDataProvider {
             return self.pendingAnnouncement?.contentHash == announcement.contentHash
         }
 
-        // First caller triggers the download
-        if !fileDownloadTriggered {
-            fileDownloadTriggered = true
-            fileDownloadCondition.unlock()
-
-            // Send DATA_REQUEST to parent process.  NOTE: do NOT fire
-            // onTransferStart here.  ensureFilesDownloaded is called
-            // BOTH from the user-paste path (.fileURL data provider)
-            // AND from the announcement-time eager pre-download below
-            // (announceDelayedFiles dispatches it on a background queue
-            // so the legacy `.fileURL` consumers have their data ready
-            // by the time they actually paste).  Firing the panel here
-            // would pop the panel at announcement time — way before
-            // the user actually pasted — which is the wrong UX.
-            // Panel show is now triggered by the actual user-paste
-            // sites (FilePromiseHandler.writePromiseTo for the modern
-            // path, the `.fileURL` data provider callback for the
-            // legacy path).
-            var request = Leviathan_ClipboardDataRequest()
-            request.contentHash = announcement.contentHash
-            request.contentType = .files
-            onDataRequest?(request)
-
-            // Wait for PROVIDE_DATA while keeping the main run loop alive.
-            // 50 ms spin so FileTransferProgress updates (driving the
-            // TransferProgressPanel) keep flowing on DispatchQueue.main.
-            // Also polls fileDownloadCancelled so the user's Cancel
-            // button click exits this loop promptly.
-            let deadline = Date(timeIntervalSinceNow: 300)
-            var completed = false
-            var superseded = false
-            var cancelled = false
-            while !completed && !superseded && !cancelled && Date() < deadline {
-                if isFileDownloadCancelled() {
-                    cancelled = true
-                } else if renderSemaphore.wait(timeout: .now()) == .success {
-                    // Re-check cancellation: the signal might have been
-                    // posted by cancelFileDownload (which also signals)
-                    // rather than by genuine PROVIDE_DATA completion.
-                    cancelled = isFileDownloadCancelled()
-                    completed = !cancelled
-                } else if !isStillCurrent() {
-                    superseded = true
-                } else if Thread.isMainThread {
-                    // Drain AppKit events + DispatchQueue.main blocks for
-                    // ~50 ms.  This is the pattern Apple uses internally
-                    // for modal panels (NSApp.runModal does the same):
-                    // pull NSEvents from our process's event queue with
-                    // `NSApp.nextEvent(...)` and forward them through
-                    // `NSApp.sendEvent(_:)`, which is what actually
-                    // routes mouse-click / key events to the responder
-                    // chain (window → contentView → … → NSButton →
-                    // target/action).
-                    //
-                    // Why `RunLoop.run(mode:)` alone isn't enough:
-                    // RunLoop.run processes input sources (Mach ports,
-                    // timers, dispatch_main_q), but the NSEvent queue
-                    // is a SEPARATE Cocoa-level queue.  NSApplication.run
-                    // is what normally pumps it via nextEvent / sendEvent
-                    // on every iteration.  Skipping that step left mouse
-                    // events stuck in the queue — the Cancel button
-                    // click arrived but never reached `cancelButtonClicked`,
-                    // appearing to the user as a permanent beachball.
-                    //
-                    // `inMode: .default` matches the mode NSApplication.run
-                    // uses by default — covers mouse, key, and dispatch
-                    // events alike on a non-modal app.
-                    let deadline = Date(timeIntervalSinceNow: 0.05)
-                    while Date() < deadline {
-                        guard
-                            let event = NSApp.nextEvent(
-                                matching: .any,
-                                until: deadline,
-                                inMode: .default,
-                                dequeue: true
-                            )
-                        else {
-                            break
-                        }
-                        NSApp.sendEvent(event)
-                    }
-                } else {
-                    Thread.sleep(forTimeInterval: 0.05)
-                }
-            }
-
-            fileDownloadCondition.lock()
-            if completed, isStillCurrent(),
-               let data = renderedData,
-               let str = String(data: data, encoding: .utf8) {
-                fileDownloadPaths = str.components(separatedBy: "\n").filter { !$0.isEmpty }
-                Log.info("File download complete: \(fileDownloadPaths?.count ?? 0) file(s)")
-            } else if cancelled {
-                Log.info("File download cancelled by user")
-            } else if superseded {
-                Log.warning("File download abandoned: announcement superseded mid-flight")
-            } else {
-                Log.error("File download failed or timed out")
-            }
-            fileDownloadCondition.broadcast()
-            let paths = fileDownloadPaths
-            fileDownloadCondition.unlock()
-            return paths
-        }
-
-        // Another caller while download is in-flight — spin until done.
-        fileDownloadCondition.unlock()
-        let deadline = Date(timeIntervalSinceNow: 300)
-        while Date() < deadline {
-            fileDownloadCondition.lock()
-            let paths = fileDownloadPaths
-            let wasCancelled = fileDownloadCancelled
-            fileDownloadCondition.unlock()
-            if let paths = paths {
-                return paths
-            }
-            if wasCancelled {
-                Log.info("ensureFilesDownloaded (secondary): cancelled by user")
-                return nil
-            }
-            if !isStillCurrent() {
-                Log.warning("ensureFilesDownloaded (secondary): announcement superseded, exiting")
-                return nil
-            }
-            if Thread.isMainThread {
-                RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.05))
-            } else {
-                Thread.sleep(forTimeInterval: 0.05)
-            }
-        }
-        Log.error("Timed out waiting for file download (secondary)")
-        return nil
+        let outcome = fileDownloadGate.ensureDownloaded(
+            semaphore: renderSemaphore,
+            sendRequest: { [weak self] in
+                // Send DATA_REQUEST to parent process.  NOTE: do NOT fire
+                // onTransferStart here.  Panel show is triggered by the
+                // actual user-paste sites (FilePromiseHandler.writePromiseTo
+                // for the modern path, the `.fileURL` data provider callback
+                // for the legacy path).
+                var request = Leviathan_ClipboardDataRequest()
+                request.contentHash = announcement.contentHash
+                request.contentType = .files
+                self?.onDataRequest?(request)
+            },
+            isStillCurrent: isStillCurrent,
+            renderedPayload: { [weak self] in
+                guard let self = self else { return nil }
+                self.stateLock.lock()
+                defer { self.stateLock.unlock() }
+                return self.renderedData
+            },
+            idle: { [weak self] in self?.idleBriefly() }
+        )
+        return outcome
     }
 
-    /// Lock-guarded read of the cancellation flag.  Pulled out so the
-    /// spin loops above don't have to inline the lock/unlock pair on
-    /// every iteration.
-    private func isFileDownloadCancelled() -> Bool {
-        fileDownloadCondition.lock()
-        defer { fileDownloadCondition.unlock() }
-        return fileDownloadCancelled
+    /// Feed a FILE_TRANSFER_PROGRESS frame from the parent into the gate so
+    /// a paste that is still moving never hits the stall timeout.  Called
+    /// from ClipboardHelperApp on every progress / completion frame.
+    func noteFileTransferProgress() {
+        fileDownloadGate.noteProgress()
+    }
+
+    /// Upper bound on how many times a failed/stalled paste re-publishes
+    /// the same announcement.  Each re-publish only leads anywhere when
+    /// the user pastes again, but system probes (Continuity, clipboard
+    /// managers) can also fire the data provider, so cap it to keep a
+    /// genuinely dead transfer from cycling forever.
+    private static let maxFailedPasteRepublishes = 2
+
+    /// `NSPasteboardItem.provideDataForType:` is called AT MOST ONCE per
+    /// (item, type) and the pasteboard caches whatever we produced — even
+    /// nothing.  So after a stalled or failed paste the announcement is
+    /// dead as far as Finder is concerned: the next Cmd+V reads the cached
+    /// empty result and never reaches us.  Re-publishing the same
+    /// announcement (fresh NSPasteboardItems, same pending state, gate
+    /// reset) gives the user's next paste a fresh data-provider call and
+    /// hence a fresh DATA_REQUEST — which succeeds immediately when the
+    /// transfer merely needed more time and has since landed upstream.
+    private func scheduleFailedPasteRepublish(_ announcement: Leviathan_ClipboardAnnouncement,
+                                              reason: String) {
+        // Data-provider callbacks run on the main thread, so these two
+        // fields are only ever touched from one thread.
+        guard !failedPasteRepublishPending else {
+            Log.info("Re-publish after failed paste already queued (\(reason)); coalescing")
+            return
+        }
+        guard failedPasteRepublishCount < Self.maxFailedPasteRepublishes else {
+            Log.warning("Not re-publishing files announcement after failed paste (\(reason)): retry cap reached")
+            return
+        }
+        failedPasteRepublishCount += 1
+        failedPasteRepublishPending = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.failedPasteRepublishPending = false
+            self.stateLock.lock()
+            let stillCurrent = self.pendingAnnouncement?.contentHash == announcement.contentHash
+            self.stateLock.unlock()
+            guard stillCurrent, self.activeTransferID == announcement.transferID else {
+                Log.info("Skipping re-publish after failed paste: announcement no longer current")
+                return
+            }
+            Log.info("Re-publishing files announcement after failed paste (\(reason)) so the next paste retries (attempt \(self.failedPasteRepublishCount)/\(Self.maxFailedPasteRepublishes))")
+            self.announceDelayedFiles(announcement)
+        }
+    }
+
+    /// Drain AppKit events + DispatchQueue.main blocks for ~50 ms when on
+    /// the main thread; plain sleep otherwise.
+    ///
+    /// This is the pattern Apple uses internally for modal panels
+    /// (NSApp.runModal does the same): pull NSEvents from our process's
+    /// event queue with `NSApp.nextEvent(...)` and forward them through
+    /// `NSApp.sendEvent(_:)`, which is what actually routes mouse-click /
+    /// key events to the responder chain (window -> contentView -> ... ->
+    /// NSButton -> target/action).
+    ///
+    /// Why `RunLoop.run(mode:)` alone isn't enough: RunLoop.run processes
+    /// input sources (Mach ports, timers, dispatch_main_q), but the NSEvent
+    /// queue is a SEPARATE Cocoa-level queue.  NSApplication.run is what
+    /// normally pumps it via nextEvent / sendEvent on every iteration.
+    /// Skipping that step left mouse events stuck in the queue — the
+    /// Cancel button click arrived but never reached `cancelButtonClicked`,
+    /// appearing to the user as a permanent beachball.
+    ///
+    /// `inMode: .default` matches the mode NSApplication.run uses by
+    /// default — covers mouse, key, and dispatch events alike on a
+    /// non-modal app.
+    private func idleBriefly() {
+        let interval = fileDownloadGate.pollInterval
+        guard Thread.isMainThread else {
+            Thread.sleep(forTimeInterval: interval)
+            return
+        }
+        let deadline = Date(timeIntervalSinceNow: interval)
+        while Date() < deadline {
+            guard
+                let event = NSApp.nextEvent(
+                    matching: .any,
+                    until: deadline,
+                    inMode: .default,
+                    dequeue: true
+                )
+            else {
+                break
+            }
+            NSApp.sendEvent(event)
+        }
     }
 }
 
