@@ -3,10 +3,10 @@ name: Build clipboard-helper
 on:
   workflow_dispatch:
   push:
-    branches: [master]
+    branches: [master, develop]
     tags: ['v*']
   pull_request:
-    branches: [master]
+    branches: [master, develop]
 
 
 jobs:
@@ -309,6 +309,52 @@ jobs:
           tag_name: latest
           name: Latest Build
           body: "Automated build from the latest commit on `master`."
+          files: |
+            clipboard-helper-macos
+            clipboard-helper-windows.exe
+            clipboard-helper-linux
+            clipboard-helper-linux-arm64
+          prerelease: true
+          make_latest: false
+
+  # Moving `dev` prerelease from the `develop` integration branch. shen's
+  # `npm run dev` downloads this one (scripts/download-clipboard-helper.js
+  # --channel dev) so day-to-day development runs the helper that matches
+  # unreleased shen changes; packaged shen builds keep following `latest`,
+  # which only moves when `develop` is merged into `master`.
+  release-dev:
+    needs: [build-macos, build-windows, build-linux]
+    if: github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: clipboard-helper-macos-universal
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: clipboard-helper-windows-x64
+
+      - name: Download Linux x64 artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: clipboard-helper-linux-x64
+
+      - name: Download Linux arm64 artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: clipboard-helper-linux-arm64
+
+      - name: Update dev release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: dev
+          name: Development Build
+          body: "Automated build from the latest commit on `develop`. Consumed by shen's `npm run dev`; not for packaged builds."
           files: |
             clipboard-helper-macos
             clipboard-helper-windows.exe
