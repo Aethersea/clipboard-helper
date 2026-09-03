@@ -18,7 +18,7 @@ namespace leviathan::clipboard_helper {
 
 class StaWorker;
 class PipeServer;
-// Forward declaration; full definition in dispatch.cpp. The provider is
+// Forward declaration; full definition in chunk_provider.h. The provider is
 // the ChunkProvider impl handed to a VirtualClipboardDataObject created
 // when shen sends ANNOUNCE_DELAYED with content_type=Files — it round-
 // trips FILE_CHUNK_REQUEST / FILE_CHUNK_DATA through PipeServer.

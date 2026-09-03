@@ -47,6 +47,7 @@ add_executable(leviathan-clipboard-helper
     src/session.cpp
     src/proto_wire.cpp
     src/dispatch.cpp
+    src/chunk_provider.cpp
     src/dispatch_codec.cpp
     src/sta_worker.cpp
     src/work_queue.cpp

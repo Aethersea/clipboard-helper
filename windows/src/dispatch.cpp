@@ -10,6 +10,7 @@
 #include <string>
 #include <utility>
 
+#include "chunk_provider.h"
 #include "clipboard_ops.h"
 #include "dispatch_codec.h"
 #include "helper_proto.h"
@@ -43,308 +44,12 @@ namespace {
 // the macOS helper hit in April 2026 (see vault notes via NotebookLM).
 constexpr DWORD kRenderTimeoutMs = 120 * 1000;
 
-// Phase 2: per-chunk timeout for the FILE_CHUNK_REQUEST round-trip a
-// VirtualFileStream::Read does on the STA thread. Tighter than the legacy
-// 120 s render budget because Explorer's copy dialog already shows progress
-// — long stalls now surface as visible "slow" instead of a frozen shell.
-// Caps at 30 s so a single WebRTC packet loss event doesn't pin the STA.
-constexpr DWORD kChunkTimeoutMs = 30 * 1000;
-
 }  // namespace
 
-// ─── DispatcherChunkProvider ─────────────────────────────────────────────
-//
-// Lives in the named namespace so dispatch.h can forward-declare it and
-// hold a std::unique_ptr<DispatcherChunkProvider>. The Dispatcher creates
-// one instance per process lifetime; every virtual-file IDataObject the
-// dispatcher publishes via OleSetClipboard borrows this provider via the
-// ChunkProvider* abstract base.
-//
-// Threading:
-//   * FetchChunk() runs on the STA worker thread (COM marshals the
-//     IStream::Read call there). It SendFrame's a FILE_CHUNK_REQUEST and
-//     waits for the parent's FILE_CHUNK_DATA reply via
-//     MsgWaitForMultipleObjects, which keeps the STA pumping window
-//     messages so nested COM marshaling can land.
-//   * DeliverChunk() runs on the pipe-accept thread when the parent's
-//     FILE_CHUNK_DATA arrives. It finds the matching PendingChunk by
-//     transfer_id, stages the bytes, and SetEvent's that specific waiter.
-//
-// Concurrency model:
-//   The STA's inner message pump inside FetchChunk WILL re-enter
-//   IStream::Read for sibling streams (e.g. Explorer copying multiple
-//   files in parallel — COM marshals the Read calls into the same STA,
-//   and our pump dispatches them). The provider therefore must support
-//   multiple in-flight requests at once. Each request gets its own auto-
-//   reset event and its own PendingChunk struct; the map keyed by
-//   transfer_id is the only shared state.
-class DispatcherChunkProvider final : public ChunkProvider {
-public:
-    explicit DispatcherChunkProvider(PipeServer* pipe) : pipe_(pipe) {}
-    ~DispatcherChunkProvider() override {
-        // Close any leftover events. In practice ReleaseStaBoundResources
-        // → CancelAll has already cleaned out the map by the time we get
-        // here; this is defensive against torn shutdown paths.
-        std::lock_guard<std::mutex> lock(mu_);
-        for (auto& [_, queue] : pending_) {
-            for (auto& slot : queue) {
-                if (slot && slot->event != nullptr) {
-                    ::CloseHandle(slot->event);
-                    slot->event = nullptr;
-                }
-            }
-        }
-        pending_.clear();
-    }
-
-    DispatcherChunkProvider(const DispatcherChunkProvider&)            = delete;
-    DispatcherChunkProvider& operator=(const DispatcherChunkProvider&) = delete;
-
-    HRESULT FetchChunk(const std::string&         transfer_id,
-                       const std::string&         file_id,
-                       std::uint64_t              offset,
-                       std::uint32_t              size,
-                       std::vector<std::uint8_t>& out_data,
-                       bool&                      out_is_last) override {
-        out_data.clear();
-        out_is_last = false;
-        if (pipe_ == nullptr) return E_FAIL;
-        if (transfer_id.empty() || file_id.empty()) return E_INVALIDARG;
-
-        // Correlate replies by the (transfer_id, file_id, offset) tuple
-        // the parent already echoes back in HelperFileChunkData. transfer_id
-        // is the announcement-scoped identifier shen uses to route the
-        // request upstream to leviathan; file_id+offset disambiguate
-        // requests within an announcement.
-        const std::string key = MakeKey(transfer_id, file_id, offset);
-
-        auto slot = std::make_shared<PendingChunk>();
-        slot->event = ::CreateEventW(nullptr, /*manualReset=*/FALSE,
-                                     /*initial=*/FALSE, nullptr);
-        if (slot->event == nullptr) {
-            LH_LOG_ERROR("DispatcherChunkProvider: CreateEventW failed");
-            return E_FAIL;
-        }
-        // Stage in the per-key FIFO queue BEFORE sending the frame so the
-        // pipe thread can find us as soon as the reply lands. A FIFO (not
-        // a single slot) lets us survive the edge case where two distinct
-        // streams happen to issue overlapping Reads at the SAME
-        // (transfer_id, file_id, offset) — without a queue the second
-        // staging would overwrite the first's slot and strand the first
-        // request until timeout. In practice the shell never does this,
-        // but a queue is cheap and removes a class of timeout. No
-        // process-wide "canceled" gate either — cancellation is per-slot
-        // via PendingChunk::cancelled set by CancelAll on existing waiters.
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            pending_[key].push_back(slot);
-        }
-
-        const auto frame = EncodeFileChunkRequestOutbound(transfer_id, file_id, offset, size);
-        if (!pipe_->SendFrame(frame)) {
-            std::lock_guard<std::mutex> lock(mu_);
-            EraseFromQueueLocked(key, slot);
-            ::CloseHandle(slot->event);
-            return E_FAIL;
-        }
-
-        // Wait on this request's specific event. MsgWaitForMultipleObjects
-        // with QS_ALLINPUT keeps the STA pumping so sibling IStream::Read
-        // calls (for other files in a multi-file paste) and the helper's
-        // own WM_CLIPBOARDUPDATE notifications can still dispatch.
-        const DWORD start = ::GetTickCount();
-        bool got_quit = false;
-        for (;;) {
-            const DWORD elapsed = ::GetTickCount() - start;
-            if (elapsed >= kChunkTimeoutMs) {
-                LH_LOG_WARN("DispatcherChunkProvider: FILE_CHUNK_REQUEST timeout");
-                break;
-            }
-            const DWORD remaining = kChunkTimeoutMs - elapsed;
-            const DWORD wait_result = ::MsgWaitForMultipleObjects(
-                1, &slot->event, FALSE, remaining, QS_ALLINPUT);
-            if (wait_result == WAIT_OBJECT_0) {
-                break;
-            }
-            if (wait_result == WAIT_OBJECT_0 + 1) {
-                MSG msg{};
-                while (::PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-                    if (msg.message == WM_QUIT) {
-                        ::PostQuitMessage(static_cast<int>(msg.wParam));
-                        got_quit = true;
-                        break;
-                    }
-                    ::TranslateMessage(&msg);
-                    ::DispatchMessageW(&msg);
-                }
-                if (got_quit) break;
-                // After the pump, our event may have been set by a
-                // re-entrant DeliverChunk OR by CancelAll; re-check
-                // under the lock.
-                std::lock_guard<std::mutex> lock(mu_);
-                if (slot->cancelled || slot->received) break;
-                continue;
-            }
-            // WAIT_TIMEOUT, WAIT_FAILED, etc. — bail out.
-            break;
-        }
-
-        // Detach THIS specific slot from the per-key queue under the lock.
-        // Removing only our entry (vs erasing the whole key) is important
-        // when sibling FetchChunk calls for the same (transfer_id, file_id,
-        // offset) are queued — they must remain in pending_ so the next
-        // DeliverChunk can find them.
-        bool received = false;
-        bool canceled = false;
-        std::vector<std::uint8_t> data;
-        bool is_last = false;
-        std::string error;
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            received = slot->received;
-            canceled = slot->cancelled;
-            data     = std::move(slot->data);
-            is_last  = slot->is_last;
-            error    = std::move(slot->error);
-            EraseFromQueueLocked(key, slot);
-        }
-        ::CloseHandle(slot->event);
-        slot->event = nullptr;
-
-        if (got_quit) {
-            return E_ABORT;
-        }
-        if (canceled && !received) {
-            return STG_E_REVERTED;
-        }
-        if (!received) {
-            return E_FAIL;  // timeout
-        }
-        if (!error.empty()) {
-            char buf[160];
-            std::snprintf(buf, sizeof(buf),
-                          "DispatcherChunkProvider: parent error: %.96s", error.c_str());
-            LH_LOG_WARN(buf);
-            return E_FAIL;
-        }
-        out_data    = std::move(data);
-        out_is_last = is_last;
-        return S_OK;
-    }
-
-    // Pipe thread → STA thread bridge. Finds the matching pending request
-    // by the (transfer_id, file_id, offset) tuple, stages bytes, and
-    // signals the request's event. Late / stale tuples are dropped quietly
-    // — that's how requests cancelled by a superseded clipboard cycle
-    // drain.
-    void DeliverChunk(const std::string&         transfer_id,
-                      const std::string&         file_id,
-                      std::uint64_t              offset,
-                      std::vector<std::uint8_t>  data,
-                      bool                       is_last,
-                      const std::string&         error) {
-        const std::string key = MakeKey(transfer_id, file_id, offset);
-        std::shared_ptr<PendingChunk> slot;
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            auto it = pending_.find(key);
-            if (it == pending_.end() || it->second.empty()) {
-                return;  // no waiter (timed out / canceled / unknown)
-            }
-            // FIFO: the oldest pending request wins. Match the wire order
-            // by which FetchChunks were issued, which is also the order
-            // the parent processes them.
-            slot = it->second.front();
-            slot->data     = std::move(data);
-            slot->is_last  = is_last;
-            slot->error    = error;
-            slot->received = true;
-        }
-        if (slot->event) ::SetEvent(slot->event);
-    }
-
-    // Wake every IN-FLIGHT FetchChunk so the helper's shutdown /
-    // clipboard-ownership-rotation path doesn't hang the STA. Each
-    // existing slot is flagged cancelled and its event is set so the
-    // FetchChunk wait wakes, sees slot->cancelled, and returns
-    // STG_E_REVERTED. Crucially we do NOT install a process-wide gate
-    // here — subsequent FetchChunk calls (for a fresh ANNOUNCE_DELAYED)
-    // are accepted as normal.
-    void CancelAll() {
-        std::vector<HANDLE> events;
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            for (auto& [_, queue] : pending_) {
-                for (auto& slot : queue) {
-                    if (slot) {
-                        slot->cancelled = true;
-                        if (slot->event) events.push_back(slot->event);
-                    }
-                }
-            }
-        }
-        for (HANDLE h : events) ::SetEvent(h);
-    }
-
-private:
-    struct PendingChunk {
-        HANDLE                       event{nullptr};
-        std::vector<std::uint8_t>    data;
-        bool                         is_last{false};
-        std::string                  error;
-        bool                         received{false};
-        // Set by CancelAll on existing slots when clipboard ownership
-        // rotates or the helper shuts down. Per-slot rather than process-
-        // wide so the FetchChunk path can stay open for fresh
-        // announcements after a rotation.
-        bool                         cancelled{false};
-    };
-
-    // Composite key for the in-flight FetchChunk map. The wire fields the
-    // parent echoes back (transfer_id, file_id, offset) uniquely identify
-    // a request within the current process — file_id is per-announcement
-    // and offset prevents collisions when the shell issues sequential
-    // Reads on the same stream before the previous one has returned (rare
-    // but legal). Format is "<transfer_id>|<file_id>|<decimal-offset>";
-    // both transfer_id and file_id are opaque tokens (no embedded '|' is
-    // expected, but if one slips through the worst case is a missed
-    // correlation that triggers a FetchChunk timeout, not data corruption).
-    static std::string MakeKey(const std::string& transfer_id,
-                               const std::string& file_id,
-                               std::uint64_t      offset) {
-        std::string key;
-        key.reserve(transfer_id.size() + file_id.size() + 24);
-        key.append(transfer_id);
-        key.push_back('|');
-        key.append(file_id);
-        key.push_back('|');
-        key.append(std::to_string(offset));
-        return key;
-    }
-
-    // Remove a specific slot from its per-key queue under mu_. Caller MUST
-    // hold mu_. If the queue becomes empty the key is erased so the map
-    // doesn't accumulate orphan empty queues across long-running sessions.
-    void EraseFromQueueLocked(const std::string& key,
-                              const std::shared_ptr<PendingChunk>& slot) {
-        auto it = pending_.find(key);
-        if (it == pending_.end()) return;
-        auto& q = it->second;
-        for (auto qit = q.begin(); qit != q.end(); ++qit) {
-            if (*qit == slot) { q.erase(qit); break; }
-        }
-        if (q.empty()) pending_.erase(it);
-    }
-
-    PipeServer*                                                pipe_;
-    std::mutex                                                 mu_;
-    // Per-key FIFO queue of in-flight FetchChunk requests. A queue rather
-    // than a single slot so two consumers reading the SAME
-    // (transfer_id, file_id, offset) tuple don't strand each other (see
-    // FetchChunk staging block). DeliverChunk pops front; FetchChunk
-    // cleanup removes its own slot via EraseFromQueueLocked.
-    std::unordered_map<std::string, std::deque<std::shared_ptr<PendingChunk>>> pending_;
-};
+// The FILE_CHUNK_REQUEST / FILE_CHUNK_DATA round-trip provider lives in
+// chunk_provider.{h,cpp}; the Dispatcher creates one instance per process
+// lifetime and every virtual-file IDataObject it publishes via
+// OleSetClipboard borrows it through the ChunkProvider* abstract base.
 
 Dispatcher::Dispatcher(StaWorker* sta, PipeServer* pipe)
     : sta_(sta), pipe_(pipe) {
@@ -352,7 +57,16 @@ Dispatcher::Dispatcher(StaWorker* sta, PipeServer* pipe)
     if (render_event_ == nullptr) {
         LH_LOG_ERROR("Dispatcher: CreateEventW for render_event_ failed; delayed rendering disabled");
     }
-    chunk_provider_ = std::make_unique<DispatcherChunkProvider>(pipe);
+    // An absent pipe leaves the provider without a transport: FetchChunk
+    // then fails with E_FAIL exactly as it did when it checked the pipe
+    // pointer itself.
+    DispatcherChunkProvider::SendFrameFn send_frame;
+    if (pipe != nullptr) {
+        send_frame = [pipe](const std::vector<std::uint8_t>& frame) {
+            return pipe->SendFrame(frame);
+        };
+    }
+    chunk_provider_ = std::make_unique<DispatcherChunkProvider>(std::move(send_frame));
 }
 
 Dispatcher::~Dispatcher() {
