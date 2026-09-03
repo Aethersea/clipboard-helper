@@ -27,6 +27,25 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File build.ps1 -Config Release
 
 The `build.ps1` script automatically discovers the Visual Studio installation root, selects the newest complete MSVC toolset under `VC\Tools\MSVC`, and configures the environment (INCLUDE, LIB, PATH) before invoking CMake and Ninja.
 
+## Tests
+
+```pwsh
+pwsh -NoProfile -ExecutionPolicy Bypass -File build.ps1 -Config Release -RunTests
+```
+
+`-RunTests` runs every ctest target after the build (CI does the same with `ctest --test-dir build --build-config Release --output-on-failure`):
+
+| Target | Framework | What it covers |
+|---|---|---|
+| `clipboard_helper_tests` | `tests/test_lite.h` (header-only) | wire codec, session, pipe server, log, work queue, descriptor builder |
+| `clipboard_helper_gtests` | GoogleTest | `DispatcherChunkProvider` — the FILE_CHUNK_REQUEST / FILE_CHUNK_DATA wait loop behind virtual-file paste (timeout, correlation, cancel, message pumping) |
+| `clipboard_helper_paste_roundtrip_test` | test_lite | `IDataObject` server through a real OLE clipboard round trip |
+| `clipboard_helper_wic_test` | test_lite | WIC PNG ↔ BGRA |
+
+GoogleTest is a test-only dependency: `tests/CMakeLists.txt` fetches the pinned release tarball (SHA-256 checked) at configure time, so the first configure needs network access; the production exe still links only Windows system DLLs. New suites that want fixtures or bounded multi-threaded waits go into `clipboard_helper_gtests`; the test_lite suites stay as they are.
+
+Two local gotchas: `build.ps1` sets both `CMAKE_CXX_COMPILER` and `CMAKE_C_COMPILER` to clang-cl because GoogleTest's `project()` enables C and CMake would otherwise pick the GNU-driver `clang.exe` and feed it MSVC flags. And `clipboard_helper_paste_roundtrip_test` takes the real OLE clipboard, so it fails intermittently while a live `leviathan-clipboard-helper.exe` (e.g. one spawned by a local leviathan) is watching the clipboard — stop that helper or trust the CI run for that target.
+
 ## Run (Smoke Test)
 
 You can launch the helper manually or via a parent process. To test the pipe connection from PowerShell:

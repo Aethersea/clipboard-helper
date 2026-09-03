@@ -225,3 +225,88 @@ set_target_properties(virtual_paste_publish PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
     OUTPUT_NAME virtual_paste_publish
 )
+
+# ──────────────────────────────────────────────────────────────────────
+# GoogleTest suites.
+#
+# The test_lite suites above stay as they are. Suites that want fixtures,
+# bounded multi-threaded waits and GTest's assertion vocabulary live in
+# clipboard_helper_gtests. GoogleTest is a TEST-ONLY dependency: it is
+# fetched at configure time from the pinned release tarball (hash-checked,
+# no git clone) and built with the same static CRT as the helper, so the
+# production exe still links nothing but Windows system DLLs.
+# ──────────────────────────────────────────────────────────────────────
+include(FetchContent)
+FetchContent_Declare(googletest
+    URL      https://github.com/google/googletest/releases/download/v1.18.0/googletest-1.18.0.tar.gz
+    URL_HASH SHA256=6e3191c1455468b3fc35a417fb565c1c5071aee1b7e7f85e30cf48a98d37d8b5
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+)
+# googletest's project() enables C as well as CXX. This project only
+# configures clang-cl for CXX (build.ps1 passes CMAKE_CXX_COMPILER); left
+# alone, CMake picks the GNU-driver clang.exe next to it for C and then
+# feeds it MSVC-style flags, and the try-compile fails. Point C at the same
+# clang-cl before the language gets enabled.
+if(NOT CMAKE_C_COMPILER)
+    set(CMAKE_C_COMPILER "${CMAKE_CXX_COMPILER}" CACHE FILEPATH
+        "C compiler (mirrors CMAKE_CXX_COMPILER for googletest)" FORCE)
+endif()
+set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
+set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+# Match the helper's /MT[d] runtime (CMAKE_MSVC_RUNTIME_LIBRARY in the root
+# CMakeLists). A shared-CRT gtest would not link against our objects.
+set(gtest_force_shared_crt OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(googletest)
+
+# chunk_provider.cpp is the FILE_CHUNK_REQUEST / FILE_CHUNK_DATA wait loop
+# behind virtual-file paste. It needs only the codec (to encode the
+# request) and user32 (MsgWaitForMultipleObjects / PeekMessage) — no OLE,
+# no PipeServer — which is what lets it be tested with a captured
+# SendFrameFn and a short timeout.
+add_executable(clipboard_helper_gtests
+    chunk_provider_test.cpp
+    ${CMAKE_SOURCE_DIR}/src/chunk_provider.cpp
+    ${CMAKE_SOURCE_DIR}/src/dispatch_codec.cpp
+    ${CMAKE_SOURCE_DIR}/src/string_utils.cpp
+    ${CMAKE_SOURCE_DIR}/src/clipboard_format.cpp
+    ${CMAKE_SOURCE_DIR}/src/proto_wire.cpp
+    ${CMAKE_SOURCE_DIR}/src/log.cpp
+)
+
+target_include_directories(clipboard_helper_gtests PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+target_compile_definitions(clipboard_helper_gtests PRIVATE
+    UNICODE
+    _UNICODE
+    NOMINMAX
+    WIN32_LEAN_AND_MEAN
+    _WIN32_WINNT=0x0A00
+)
+
+target_compile_options(clipboard_helper_gtests PRIVATE
+    /W4
+    /WX
+    /permissive-
+    /utf-8
+    /EHsc
+    $<$<CONFIG:Release>:/O2>
+    $<$<CONFIG:Debug>:/Od /Zi>
+)
+
+# user32 — MsgWaitForMultipleObjects / PeekMessageW / PostThreadMessageW
+#   (the wait loop pumps the STA queue; tests drive it the same way).
+# advapi32 — transitively via log.cpp / string_utils.
+target_link_libraries(clipboard_helper_gtests PRIVATE
+    GTest::gtest_main user32 advapi32
+)
+
+set_target_properties(clipboard_helper_gtests PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+    OUTPUT_NAME clipboard_helper_gtests
+)
+
+add_test(NAME clipboard_helper_gtests
+         COMMAND clipboard_helper_gtests)

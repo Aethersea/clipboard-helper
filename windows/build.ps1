@@ -116,6 +116,7 @@ Write-Host "==> Configuring leviathan-clipboard-helper ($Config) at $buildDir"
 & cmake -S $scriptDir -B $buildDir `
     -G 'Ninja Multi-Config' `
     -DCMAKE_CXX_COMPILER=clang-cl `
+    -DCMAKE_C_COMPILER=clang-cl `
     -DCMAKE_CONFIGURATION_TYPES="Debug;Release" `
     -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 if ($LASTEXITCODE -ne 0) { throw "CMake configure failed (exit $LASTEXITCODE)" }
