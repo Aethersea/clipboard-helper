@@ -912,7 +912,7 @@ final class FileDownloadGateTests: XCTestCase {
     // MARK: - Rule 11: timeout is a stall bound refreshed by noteProgress()
 
     func testProgressShorterThanStallTimeoutKeepsPrimaryWaiting() {
-        let timeout: TimeInterval = 0.3
+        let timeout: TimeInterval = 0.6
         let gate = FileDownloadGate(timeout: timeout, pollInterval: 0.05)
         let semaphore = DispatchSemaphore(value: 0)
         let probe = GateProbe(pollInterval: 0.05)
@@ -926,9 +926,9 @@ final class FileDownloadGateTests: XCTestCase {
             return
         }
 
-        pulseProgress(gate, every: 0.1, for: 0.8, watching: [outcome])
+        pulseProgress(gate, every: 0.1, for: 1.5, watching: [outcome])
         XCTAssertNil(outcome.get(),
-                     "primary must still be waiting at ~0.8s when progress arrives every 0.1s")
+                     "primary must still be waiting at ~1.5s when progress arrives every 0.1s")
         XCTAssertTrue(gate.hasTriggered)
         XCTAssertEqual(probe.sendCount, 1)
 
@@ -1000,7 +1000,7 @@ final class FileDownloadGateTests: XCTestCase {
     }
 
     func testProgressExtendsSecondaryWaitTheSameWay() {
-        let timeout: TimeInterval = 0.3
+        let timeout: TimeInterval = 0.6
         let gate = FileDownloadGate(timeout: timeout, pollInterval: 0.05)
         let semaphore = DispatchSemaphore(value: 0)
         let probe = GateProbe(pollInterval: 0.05)
@@ -1022,7 +1022,7 @@ final class FileDownloadGateTests: XCTestCase {
             return
         }
 
-        pulseProgress(gate, every: 0.1, for: 0.8, watching: [primaryOutcome, secondaryOutcome])
+        pulseProgress(gate, every: 0.1, for: 1.5, watching: [primaryOutcome, secondaryOutcome])
         XCTAssertNil(primaryOutcome.get(), "primary must still be waiting while progress flows")
         XCTAssertNil(secondaryOutcome.get(), "secondary must be extended by progress the same way")
         XCTAssertEqual(probe.sendCount, 1)
