@@ -303,6 +303,19 @@ jobs:
         with:
           name: clipboard-helper-linux-arm64
 
+      # softprops/action-gh-release only creates a tag when it does not
+      # exist; an existing `latest` tag is never moved, so the release would
+      # keep pointing at whatever commit first created it while its assets
+      # are replaced on every run. Move the tag to this commit first.
+      - name: Move latest tag to this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/latest" \
+            -f sha="${GITHUB_SHA}" -F force=true \
+          || gh api -X POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f ref="refs/tags/latest" -f sha="${GITHUB_SHA}"
+
       - name: Update latest release
         uses: softprops/action-gh-release@v3
         with:
@@ -348,6 +361,16 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: clipboard-helper-linux-arm64
+
+      # Same as for `latest`: move the `dev` tag before updating the release.
+      - name: Move dev tag to this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/dev" \
+            -f sha="${GITHUB_SHA}" -F force=true \
+          || gh api -X POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f ref="refs/tags/dev" -f sha="${GITHUB_SHA}"
 
       - name: Update dev release
         uses: softprops/action-gh-release@v3
