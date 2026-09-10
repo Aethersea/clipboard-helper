@@ -28,6 +28,7 @@
 #include "pipe_server.h"
 #include "session.h"
 #include "sta_worker.h"
+#include "usage_args.h"
 
 namespace {
 
@@ -178,6 +179,13 @@ void RunParentWatchdog(Watchdog* w) {
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
+    // Before the session lookup, the STA worker, the pipe — before anything
+    // observable. `--help` has to answer without starting a helper, and an
+    // unrecognised flag has to fail instead of quietly becoming one.
+    if (const int exit_code = leviathan::clipboard_helper::HandleUsageArgs(argc, argv); exit_code >= 0) {
+        return exit_code;
+    }
+
     const DWORD session_id = leviathan::clipboard_helper::GetCurrentSessionId();
     std::wstring pipe_name = ParsePipeNameOverride(argc, argv);
     const bool pipe_name_overridden = !pipe_name.empty();

@@ -265,6 +265,8 @@ FetchContent_MakeAvailable(googletest)
 # SendFrameFn and a short timeout.
 add_executable(clipboard_helper_gtests
     chunk_provider_test.cpp
+    usage_args_test.cpp
+    ${CMAKE_SOURCE_DIR}/src/usage_args.cpp
     ${CMAKE_SOURCE_DIR}/src/chunk_provider.cpp
     ${CMAKE_SOURCE_DIR}/src/dispatch_codec.cpp
     ${CMAKE_SOURCE_DIR}/src/string_utils.cpp

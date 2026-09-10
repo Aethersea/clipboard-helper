@@ -42,6 +42,7 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 add_executable(leviathan-clipboard-helper
     src/main.cpp
+    src/usage_args.cpp
     src/pipe_server.cpp
     src/log.cpp
     src/session.cpp
