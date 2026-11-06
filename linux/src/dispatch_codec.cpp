@@ -86,6 +86,63 @@ std::vector<std::uint8_t> EncodeDataRequest(std::string_view             content
     return w.take();
 }
 
+static std::vector<std::uint8_t> EncodeLocalFileMetadata(const LocalFileMetadata& f) {
+    Writer w;
+    w.WriteStringField(proto::kFMFieldFileId, f.file_id);
+    w.WriteStringField(proto::kFMFieldFilename, f.filename);
+    w.WriteStringField(proto::kFMFieldRelativePath, f.relative_path);
+    w.WriteUint64Field(proto::kFMFieldFileSize, f.file_size);
+    w.WriteBoolField(proto::kFMFieldIsDirectory, f.is_directory);
+    return w.take();
+}
+
+std::vector<std::uint8_t> EncodeClipboardChangedFiles(const std::vector<LocalFileMetadata>& files,
+                                                      std::string_view content_hash,
+                                                      ClockFn          clock) {
+    Writer inner;
+    inner.WriteEnumField(proto::kCDFieldContentType,
+                         static_cast<std::int32_t>(ClipboardContentType::Files));
+    if (!content_hash.empty()) {
+        inner.WriteStringField(proto::kCDFieldContentHash, content_hash);
+    }
+    for (const auto& f : files) {
+        inner.WriteSubMessageField(proto::kCDFieldFiles, EncodeLocalFileMetadata(f));
+    }
+
+    Writer w;
+    w.WriteEnumField(proto::kFieldType,
+                     static_cast<std::int32_t>(HelperMessageType::ClipboardChanged));
+    w.WriteSubMessageField(proto::kFieldClipboardData, inner.take());
+    w.WriteUint64Field(proto::kFieldTimestamp, clock());
+    return w.take();
+}
+
+std::vector<std::uint8_t> EncodeFileChunkData(std::string_view    transfer_id,
+                                              std::string_view    file_id,
+                                              std::uint64_t       offset,
+                                              const std::uint8_t* data,
+                                              std::size_t         data_len,
+                                              bool                is_last,
+                                              std::string_view    error_msg,
+                                              ClockFn             clock) {
+    Writer inner;
+    inner.WriteStringField(proto::kFCDataFieldTransferId, transfer_id);
+    inner.WriteStringField(proto::kFCDataFieldFileId, file_id);
+    inner.WriteUint64Field(proto::kFCDataFieldOffset, offset);
+    if (data != nullptr) {
+        inner.WriteBytesField(proto::kFCDataFieldData, data, data_len);
+    }
+    inner.WriteBoolField(proto::kFCDataFieldIsLast, is_last);
+    inner.WriteStringField(proto::kFCDataFieldError, error_msg);
+
+    Writer w;
+    w.WriteEnumField(proto::kFieldType,
+                     static_cast<std::int32_t>(HelperMessageType::FileChunkData));
+    w.WriteSubMessageField(proto::kFieldFileChunkData, inner.take());
+    w.WriteUint64Field(proto::kFieldTimestamp, clock());
+    return w.take();
+}
+
 // ─── Decoders ────────────────────────────────────────────────────────────
 
 bool ParseHelperMessage(const std::vector<std::uint8_t>& in,
@@ -199,6 +256,41 @@ bool ParseProvideData(const std::uint8_t* data,
             std::size_t         n = 0;
             if (!r.ReadLengthDelim(p, n)) return false;
             out.data.assign(p, p + n);
+        } else {
+            if (!r.SkipField(wire)) return false;
+        }
+    }
+    return true;
+}
+
+bool ParseFileChunkRequest(const std::uint8_t*     data,
+                           std::size_t             len,
+                           ParsedFileChunkRequest& out) {
+    out = {};
+    Reader r(data, len);
+    while (!r.eof()) {
+        std::uint32_t field = 0;
+        WireType      wire  = WireType::Varint;
+        if (!r.ReadTag(field, wire)) return false;
+        if (field == proto::kFCReqFieldTransferId && wire == WireType::LengthDelim) {
+            const std::uint8_t* p = nullptr;
+            std::size_t         n = 0;
+            if (!r.ReadLengthDelim(p, n)) return false;
+            out.transfer_id.assign(reinterpret_cast<const char*>(p), n);
+        } else if (field == proto::kFCReqFieldFileId && wire == WireType::LengthDelim) {
+            const std::uint8_t* p = nullptr;
+            std::size_t         n = 0;
+            if (!r.ReadLengthDelim(p, n)) return false;
+            out.file_id.assign(reinterpret_cast<const char*>(p), n);
+        } else if (field == proto::kFCReqFieldOffset && wire == WireType::Varint) {
+            std::uint64_t v = 0;
+            if (!r.ReadVarint(v)) return false;
+            out.offset = v;
+        } else if (field == proto::kFCReqFieldSize && wire == WireType::Varint) {
+            std::uint64_t v = 0;
+            if (!r.ReadVarint(v)) return false;
+            // proto3 uint32 parsers truncate a wider varint to 32 bits.
+            out.size = static_cast<std::uint32_t>(v);
         } else {
             if (!r.SkipField(wire)) return false;
         }

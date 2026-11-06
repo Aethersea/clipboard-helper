@@ -44,6 +44,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -92,6 +93,7 @@ struct DelayedState {
     std::string                                      pending_data_hash;
     std::optional<std::string>                       cached_clipboard_text;
     std::function<void(const std::string&)>          on_changed;
+    std::function<void(const std::vector<std::string>&)> on_files_changed;
     std::function<void(const std::string&)>          on_request;
 };
 
@@ -468,6 +470,12 @@ public:
         state_->on_request = std::move(cb);
     }
 
+    void SetOnFilesChanged(
+            std::function<void(const std::vector<std::string>&)> cb) override {
+        std::lock_guard<std::mutex> g(state_->mu);
+        state_->on_files_changed = std::move(cb);
+    }
+
 private slots:
     void OnClipboardChanged() {
         auto* cb = QGuiApplication::clipboard();
@@ -475,12 +483,36 @@ private slots:
         const QMimeData* mime = cb->mimeData(QClipboard::Clipboard);
         if (mime == nullptr) return;
 
-        // CHEAP pointer-identity check first — skips the expensive text()
-        // call for our own AnnounceDelayed echo. If we triggered text()
-        // on our own DelayedClipboardMimeData, retrieveData would fire an
-        // unwanted DATA_REQUEST and block the main thread for up to 10s
-        // waiting on ProvideData.
+        // CHEAP pointer-identity check first — skips the expensive data
+        // reads below for our own AnnounceDelayed echo. If we triggered
+        // data()/text() on our own DelayedClipboardMimeData (a FILES
+        // announcement advertises text/uri-list), retrieveData would fire
+        // an unwanted DATA_REQUEST and block the main thread for up to
+        // 10s waiting on ProvideData. Must stay ahead of every read.
         if (echo_.IsAnnouncedMime(mime)) return;
+
+        // File-manager copy: text/uri-list whose every entry is a local
+        // file: URI. Anything else that offers a uri-list (a browser
+        // link, a remote file:// host) falls through to the text path
+        // exactly as before. Our own eager SetClipboardText only ever
+        // carries text/plain, so it can't land here.
+        if (mime->hasFormat(QStringLiteral("text/uri-list"))) {
+            const QByteArray raw = mime->data(QStringLiteral("text/uri-list"));
+            auto paths = uri_list::ParseLocalFileUriList(
+                std::string_view(raw.constData(), static_cast<std::size_t>(raw.size())));
+            if (paths) {
+                std::function<void(const std::vector<std::string>&)> files_fn;
+                {
+                    std::lock_guard<std::mutex> g(state_->mu);
+                    // GET_CLIPBOARD is text-only; the clipboard no longer
+                    // holds text we reported, so don't serve a stale one.
+                    state_->cached_clipboard_text.reset();
+                    files_fn = state_->on_files_changed;
+                }
+                if (files_fn) files_fn(*paths);
+                return;
+            }
+        }
 
         if (!mime->hasText()) return;
         const QString text = mime->text();

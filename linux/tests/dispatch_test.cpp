@@ -388,12 +388,13 @@ TEST(Dispatcher, UnknownMessageTypeReturnsError) {
               static_cast<int>(proto::HelperMessageType::Error));
 }
 
-TEST(Dispatcher, FileChunkRequestReturnsNotSupportedError) {
+TEST(Dispatcher, FileChunkRequestMissingPayloadReturnsError) {
     MockClipboardManager mock;
     ch::Dispatcher d(&mock, nullptr, [] {});
 
-    // FILES path is not implemented in P1: any file-chunk message acks
-    // with a non-fatal ERROR so the parent can detect missing support.
+    // FILE_CHUNK_REQUEST is served for local file copies (see
+    // dispatch_files_test.cpp), but a request with no body at all is
+    // malformed and is answered with an ERROR frame.
     const auto reply = d.Handle(BuildEnvelope(
         proto::HelperMessageType::FileChunkRequest, 0, nullptr));
 

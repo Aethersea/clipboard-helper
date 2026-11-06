@@ -1,8 +1,9 @@
 #pragma once
 //
 // uri_list_format — pure helpers for formatting file paths into
-// clipboard MIME payloads, shared by the Wayland (wlr / ext) and X11
-// backends.
+// clipboard MIME payloads (outbound paste) and for parsing a copied
+// text/uri-list back into local paths (inbound file copy), shared by
+// the Wayland (wlr / ext) and X11 backends.
 //
 // Both backends used to carry duplicate copies of the percent-encoder
 // and the text/uri-list / x-special/gnome-copied-files formatters.
@@ -15,6 +16,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -63,5 +65,32 @@ std::string FormatGnomeCopiedFiles(const std::vector<std::string>& paths);
 // retrieveData) should only ever pass MIMEs we advertised.
 std::vector<std::uint8_t> FormatForMime(const std::vector<std::uint8_t>& path_bytes,
                                         std::string_view mime);
+
+// ─── Inbound: text/uri-list → local paths ──────────────────────────────
+
+// Decode one `file:` URI into an absolute local path (raw bytes, so
+// non-UTF-8 file names survive). Accepted forms (scheme and host are
+// case-insensitive):
+//   file:///abs/path            (empty authority)
+//   file://localhost/abs/path
+//   file:/abs/path              (RFC 8089 authority-less form; some
+//                                KDE / older apps emit it)
+// Rejected (nullopt): any other scheme, a non-local host
+// (file://otherhost/...), a relative path, a query or fragment, a
+// malformed %XX escape, or an escape that decodes to NUL. Trailing '/'
+// is stripped (except for "/" itself) so a directory copied as
+// "file:///tmp/dir/" yields the same path — and the same basename —
+// as "file:///tmp/dir".
+std::optional<std::string> DecodeLocalFileUri(std::string_view uri);
+
+// Parse a text/uri-list payload (RFC 2483) as copied by a file manager.
+// Lines may end in CRLF or LF; blank lines and '#' comment lines are
+// ignored, as is surrounding whitespace / trailing NUL padding. Returns
+// the decoded absolute paths in list order iff EVERY remaining line is
+// a local `file:` URI (see DecodeLocalFileUri) and there is at least
+// one. Any other line — an https:// link copied from a browser, a
+// file:// URI on another host — returns nullopt so the caller keeps
+// treating the clipboard as TEXT.
+std::optional<std::vector<std::string>> ParseLocalFileUriList(std::string_view uri_list);
 
 }  // namespace leviathan::clipboard_helper::uri_list
