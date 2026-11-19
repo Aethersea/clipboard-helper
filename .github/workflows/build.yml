@@ -59,10 +59,17 @@ jobs:
       # regardless of Homebrew drift. The 1.34.1 tag ships a
       # Package@swift-5.10.swift manifest, so it builds on the stock toolchain.
       # If you bump the pin here, bump macos/Package.swift to match.
+      #
+      # The clone needs the submodules: on the macos-15 image (Swift 6.1)
+      # SwiftPM reads the tag's Package@swift-6.0.swift, which declares a
+      # `protoc` target under Sources/protobuf (the protobuf and abseil
+      # submodules). Without them the manifest is rejected ("target 'protoc'
+      # ... is empty") even though only protoc-gen-swift is built.
       - name: Build pinned protoc-gen-swift (1.34.1)
         run: |
           tag=1.34.1
           git clone --depth 1 --branch "$tag" \
+            --recurse-submodules --shallow-submodules \
             https://github.com/apple/swift-protobuf.git "$RUNNER_TEMP/swift-protobuf"
           swift build -c release \
             --package-path "$RUNNER_TEMP/swift-protobuf" \
