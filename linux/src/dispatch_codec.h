@@ -8,9 +8,11 @@
 // inbound frames) stays in dispatch.cpp; only the free functions that
 // move bytes in and out of the schema live here.
 //
-// Linux subset of the Windows dispatch_codec — P1 covers TEXT (plus the
-// generic envelope plumbing). IMAGE / FILES / FILE_CHUNK encoders/parsers
-// will land alongside the Wayland backend in the next PR.
+// Linux subset of the Windows dispatch_codec: TEXT plus the generic
+// envelope plumbing, CLIPBOARD_CHANGED(FILES) for local file copies, and
+// the FILE_CHUNK_REQUEST / FILE_CHUNK_DATA pair used to serve those
+// files to the parent. (SET_CLIPBOARD with FILES is not supported on
+// Linux, so there is no inbound FileMetadata parser.)
 //
 // Field numbers and enums come from helper_proto.h.
 
@@ -58,6 +60,35 @@ std::vector<std::uint8_t> EncodeDataRequest(std::string_view             content
                                             proto::ClipboardContentType content_type,
                                             ClockFn                      clock = &NowUnixMillis);
 
+// One entry of a CLIPBOARD_CHANGED(FILES) frame — the FileMetadata
+// fields the Linux helper fills (same subset as the macOS helper's
+// clipboardDataFromFileURLs). mime_type / checksum_sha256 stay empty.
+struct LocalFileMetadata {
+    std::string   file_id;        // decimal index "0", "1", …
+    std::string   filename;       // basename
+    std::string   relative_path;  // absolute local path
+    std::uint64_t file_size{0};
+    bool          is_directory{false};
+};
+
+// CLIPBOARD_CHANGED(files): pushed when the user copies files in a file
+// manager. payload stays empty; the parent pulls the bytes later via
+// FILE_CHUNK_REQUEST keyed by file_id.
+std::vector<std::uint8_t> EncodeClipboardChangedFiles(const std::vector<LocalFileMetadata>& files,
+                                                      std::string_view content_hash,
+                                                      ClockFn          clock = &NowUnixMillis);
+
+// FILE_CHUNK_DATA: the helper's reply to a FILE_CHUNK_REQUEST. On error
+// pass empty data, is_last=true and a non-empty `error_msg`.
+std::vector<std::uint8_t> EncodeFileChunkData(std::string_view    transfer_id,
+                                              std::string_view    file_id,
+                                              std::uint64_t       offset,
+                                              const std::uint8_t* data,
+                                              std::size_t         data_len,
+                                              bool                is_last,
+                                              std::string_view    error_msg,
+                                              ClockFn             clock = &NowUnixMillis);
+
 // ─── Parsed structs ─────────────────────────────────────────────────────
 //
 // Each Parse* function fills its corresponding Parsed* POD. Pointer
@@ -97,6 +128,13 @@ struct ParsedProvideData {
     std::vector<std::uint8_t>   data;
 };
 
+struct ParsedFileChunkRequest {
+    std::string   transfer_id;
+    std::string   file_id;
+    std::uint64_t offset{0};
+    std::uint32_t size{0};  // 0 = use the 262144-byte default
+};
+
 // ─── Decoders ────────────────────────────────────────────────────────────
 
 // Parse a HelperMessage envelope. Returns false on malformed wire
@@ -115,5 +153,9 @@ bool ParseAnnouncement(const std::uint8_t* data,
 bool ParseProvideData(const std::uint8_t* data,
                       std::size_t         len,
                       ParsedProvideData&  out);
+
+bool ParseFileChunkRequest(const std::uint8_t*     data,
+                           std::size_t             len,
+                           ParsedFileChunkRequest& out);
 
 }  // namespace leviathan::clipboard_helper::dispatch_codec

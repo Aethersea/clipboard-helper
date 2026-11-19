@@ -3,11 +3,10 @@
 // clipboard_manager — abstraction over the underlying clipboard backend
 // (Wayland ext-data-control / wlr-data-control or X11 xcb QClipboard).
 //
-// Status (P1 PR): this header defines the contract. The two real
-// backends are stubbed by MakeStubManager() which logs every call but
-// does not touch any real clipboard. The actual Wayland / X11
-// implementations land in the next PR — they're the highest-risk
-// technical work in the plan and deserve their own focused review.
+// This header defines the contract. Real backends: X11 (QClipboard),
+// ext-data-control-v1 and wlr-data-control-unstable-v1. MakeStubManager()
+// logs every call without touching a clipboard (fallback when no backend
+// initialises, and for IPC-layer tests).
 //
 // Threading: every method is callable from any thread. Implementations
 // that need to run code on the Qt event loop thread should marshal
@@ -88,6 +87,26 @@ public:
     // problem documented in the macOS helper's PasteboardManager).
     virtual void SetOnClipboardChanged(std::function<void(const std::string&)> cb) = 0;
 
+    // Called instead of the text callback when an external change offers
+    // text/uri-list and every URI in it is a local `file:` URI (see
+    // uri_list::ParseLocalFileUriList) — i.e. the user copied files in a
+    // file manager. `abs_paths` are the decoded absolute paths in list
+    // order; they are NOT checked for existence here. The backend only
+    // detects and decodes; the Dispatcher stats the paths, builds the
+    // FILES frame and keeps the file_id → path map for
+    // FILE_CHUNK_REQUEST, so the wire shape is identical on every
+    // backend. Same echo-suppression rule as SetOnClipboardChanged: our
+    // own AnnounceDelayedFiles (which advertises text/uri-list) must
+    // never come back through here.
+    //
+    // Not pure: the default ignores the callback, so a manager that
+    // cannot see file copies (or a test double) keeps compiling and
+    // simply never reports FILES.
+    virtual void SetOnFilesChanged(
+            std::function<void(const std::vector<std::string>& abs_paths)> cb) {
+        (void)cb;
+    }
+
     // Called when the OS asks us to materialise a delayed-render
     // payload (someone pasted from our advertised slot). The callback
     // is invoked with the content_hash; the implementation blocks
@@ -98,8 +117,8 @@ public:
 
 // Factory: a stub ClipboardManager that logs every call but performs
 // no real clipboard I/O. Useful for:
-//   - P1 PR: lets us wire dispatch + main without committing to a
-//     specific Wayland / X11 binding yet.
+//   - Fallback when no real backend initialises, so the IPC layer still
+//     answers the parent.
 //   - Unit tests for dispatch_codec / socket_server end-to-end.
 //   - Future smoke tests of the IPC layer that don't need a display.
 std::unique_ptr<ClipboardManager> MakeStubManager();

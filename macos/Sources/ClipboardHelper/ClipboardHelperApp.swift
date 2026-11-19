@@ -81,6 +81,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// content_hash won't match any session and the download keeps
     /// going.
     private var dcTransferIDForCurrentAnnouncement: String?
+    /// dcTransfer UUID whose FILE_TRANSFER_PROGRESS frames are allowed to
+    /// extend the current `.fileURL` paste's stall deadline.  Adopted from
+    /// the first non-empty frame after a paste starts / an announcement
+    /// arrives; cleared at those same points.  Kept separate from
+    /// `dcTransferIDForCurrentAnnouncement`, which the NSFilePromiseProvider
+    /// KVO bridge also writes (with the announcement's transfer_id, not a
+    /// dcTransfer UUID) for cancel routing.
+    private var stallTrackingTransferID: String?
     /// Retained for lifetime of the helper — cancelling the source unregisters
     /// the kqueue watch, so it must outlive setupParentPidWatchdog's scope.
     private var parentPidWatcher: DispatchSourceProcess?
@@ -158,6 +166,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // now and the FIRST progress frame of the NEW session would
             // otherwise route to the stale UUID and silently miss.
             self.dcTransferIDForCurrentAnnouncement = nil
+            self.stallTrackingTransferID = nil
             self.ensureProgressPanelVisible()
         }
 
@@ -254,6 +263,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     // click after this point doesn't try to cancel the
                     // OLD session's UUID and miss the new one.
                     self.dcTransferIDForCurrentAnnouncement = nil
+                    self.stallTrackingTransferID = nil
                     self.pasteboardManager.announceDelayed(ann)
                 }
             }
@@ -311,6 +321,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Handle file transfer progress from the Go parent process.
     /// Shows or updates a floating progress panel during file downloads.
     private func handleFileTransferProgress(_ progress: Leviathan_HelperFileTransferProgress) {
+        // Every frame — progress or terminal — is proof the upstream
+        // transfer is alive; push the `.fileURL` paste's stall deadline out
+        // so a large file that is still moving is never abandoned.  Only
+        // frames from the transfer this paste adopted count: the first
+        // non-empty transferID after the paste started is adopted, and a
+        // late frame from an earlier (cancelled / superseded) transfer
+        // must not keep a dead wait alive.
+        if let tracked = stallTrackingTransferID,
+           !progress.transferID.isEmpty,
+           tracked != progress.transferID {
+            Log.debug("[FileTransfer] Ignoring progress frame for transfer \(progress.transferID) (tracking \(tracked))")
+        } else {
+            if stallTrackingTransferID == nil, !progress.transferID.isEmpty {
+                stallTrackingTransferID = progress.transferID
+            }
+            pasteboardManager.noteFileTransferProgress()
+        }
+
         // Capture the dcTransfer-side UUID for cancel routing.  Leviathan
         // generates its own session UUID inside handleFileTransferToClient,
         // which differs from the announcement's content_hash; a

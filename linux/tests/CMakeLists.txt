@@ -19,6 +19,11 @@ add_executable(clipboard_helper_tests
     uri_list_format_test.cpp
     webp_decode_test.cpp
     echo_suppressor_test.cpp
+    uri_list_parse_test.cpp
+    dispatch_codec_files_test.cpp
+    dispatch_files_test.cpp
+    x11_manager_test.cpp
+    x11_dispatch_integration_test.cpp
     ${CMAKE_SOURCE_DIR}/src/proto_wire.cpp
     ${CMAKE_SOURCE_DIR}/src/backend_detector.cpp
     ${CMAKE_SOURCE_DIR}/src/log.cpp
@@ -29,6 +34,7 @@ add_executable(clipboard_helper_tests
     ${CMAKE_SOURCE_DIR}/src/uri_list_format.cpp
     ${CMAKE_SOURCE_DIR}/src/webp_decode.cpp
     ${CMAKE_SOURCE_DIR}/src/echo_suppressor.cpp
+    ${CMAKE_SOURCE_DIR}/src/clipboard_manager_x11.cpp
 )
 
 target_include_directories(clipboard_helper_tests PRIVATE
@@ -49,6 +55,7 @@ target_compile_options(clipboard_helper_tests PRIVATE
 target_link_libraries(clipboard_helper_tests PRIVATE
     PkgConfig::LIBWEBP
     Qt6::Core
+    Qt6::Gui
     pthread
 )
 

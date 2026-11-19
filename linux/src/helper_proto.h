@@ -81,9 +81,8 @@ constexpr std::uint32_t kReqFieldContentType = 2;
 constexpr std::uint32_t kPDFieldContentHash  = 1;
 constexpr std::uint32_t kPDFieldData         = 2;
 
-// FileMetadata field numbers (Proto/clipboard.proto). Referenced by future
-// FILES-path encoders/decoders; included for completeness so the constants
-// don't drift between platforms.
+// FileMetadata field numbers (Proto/clipboard.proto). Used by the
+// CLIPBOARD_CHANGED(FILES) encoder for local file copies.
 constexpr std::uint32_t kFMFieldFileId        = 1;
 constexpr std::uint32_t kFMFieldFilename      = 2;
 constexpr std::uint32_t kFMFieldRelativePath  = 3;
@@ -91,5 +90,30 @@ constexpr std::uint32_t kFMFieldFileSize      = 4;
 constexpr std::uint32_t kFMFieldMimeType      = 5;
 constexpr std::uint32_t kFMFieldChecksum      = 6;
 constexpr std::uint32_t kFMFieldIsDirectory   = 7;
+
+// HelperFileChunkRequest field numbers (Proto/clipboard_helper.proto).
+// Names match windows/src/helper_proto.h.
+constexpr std::uint32_t kFCReqFieldTransferId = 1;
+constexpr std::uint32_t kFCReqFieldFileId     = 2;
+constexpr std::uint32_t kFCReqFieldOffset     = 3;
+constexpr std::uint32_t kFCReqFieldSize       = 4;
+
+// HelperFileChunkData field numbers (Proto/clipboard_helper.proto).
+constexpr std::uint32_t kFCDataFieldTransferId = 1;
+constexpr std::uint32_t kFCDataFieldFileId     = 2;
+constexpr std::uint32_t kFCDataFieldOffset     = 3;
+constexpr std::uint32_t kFCDataFieldData       = 4;
+constexpr std::uint32_t kFCDataFieldIsLast     = 5;
+constexpr std::uint32_t kFCDataFieldError      = 6;
+
+// HelperFileTransferProgress field numbers (Proto/clipboard_helper.proto).
+// The Linux helper accepts and ignores progress frames (no progress UI),
+// so nothing decodes these yet; listed so the constants don't drift.
+constexpr std::uint32_t kFTPFieldTransferId       = 1;
+constexpr std::uint32_t kFTPFieldBytesTransferred = 2;
+constexpr std::uint32_t kFTPFieldTotalBytes       = 3;
+constexpr std::uint32_t kFTPFieldIsComplete       = 4;
+constexpr std::uint32_t kFTPFieldSuccess          = 5;
+constexpr std::uint32_t kFTPFieldErrorMessage     = 6;
 
 }  // namespace leviathan::clipboard_helper::proto
