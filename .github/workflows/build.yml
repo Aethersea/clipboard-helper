@@ -12,20 +12,21 @@ on:
 jobs:
   build-macos:
     name: macOS (universal)
-    runs-on: macos-14  # Apple Silicon runner (arm64)
+    # macos-14 images were retired from GitHub Actions on 2026-11-02.
+    runs-on: macos-15  # Apple Silicon runner (arm64)
     defaults:
       run:
         working-directory: macos
     steps:
       - uses: actions/checkout@v6
 
-      # macos-14 (Sonoma, arm64) ships Xcode 15+ which bundles Swift 5.9+.
+      # The macos-15 (arm64) image's default Xcode bundles Swift 5.9+.
       # We rely on the runner-default Xcode rather than a third-party setup
       # action — fwal/setup-swift is unmaintained (Node 16 runtime) and the
       # alternatives all still ship Node 20 actions that GitHub will be
       # force-migrating to Node 24 starting 2026-06-02. Don't pin an
       # /Applications/Xcode_<ver>.app path: those drop out of runner images
-      # on a faster cadence than the Sonoma image itself. swift --version
+      # on a faster cadence than the runner image itself. swift --version
       # fails fast if a future image regresses below 5.9.
       - name: Verify Swift toolchain (≥ 5.9)
         run: |
@@ -50,18 +51,25 @@ jobs:
       # Build protoc-gen-swift from a PINNED swift-protobuf tag instead of the
       # rolling Homebrew bottle. As of 1.38.0, protoc-gen-swift emits
       # type-/extension-level `nonisolated` modifiers (SE-0449), which the
-      # macos-14 runner's stock Swift 5.10 rejects ("'nonisolated' modifier
-      # cannot be applied to this declaration"). Pinning the generator to
+      # retired macos-14 runner's stock Swift 5.10 rejected ("'nonisolated'
+      # modifier cannot be applied to this declaration"). Pinning the generator to
       # 1.34.1 — the same version SwiftPM resolves for the runtime on Swift
       # 5.10 (see macos/Package.swift) — keeps generated code, the linked
       # runtime, and the compiler in lockstep and makes the build reproducible
       # regardless of Homebrew drift. The 1.34.1 tag ships a
       # Package@swift-5.10.swift manifest, so it builds on the stock toolchain.
       # If you bump the pin here, bump macos/Package.swift to match.
+      #
+      # The clone needs the submodules: on the macos-15 image (Swift 6.1)
+      # SwiftPM reads the tag's Package@swift-6.0.swift, which declares a
+      # `protoc` target under Sources/protobuf (the protobuf and abseil
+      # submodules). Without them the manifest is rejected ("target 'protoc'
+      # ... is empty") even though only protoc-gen-swift is built.
       - name: Build pinned protoc-gen-swift (1.34.1)
         run: |
           tag=1.34.1
           git clone --depth 1 --branch "$tag" \
+            --recurse-submodules --shallow-submodules \
             https://github.com/apple/swift-protobuf.git "$RUNNER_TEMP/swift-protobuf"
           swift build -c release \
             --package-path "$RUNNER_TEMP/swift-protobuf" \

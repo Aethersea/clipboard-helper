@@ -66,6 +66,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -122,7 +123,18 @@ const char* const kFilesMimeTypes[] = {
     "x-special/gnome-copied-files",
 };
 
+// Inbound: the MIME a file manager's copy is recognised by.
+constexpr const char kUriListMime[] = "text/uri-list";
+
 constexpr std::chrono::seconds kProvideDataWait{10};
+
+// How long a selection source may go without writing anything to our
+// receive pipes before we give up on it, so a wedged source can't pin a
+// worker thread forever.
+constexpr int kReceiveIdleTimeoutMs = 10000;
+
+// 16 MiB, matching the IPC frame size cap.
+constexpr std::size_t kReceiveCap = 16 * 1024 * 1024;
 
 // Convert PROVIDE_DATA payload (newline-joined LOCAL absolute paths,
 // the format the macOS helper's send_provide_data_file_paths produces
@@ -200,20 +212,62 @@ bool WriteAll(int fd, const std::uint8_t* data, std::size_t len) {
     return true;
 }
 
-bool DrainFd(int fd, std::vector<std::uint8_t>& out, std::size_t cap) {
-    std::uint8_t buf[4096];
-    while (out.size() < cap) {
-        const ssize_t n = ::read(fd, buf,
-            std::min(sizeof(buf), cap - out.size()));
-        if (n > 0) {
-            out.insert(out.end(), buf, buf + n);
-            continue;
-        }
-        if (n == 0) return true;
-        if (errno == EINTR) continue;
-        return false;
+// One pipe read end being drained by DrainPipes.
+struct PipeSink {
+    int                       fd{-1};   // -1 = not requested
+    std::vector<std::uint8_t> bytes;
+    bool                      ok{false};  // true once EOF (or the cap) is reached
+};
+
+// Drain every requested pipe until EOF or `cap` bytes, concurrently via
+// poll(). Concurrent rather than one after the other because the source
+// serves each receive request on its own: a source that writes the
+// second MIME first would fill that pipe's buffer and block while we
+// blocked waiting for EOF on the first. Does not close the fds.
+void DrainPipes(PipeSink* sinks, std::size_t count, std::size_t cap) {
+    std::vector<std::size_t> open;
+    for (std::size_t i = 0; i < count; ++i) {
+        if (sinks[i].fd >= 0) open.push_back(i);
     }
-    return true;
+    std::uint8_t buf[4096];
+    while (!open.empty()) {
+        std::vector<pollfd> pfds;
+        for (const std::size_t i : open) pfds.push_back(pollfd{sinks[i].fd, POLLIN, 0});
+        const int pr = ::poll(pfds.data(), static_cast<nfds_t>(pfds.size()),
+                              kReceiveIdleTimeoutMs);
+        if (pr < 0 && errno == EINTR) continue;
+        if (pr <= 0) {
+            // Error or idle timeout: everything still open stays !ok.
+            LH_LOG_WARN("[ext] selection source stalled or poll failed; "
+                        "dropping the clipboard change");
+            return;
+        }
+        std::vector<std::size_t> still_open;
+        for (std::size_t k = 0; k < pfds.size(); ++k) {
+            PipeSink& s = sinks[open[k]];
+            if (pfds[k].revents == 0) {
+                still_open.push_back(open[k]);
+                continue;
+            }
+            // POLLIN / POLLHUP / POLLERR all resolve through read():
+            // data, 0 = EOF, or -1 = error. Ready, so it won't block.
+            const ssize_t n = ::read(s.fd, buf, std::min(sizeof(buf), cap - s.bytes.size()));
+            if (n > 0) {
+                s.bytes.insert(s.bytes.end(), buf, buf + n);
+                if (s.bytes.size() >= cap) {
+                    s.ok = true;  // truncated at the cap; the rest is dropped
+                } else {
+                    still_open.push_back(open[k]);
+                }
+            } else if (n == 0) {
+                s.ok = true;
+            } else if (errno == EINTR || errno == EAGAIN) {
+                still_open.push_back(open[k]);
+            }
+            // else: read error, leave !ok and stop polling this fd.
+        }
+        open.swap(still_open);
+    }
 }
 
 // State shared between the manager (lives on the main thread) and the
@@ -231,6 +285,7 @@ struct ExtState {
     std::string                                      pending_data_hash;
     std::optional<std::string>                       cached_clipboard_text;
     std::function<void(const std::string&)>          on_changed;
+    std::function<void(const std::vector<std::string>&)> on_files_changed;
     std::function<void(const std::string&)>          on_request;
 };
 
@@ -309,19 +364,46 @@ void WaitAndWriteOnWorker(std::shared_ptr<ExtState> state,
     ::close(fd);
 }
 
-// Worker: drain a pipe fd that holds incoming clipboard data, then
-// dispatch the resulting text to on_changed and cache it. Always
-// closes fd.
-void DrainAndDispatchOnWorker(std::shared_ptr<ExtState> state, int fd) {
-    std::vector<std::uint8_t> buf;
-    // Cap at 16 MiB to match the IPC frame size cap.
-    const bool ok = DrainFd(fd, buf, 16 * 1024 * 1024);
-    ::close(fd);
+// Worker: drain the receive pipes of an external selection, then
+// dispatch. `uri_fd` carries text/uri-list and `text_fd` the chosen
+// text MIME; either may be -1 (not offered). If the uri-list is
+// entirely local file: URIs the change goes to on_files_changed;
+// otherwise the text rendering goes to on_changed (and is cached),
+// exactly as before uri-list detection existed. Always closes both fds.
+void ReceiveAndDispatchOnWorker(std::shared_ptr<ExtState> state, int uri_fd, int text_fd) {
+    PipeSink sinks[2];
+    sinks[0].fd = uri_fd;
+    sinks[1].fd = text_fd;
+    // Both pipes are drained to EOF (up to the cap) even when only one
+    // turns out to be needed, so the source doesn't hit EPIPE / SIGPIPE
+    // on the one we'd otherwise abandon.
+    DrainPipes(sinks, 2, kReceiveCap);
+    if (uri_fd >= 0) ::close(uri_fd);
+    if (text_fd >= 0) ::close(text_fd);
 
     if (state->stop.load(std::memory_order_acquire)) return;
-    if (!ok) return;
 
-    std::string text(buf.begin(), buf.end());
+    if (sinks[0].ok) {
+        const auto& raw = sinks[0].bytes;
+        auto paths = uri_list::ParseLocalFileUriList(
+            std::string_view(reinterpret_cast<const char*>(raw.data()), raw.size()));
+        if (paths) {
+            std::function<void(const std::vector<std::string>&)> files_cb;
+            {
+                std::lock_guard<std::mutex> g(state->mu);
+                // GET_CLIPBOARD is text-only; don't keep serving the
+                // text of a change the clipboard no longer holds.
+                state->cached_clipboard_text.reset();
+                files_cb = state->on_files_changed;
+            }
+            if (files_cb) files_cb(*paths);
+            return;
+        }
+    }
+
+    if (!sinks[1].ok) return;
+
+    std::string text(sinks[1].bytes.begin(), sinks[1].bytes.end());
     std::function<void(const std::string&)> cb;
     {
         std::lock_guard<std::mutex> g(state->mu);
@@ -514,6 +596,12 @@ public:
     void SetOnDataRequest(std::function<void(const std::string&)> cb) override {
         std::lock_guard<std::mutex> g(state_->mu);
         state_->on_request = std::move(cb);
+    }
+
+    void SetOnFilesChanged(
+            std::function<void(const std::vector<std::string>&)> cb) override {
+        std::lock_guard<std::mutex> g(state_->mu);
+        state_->on_files_changed = std::move(cb);
     }
 
 private:
@@ -716,7 +804,15 @@ private:
         // set_selection, the compositor echoes a selection event back.
         // Don't recurse — but still destroy any straggling unselected
         // offers (the compositor may have introduced several before
-        // this selection landed) so we don't leak them.
+        // this selection landed) so we don't leak them. This covers our
+        // FILES announcements too: their text/uri-list is never read.
+        //
+        // current_source_ is reliably cleared before a foreign selection
+        // is handled: compositors cancel the old selection source before
+        // announcing the new selection (same connection, so the events
+        // arrive in that order), and we dispatch on the main thread,
+        // where OnSourceCancelled's InvokeOnMain runs inline rather than
+        // being queued.
         const bool from_us = (current_source_ != nullptr);
         if (from_us) {
             DrainOtherOffers(/*keep=*/nullptr);  // includes `offer`
@@ -732,32 +828,49 @@ private:
         // since we'll destroy it after issuing receive().
         offer_mimes_.erase(offer);
 
-        const char* chosen = nullptr;
+        // A file manager's copy offers text/uri-list beside a text
+        // rendering of the paths. Receive both (receive may be issued
+        // more than once per offer): the worker reports FILES when the
+        // uri-list is all local file: URIs and otherwise falls back to
+        // the text, so browser links etc. still arrive as TEXT.
+        const bool  want_uri_list = mimes.count(kUriListMime) > 0;
+        const char* text_mime     = nullptr;
         for (const char* candidate : kTextMimeTypes) {
-            if (mimes.count(candidate)) { chosen = candidate; break; }
+            if (mimes.count(candidate)) { text_mime = candidate; break; }
         }
-        if (chosen == nullptr) {
-            // No text representation; ignore.
+        if (!want_uri_list && text_mime == nullptr) {
+            // Neither files nor text; ignore.
             ext_data_control_offer_v1_destroy(offer);
             return;
         }
 
+        const int uri_fd  = want_uri_list ? ReceiveToPipe(offer, kUriListMime) : -1;
+        const int text_fd = (text_mime != nullptr) ? ReceiveToPipe(offer, text_mime) : -1;
+        if (display_) display_->Flush();
+
+        ext_data_control_offer_v1_destroy(offer);
+
+        if (uri_fd < 0 && text_fd < 0) return;  // pipe2 failed (logged)
+
+        // Worker captures shared_ptr<state>, not `this`.
+        std::thread(ReceiveAndDispatchOnWorker, state_, uri_fd, text_fd).detach();
+    }
+
+    // Ask the selection source to write `mime` into a fresh pipe and
+    // return its read end, or -1 if the pipe could not be created (no
+    // request sent). The write end is closed right away: libwayland has
+    // already dup'ed it into the outgoing request.
+    int ReceiveToPipe(struct ext_data_control_offer_v1* offer, const char* mime) {
         int pipefd[2];
         if (::pipe2(pipefd, O_CLOEXEC) != 0) {
             std::ostringstream m;
             m << "pipe2 failed: " << std::strerror(errno);
             LH_LOG_ERROR(m.str());
-            ext_data_control_offer_v1_destroy(offer);
-            return;
+            return -1;
         }
-        ext_data_control_offer_v1_receive(offer, chosen, pipefd[1]);
+        ext_data_control_offer_v1_receive(offer, mime, pipefd[1]);
         ::close(pipefd[1]);
-        if (display_) display_->Flush();
-
-        ext_data_control_offer_v1_destroy(offer);
-
-        // Worker captures shared_ptr<state>, not `this`.
-        std::thread(DrainAndDispatchOnWorker, state_, pipefd[0]).detach();
+        return pipefd[0];
     }
 
     // ── ext-data-control listener tables (must be visible to C) ──

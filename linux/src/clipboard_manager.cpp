@@ -90,6 +90,14 @@ public:
         on_request_ = std::move(cb);
     }
 
+    void SetOnFilesChanged(
+            std::function<void(const std::vector<std::string>&)> cb) override {
+        // Stored for symmetry with the other callbacks; the stub never
+        // observes a clipboard, so it never fires.
+        std::lock_guard<std::mutex> g(mu_);
+        on_files_changed_ = std::move(cb);
+    }
+
 private:
     // Compact the SHA-256 hex hash for logging — first 8 chars is
     // enough to distinguish hashes in a session log and matches the
@@ -103,6 +111,7 @@ private:
     std::string                                      pending_hash_;
     std::function<void(const std::string&)>          on_changed_;
     std::function<void(const std::string&)>          on_request_;
+    std::function<void(const std::vector<std::string>&)> on_files_changed_;
 };
 
 }  // namespace

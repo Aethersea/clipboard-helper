@@ -45,6 +45,12 @@
 // main thread, for both the Record* calls — done from inside
 // InvokeOnMain lambdas — and the IsAnnouncedMime/ConsumeEagerSetTextEcho
 // checks from the dataChanged slot).
+//
+// Ordering: Record* MUST be called BEFORE QClipboard::setMimeData. The
+// xcb QPA emits dataChanged synchronously from inside setMimeData, so
+// the slot runs before setMimeData returns; an expectation recorded
+// afterwards is never seen and every self-set leaks out as a "local
+// change" (issue #12).
 
 #include <QMimeData>
 #include <QPointer>
@@ -58,13 +64,13 @@ class EchoSuppressor {
 public:
     // ─── Recording self-set expectations ────────────────────────────────────
 
-    // Eager-set: record the UTF-8 text we just placed on the clipboard via
-    // SetClipboardText. The next dataChanged carrying the same text is
-    // treated as our echo and consumed.
+    // Eager-set: record the UTF-8 text we are about to place on the
+    // clipboard via SetClipboardText. The next dataChanged carrying the
+    // same text is treated as our echo and consumed.
     void RecordEagerSetText(std::string utf8);
 
-    // Delayed-announce: record the QMimeData object we just placed on the
-    // clipboard. Subsequent dataChanged events whose current mime IS this
+    // Delayed-announce: record the QMimeData object we are about to place
+    // on the clipboard. Subsequent dataChanged events whose current mime IS this
     // object are treated as our echo. The QPointer auto-nulls when Qt
     // destroys the object (which happens when another clipboard owner
     // replaces it).

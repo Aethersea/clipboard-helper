@@ -44,6 +44,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -92,6 +93,7 @@ struct DelayedState {
     std::string                                      pending_data_hash;
     std::optional<std::string>                       cached_clipboard_text;
     std::function<void(const std::string&)>          on_changed;
+    std::function<void(const std::vector<std::string>&)> on_files_changed;
     std::function<void(const std::string&)>          on_request;
 };
 
@@ -333,16 +335,18 @@ public:
         // QMimeData with the text already in it. Faster path; the
         // delayed flow is reserved for ANNOUNCE_DELAYED. echo_ is
         // single-threaded (main-thread only), so RecordEagerSetText is
-        // called from inside the lambda — after setMimeData but still
-        // on the same thread as OnClipboardChanged that will later read it.
+        // called from inside the lambda, and BEFORE setMimeData: the xcb
+        // QPA emits QClipboard::dataChanged synchronously from inside
+        // setMimeData, so OnClipboardChanged runs before setMimeData
+        // returns and must already see the expectation.
         const QString text = QString::fromUtf8(utf8.c_str(), static_cast<qsizetype>(utf8.size()));
         InvokeOnMain([this, text, utf8] {
             auto* cb = QGuiApplication::clipboard();
             if (cb == nullptr) return;
             auto* mime = new QMimeData;
             mime->setText(text);
-            cb->setMimeData(mime, QClipboard::Clipboard);
             echo_.RecordEagerSetText(utf8);
+            cb->setMimeData(mime, QClipboard::Clipboard);
         }, /*context=*/this);
     }
 
@@ -363,11 +367,11 @@ public:
                                   QImage::Format_RGBA8888)
                                .copy();
 
-        // Capture the QMimeData pointer inside the lambda so we can record
-        // it with echo_ AFTER setMimeData. Pointer-identity echo suppression
-        // is robust against external copies arriving before our own echo
-        // (see EchoSuppressor docs) — replaces the previous one-shot flag
-        // that consumed unconditionally on the next dataChanged.
+        // Record the QMimeData pointer with echo_ BEFORE setMimeData: the
+        // xcb QPA emits dataChanged synchronously from inside setMimeData,
+        // so recording afterwards misses our own echo. Pointer-identity
+        // echo suppression is robust against external copies arriving
+        // after our own set (see EchoSuppressor docs).
         InvokeOnMain([this, img] {
             auto* cb = QGuiApplication::clipboard();
             if (cb == nullptr) return;
@@ -376,8 +380,8 @@ public:
             // plumbing — pasters get all three.
             auto* mime = new QMimeData;
             mime->setImageData(img);
-            cb->setMimeData(mime, QClipboard::Clipboard);
             echo_.RecordAnnouncedMime(mime);
+            cb->setMimeData(mime, QClipboard::Clipboard);
         }, /*context=*/this);
     }
 
@@ -396,7 +400,9 @@ public:
     void AnnounceDelayed(const std::string& content_hash, ContentKind kind) {
         std::ostringstream m;
         m << "[x11] AnnounceDelayed"
-          << (kind == ContentKind::Image ? "Image" : "Text")
+          << (kind == ContentKind::Image   ? "Image"
+              : kind == ContentKind::Files ? "Files"
+                                           : "Text")
           << "(hash=" << ShortHash(content_hash) << ")";
         LH_LOG_INFO(m.str());
 
@@ -416,12 +422,16 @@ public:
             // Each set_selection-equivalent requires a fresh QMimeData;
             // Qt takes ownership and deletes the previous one.
             auto* mime = new DelayedClipboardMimeData(state, content_hash, kind);
-            cb->setMimeData(mime, QClipboard::Clipboard);
-            // Record pointer-identity for echo suppression. The QPointer
-            // auto-nulls when Qt later destroys this mime (i.e., another
-            // owner replaces it), so the expectation correctly expires
-            // without us needing a notification.
+            // Record pointer-identity for echo suppression BEFORE
+            // setMimeData: the xcb QPA emits dataChanged synchronously
+            // from inside setMimeData, and OnClipboardChanged must
+            // recognise its own announcement without calling text() on
+            // it (that would fire DATA_REQUEST before anyone pastes). The
+            // QPointer auto-nulls when Qt later destroys this mime (i.e.,
+            // another owner replaces it), so the expectation correctly
+            // expires without us needing a notification.
             echo_.RecordAnnouncedMime(mime);
+            cb->setMimeData(mime, QClipboard::Clipboard);
         }, /*context=*/this);
     }
 
@@ -460,6 +470,12 @@ public:
         state_->on_request = std::move(cb);
     }
 
+    void SetOnFilesChanged(
+            std::function<void(const std::vector<std::string>&)> cb) override {
+        std::lock_guard<std::mutex> g(state_->mu);
+        state_->on_files_changed = std::move(cb);
+    }
+
 private slots:
     void OnClipboardChanged() {
         auto* cb = QGuiApplication::clipboard();
@@ -467,12 +483,36 @@ private slots:
         const QMimeData* mime = cb->mimeData(QClipboard::Clipboard);
         if (mime == nullptr) return;
 
-        // CHEAP pointer-identity check first — skips the expensive text()
-        // call for our own AnnounceDelayed echo. If we triggered text()
-        // on our own DelayedClipboardMimeData, retrieveData would fire an
-        // unwanted DATA_REQUEST and block the main thread for up to 10s
-        // waiting on ProvideData.
+        // CHEAP pointer-identity check first — skips the expensive data
+        // reads below for our own AnnounceDelayed echo. If we triggered
+        // data()/text() on our own DelayedClipboardMimeData (a FILES
+        // announcement advertises text/uri-list), retrieveData would fire
+        // an unwanted DATA_REQUEST and block the main thread for up to
+        // 10s waiting on ProvideData. Must stay ahead of every read.
         if (echo_.IsAnnouncedMime(mime)) return;
+
+        // File-manager copy: text/uri-list whose every entry is a local
+        // file: URI. Anything else that offers a uri-list (a browser
+        // link, a remote file:// host) falls through to the text path
+        // exactly as before. Our own eager SetClipboardText only ever
+        // carries text/plain, so it can't land here.
+        if (mime->hasFormat(QStringLiteral("text/uri-list"))) {
+            const QByteArray raw = mime->data(QStringLiteral("text/uri-list"));
+            auto paths = uri_list::ParseLocalFileUriList(
+                std::string_view(raw.constData(), static_cast<std::size_t>(raw.size())));
+            if (paths) {
+                std::function<void(const std::vector<std::string>&)> files_fn;
+                {
+                    std::lock_guard<std::mutex> g(state_->mu);
+                    // GET_CLIPBOARD is text-only; the clipboard no longer
+                    // holds text we reported, so don't serve a stale one.
+                    state_->cached_clipboard_text.reset();
+                    files_fn = state_->on_files_changed;
+                }
+                if (files_fn) files_fn(*paths);
+                return;
+            }
+        }
 
         if (!mime->hasText()) return;
         const QString text = mime->text();
