@@ -63,14 +63,21 @@ final class FileDownloadGateTests: XCTestCase {
     private func invokeEnsure(
         _ gate: FileDownloadGate,
         semaphore: DispatchSemaphore,
-        probe: GateProbe
+        probe: GateProbe,
+        trace: WaiterTrace? = nil
     ) -> FileDownloadWaitOutcome {
         gate.ensureDownloaded(
             semaphore: semaphore,
-            sendRequest: { probe.sendRequest() },
+            sendRequest: {
+                trace?.noteSend()
+                probe.sendRequest()
+            },
             isStillCurrent: { probe.isStillCurrent() },
             renderedPayload: { probe.renderedPayload() },
-            idle: { probe.idle() }
+            idle: {
+                trace?.noteIdle()
+                probe.idle()
+            }
         )
     }
 
@@ -79,12 +86,48 @@ final class FileDownloadGateTests: XCTestCase {
         semaphore: DispatchSemaphore,
         probe: GateProbe,
         expectation exp: XCTestExpectation,
-        outcome: OutcomeBox
+        outcome: OutcomeBox,
+        trace: WaiterTrace? = nil
     ) {
         DispatchQueue.global(qos: .userInitiated).async {
-            outcome.set(self.invokeEnsure(gate, semaphore: semaphore, probe: probe))
+            outcome.set(self.invokeEnsure(gate, semaphore: semaphore, probe: probe, trace: trace))
             exp.fulfill()
         }
+    }
+
+    /// Wait until the waiter recorded by `trace` is provably inside the
+    /// secondary wait loop of the attempt the test started: it has called
+    /// `idle` itself (a secondary idles only after its first round of
+    /// checks) without ever calling `sendRequest` (a primary always sends
+    /// before it idles), and the shared probe still shows only the sends
+    /// the test expects, so no newer primary has started.
+    ///
+    /// A shared `probe.idleCount` cannot establish this: the primary idles
+    /// on every poll and can push the shared count past any threshold
+    /// before the second waiter has even called `ensureDownloaded`.
+    private func waitUntilJoinedAsSecondary(
+        _ trace: WaiterTrace,
+        probe: GateProbe,
+        expectedSends: Int = 1,
+        file: StaticString = #file,
+        line: UInt = #line
+    ) -> Bool {
+        guard waitUntil(timeout: 1.0, file: file, line: line, predicate: { trace.idleCount >= 1 }) else {
+            XCTFail("second waiter never idled, so it is not waiting as a secondary",
+                    file: file, line: line)
+            return false
+        }
+        guard trace.sendCount == 0 else {
+            XCTFail("second waiter sent a request: it became a new primary instead of joining as a secondary",
+                    file: file, line: line)
+            return false
+        }
+        guard probe.sendCount == expectedSends else {
+            XCTFail("expected \(expectedSends) request(s) when the secondary joined, got \(probe.sendCount)",
+                    file: file, line: line)
+            return false
+        }
+        return true
     }
 
     private func requireOutcome(
@@ -151,13 +194,14 @@ final class FileDownloadGateTests: XCTestCase {
         let outcomes = OutcomeList()
         let ready = DispatchGroup()
         let go = DispatchSemaphore(value: 0)
+        let traces = (0..<waiterCount).map { _ in WaiterTrace() }
 
-        for _ in 0..<waiterCount {
+        for trace in traces {
             ready.enter()
             DispatchQueue.global(qos: .userInitiated).async {
                 ready.leave()
                 go.wait()
-                outcomes.append(self.invokeEnsure(gate, semaphore: semaphore, probe: probe))
+                outcomes.append(self.invokeEnsure(gate, semaphore: semaphore, probe: probe, trace: trace))
                 exp.fulfill()
             }
         }
@@ -178,8 +222,19 @@ final class FileDownloadGateTests: XCTestCase {
             cancelAndWait(gate, exp)
             return
         }
-        // Give the other callers time to enter as secondaries.
-        Thread.sleep(forTimeInterval: 0.1)
+        // Every caller must be waiting before the signal: each has idled
+        // itself, and all but the one primary did so without sending. A
+        // caller that arrived after completion would read the cache and
+        // never exercise the secondary path.
+        guard waitUntil(timeout: 1.0, predicate: { traces.allSatisfy { $0.idleCount >= 1 } }) else {
+            cancelAndWait(gate, exp)
+            return
+        }
+        guard traces.filter({ $0.sendCount == 0 }).count == waiterCount - 1 else {
+            XCTFail("expected exactly one primary and \(waiterCount - 1) secondaries, got send counts \(traces.map { $0.sendCount })")
+            cancelAndWait(gate, exp)
+            return
+        }
         XCTAssertEqual(probe.sendCount, 1)
 
         semaphore.signal()
@@ -218,9 +273,10 @@ final class FileDownloadGateTests: XCTestCase {
         XCTAssertEqual(probe.sendCountAtFirstIdle, Optional(1),
                        "sendRequest must run before the primary starts waiting")
 
+        let secondaryTrace = WaiterTrace()
         startWaiter(gate: gate, semaphore: semaphore, probe: probe,
-                    expectation: secondaryExp, outcome: secondaryOutcome)
-        guard waitUntil(timeout: 1.0, predicate: { probe.idleCount >= 2 }) else {
+                    expectation: secondaryExp, outcome: secondaryOutcome, trace: secondaryTrace)
+        guard waitUntilJoinedAsSecondary(secondaryTrace, probe: probe) else {
             cancelAndWait(gate, primaryExp, secondaryExp)
             return
         }
@@ -318,9 +374,10 @@ final class FileDownloadGateTests: XCTestCase {
             return
         }
 
+        let secondaryTrace = WaiterTrace()
         startWaiter(gate: gate, semaphore: semaphore, probe: probe,
-                    expectation: secondaryExp, outcome: secondaryOutcome)
-        guard waitUntil(timeout: 1.0, predicate: { probe.idleCount >= 2 }) else {
+                    expectation: secondaryExp, outcome: secondaryOutcome, trace: secondaryTrace)
+        guard waitUntilJoinedAsSecondary(secondaryTrace, probe: probe) else {
             cancelAndWait(gate, primaryExp, secondaryExp)
             return
         }
@@ -383,8 +440,13 @@ final class FileDownloadGateTests: XCTestCase {
         }
 
         let started = Date()
+        let secondaryTrace = WaiterTrace()
         startWaiter(gate: gate, semaphore: semaphore, probe: probe,
-                    expectation: secondaryExp, outcome: secondaryOutcome)
+                    expectation: secondaryExp, outcome: secondaryOutcome, trace: secondaryTrace)
+        guard waitUntilJoinedAsSecondary(secondaryTrace, probe: probe) else {
+            cancelAndWait(gate, primaryExp, secondaryExp)
+            return
+        }
         wait(for: [secondaryExp], timeout: 5.0)
         let elapsed = Date().timeIntervalSince(started)
 
@@ -474,9 +536,10 @@ final class FileDownloadGateTests: XCTestCase {
             cancelAndWait(gate, primaryExp)
             return
         }
+        let secondaryTrace = WaiterTrace()
         startWaiter(gate: gate, semaphore: semaphore, probe: probe,
-                    expectation: secondaryExp, outcome: secondaryOutcome)
-        guard waitUntil(timeout: 1.0, predicate: { probe.idleCount >= 2 }) else {
+                    expectation: secondaryExp, outcome: secondaryOutcome, trace: secondaryTrace)
+        guard waitUntilJoinedAsSecondary(secondaryTrace, probe: probe) else {
             cancelAndWait(gate, primaryExp, secondaryExp)
             return
         }
@@ -589,9 +652,10 @@ final class FileDownloadGateTests: XCTestCase {
             cancelAndWait(gate, primaryExp)
             return
         }
+        let secondaryTrace = WaiterTrace()
         startWaiter(gate: gate, semaphore: semaphore, probe: probe,
-                    expectation: secondaryExp, outcome: secondaryOutcome)
-        guard waitUntil(timeout: 1.0, predicate: { probe.idleCount >= 2 }) else {
+                    expectation: secondaryExp, outcome: secondaryOutcome, trace: secondaryTrace)
+        guard waitUntilJoinedAsSecondary(secondaryTrace, probe: probe) else {
             cancelAndWait(gate, primaryExp, secondaryExp)
             return
         }
@@ -875,9 +939,10 @@ final class FileDownloadGateTests: XCTestCase {
             cancelAndWait(gate, primaryExp)
             return
         }
+        let secondaryTrace = WaiterTrace()
         startWaiter(gate: gate, semaphore: semaphore, probe: probe,
-                    expectation: secondaryExp, outcome: secondaryOutcome)
-        guard waitUntil(timeout: 1.0, predicate: { probe.idleCount >= 2 }) else {
+                    expectation: secondaryExp, outcome: secondaryOutcome, trace: secondaryTrace)
+        guard waitUntilJoinedAsSecondary(secondaryTrace, probe: probe) else {
             cancelAndWait(gate, primaryExp, secondaryExp)
             return
         }
@@ -1015,9 +1080,10 @@ final class FileDownloadGateTests: XCTestCase {
             cancelAndWait(gate, primaryExp)
             return
         }
+        let secondaryTrace = WaiterTrace()
         startWaiter(gate: gate, semaphore: semaphore, probe: probe,
-                    expectation: secondaryExp, outcome: secondaryOutcome)
-        guard waitUntil(timeout: 1.0, predicate: { probe.idleCount >= 2 }) else {
+                    expectation: secondaryExp, outcome: secondaryOutcome, trace: secondaryTrace)
+        guard waitUntilJoinedAsSecondary(secondaryTrace, probe: probe) else {
             cancelAndWait(gate, primaryExp, secondaryExp)
             return
         }
@@ -1151,9 +1217,10 @@ final class FileDownloadGateTests: XCTestCase {
         // ~timeout remaining after the primary gives up. Inheriting promptly
         // is what distinguishes re-arm from "wait your own full timeout".
         Thread.sleep(forTimeInterval: 0.5)
+        let secondaryTrace = WaiterTrace()
         startWaiter(gate: gate, semaphore: semaphore, probe: probe,
-                    expectation: secondaryExp, outcome: secondaryOutcome)
-        guard waitUntil(timeout: 1.0, predicate: { probe.idleCount >= 2 && probe.sendCount == 1 }) else {
+                    expectation: secondaryExp, outcome: secondaryOutcome, trace: secondaryTrace)
+        guard waitUntilJoinedAsSecondary(secondaryTrace, probe: probe) else {
             cancelAndWait(gate, primaryExp, secondaryExp)
             return
         }
@@ -1187,9 +1254,10 @@ final class FileDownloadGateTests: XCTestCase {
             cancelAndWait(gate, primaryExp)
             return
         }
+        let secondaryTrace = WaiterTrace()
         startWaiter(gate: gate, semaphore: semaphore, probe: probe,
-                    expectation: secondaryExp, outcome: secondaryOutcome)
-        guard waitUntil(timeout: 1.0, predicate: { probe.idleCount >= 2 }) else {
+                    expectation: secondaryExp, outcome: secondaryOutcome, trace: secondaryTrace)
+        guard waitUntilJoinedAsSecondary(secondaryTrace, probe: probe) else {
             cancelAndWait(gate, primaryExp, secondaryExp)
             return
         }
@@ -1327,9 +1395,10 @@ final class FileDownloadGateTests: XCTestCase {
         }
         XCTAssertEqual(gate.currentGeneration, 4)
 
+        let secondaryTrace = WaiterTrace()
         startWaiter(gate: gate, semaphore: waitSemaphore, probe: waitProbe,
-                    expectation: secondaryExp, outcome: secondaryOutcome)
-        guard waitUntil(timeout: 1.0, predicate: { waitProbe.idleCount >= 2 }) else {
+                    expectation: secondaryExp, outcome: secondaryOutcome, trace: secondaryTrace)
+        guard waitUntilJoinedAsSecondary(secondaryTrace, probe: waitProbe) else {
             cancelAndWait(gate, primaryExp, secondaryExp)
             return
         }
@@ -1394,9 +1463,10 @@ final class FileDownloadGateTests: XCTestCase {
             cancelAndWait(gate, primaryExp)
             return
         }
+        let secondaryTrace = WaiterTrace()
         startWaiter(gate: gate, semaphore: semaphore, probe: probe,
-                    expectation: secondaryExp, outcome: secondaryOutcome)
-        guard waitUntil(timeout: 1.0, predicate: { probe.idleCount >= 2 }) else {
+                    expectation: secondaryExp, outcome: secondaryOutcome, trace: secondaryTrace)
+        guard waitUntilJoinedAsSecondary(secondaryTrace, probe: probe) else {
             cancelAndWait(gate, primaryExp, secondaryExp)
             return
         }
@@ -1625,6 +1695,40 @@ private final class OutcomeList {
         lock.lock()
         defer { lock.unlock() }
         return items
+    }
+}
+
+/// Counts what ONE waiter's own `ensureDownloaded` call did, separately
+/// from a `GateProbe` that several waiters may share. `idle` is recorded
+/// before the probe sleeps or parks, so a non-zero count means this waiter
+/// is already inside its wait loop.
+private final class WaiterTrace {
+    private let lock = NSLock()
+    private var sendCountValue = 0
+    private var idleCountValue = 0
+
+    var sendCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return sendCountValue
+    }
+
+    var idleCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return idleCountValue
+    }
+
+    func noteSend() {
+        lock.lock()
+        sendCountValue += 1
+        lock.unlock()
+    }
+
+    func noteIdle() {
+        lock.lock()
+        idleCountValue += 1
+        lock.unlock()
     }
 }
 
