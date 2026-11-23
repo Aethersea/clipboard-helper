@@ -73,6 +73,7 @@
 #include <utility>
 #include <vector>
 
+#include "image_encode.h"
 #include "log.h"
 #include "uri_list_format.h"
 #include "wayland_display.h"
@@ -217,6 +218,7 @@ struct PipeSink {
     int                       fd{-1};   // -1 = not requested
     std::vector<std::uint8_t> bytes;
     bool                      ok{false};  // true once EOF (or the cap) is reached
+    bool                      truncated{false};  // stopped at the cap, rest dropped
 };
 
 // Drain every requested pipe until EOF or `cap` bytes, concurrently via
@@ -255,7 +257,8 @@ void DrainPipes(PipeSink* sinks, std::size_t count, std::size_t cap) {
             if (n > 0) {
                 s.bytes.insert(s.bytes.end(), buf, buf + n);
                 if (s.bytes.size() >= cap) {
-                    s.ok = true;  // truncated at the cap; the rest is dropped
+                    s.ok        = true;  // truncated at the cap; the rest is dropped
+                    s.truncated = true;
                 } else {
                     still_open.push_back(open[k]);
                 }
@@ -286,6 +289,7 @@ struct ExtState {
     std::optional<std::string>                       cached_clipboard_text;
     std::function<void(const std::string&)>          on_changed;
     std::function<void(const std::vector<std::string>&)> on_files_changed;
+    std::function<void(const std::vector<std::uint8_t>&)> on_image_changed;
     std::function<void(const std::string&)>          on_request;
 };
 
@@ -365,20 +369,24 @@ void WaitAndWriteOnWorker(std::shared_ptr<ExtState> state,
 }
 
 // Worker: drain the receive pipes of an external selection, then
-// dispatch. `uri_fd` carries text/uri-list and `text_fd` the chosen
-// text MIME; either may be -1 (not offered). If the uri-list is
-// entirely local file: URIs the change goes to on_files_changed;
-// otherwise the text rendering goes to on_changed (and is cached),
-// exactly as before uri-list detection existed. Always closes both fds.
-void ReceiveAndDispatchOnWorker(std::shared_ptr<ExtState> state, int uri_fd, int text_fd) {
-    PipeSink sinks[2];
+// dispatch. `uri_fd` carries text/uri-list, `image_fd` the chosen image
+// MIME (`image_mime`) and `text_fd` the chosen text MIME; any may be -1
+// (not offered). Priority matches the macOS helper: a uri-list of only
+// local file: URIs goes to on_files_changed; else an image that converts
+// to PNG goes to on_image_changed; else non-empty text goes to
+// on_changed (and is cached). Always closes every fd.
+void ReceiveAndDispatchOnWorker(std::shared_ptr<ExtState> state, int uri_fd,
+                                int image_fd, std::string image_mime, int text_fd) {
+    PipeSink sinks[3];
     sinks[0].fd = uri_fd;
-    sinks[1].fd = text_fd;
-    // Both pipes are drained to EOF (up to the cap) even when only one
+    sinks[1].fd = image_fd;
+    sinks[2].fd = text_fd;
+    // Every pipe is drained to EOF (up to the cap) even when only one
     // turns out to be needed, so the source doesn't hit EPIPE / SIGPIPE
-    // on the one we'd otherwise abandon.
-    DrainPipes(sinks, 2, kReceiveCap);
+    // on the ones we'd otherwise abandon.
+    DrainPipes(sinks, 3, kReceiveCap);
     if (uri_fd >= 0) ::close(uri_fd);
+    if (image_fd >= 0) ::close(image_fd);
     if (text_fd >= 0) ::close(text_fd);
 
     if (state->stop.load(std::memory_order_acquire)) return;
@@ -401,9 +409,40 @@ void ReceiveAndDispatchOnWorker(std::shared_ptr<ExtState> state, int uri_fd, int
         }
     }
 
-    if (!sinks[1].ok) return;
+    if (sinks[1].ok) {
+        if (sinks[1].truncated) {
+            // Bigger than a frame can carry; the text beside it is only
+            // a rendering of the image, so report nothing.
+            std::ostringstream m;
+            m << "[ext/image] local " << image_mime << " exceeds "
+              << kReceiveCap << " bytes; not reporting";
+            LH_LOG_WARN(m.str());
+            return;
+        }
+        auto png = image_encode::ToPng(sinks[1].bytes.data(), sinks[1].bytes.size(),
+                                       image_mime);
+        if (png) {
+            std::function<void(const std::vector<std::uint8_t>&)> image_cb;
+            {
+                std::lock_guard<std::mutex> g(state->mu);
+                // GET_CLIPBOARD is text-only; don't serve a stale one.
+                state->cached_clipboard_text.reset();
+                image_cb = state->on_image_changed;
+            }
+            if (image_cb) image_cb(*png);
+            return;
+        }
+        std::ostringstream m;
+        m << "[ext/image] local " << image_mime << " (" << sinks[1].bytes.size()
+          << " bytes) did not convert to PNG; trying text";
+        LH_LOG_WARN(m.str());
+    }
 
-    std::string text(sinks[1].bytes.begin(), sinks[1].bytes.end());
+    if (!sinks[2].ok) return;
+    // An empty text rendering has nothing to paste.
+    if (sinks[2].bytes.empty()) return;
+
+    std::string text(sinks[2].bytes.begin(), sinks[2].bytes.end());
     std::function<void(const std::string&)> cb;
     {
         std::lock_guard<std::mutex> g(state->mu);
@@ -602,6 +641,12 @@ public:
             std::function<void(const std::vector<std::string>&)> cb) override {
         std::lock_guard<std::mutex> g(state_->mu);
         state_->on_files_changed = std::move(cb);
+    }
+
+    void SetOnImageChanged(
+            std::function<void(const std::vector<std::uint8_t>&)> cb) override {
+        std::lock_guard<std::mutex> g(state_->mu);
+        state_->on_image_changed = std::move(cb);
     }
 
 private:
@@ -829,31 +874,37 @@ private:
         offer_mimes_.erase(offer);
 
         // A file manager's copy offers text/uri-list beside a text
-        // rendering of the paths. Receive both (receive may be issued
-        // more than once per offer): the worker reports FILES when the
-        // uri-list is all local file: URIs and otherwise falls back to
-        // the text, so browser links etc. still arrive as TEXT.
+        // rendering of the paths; an image copy (browser, screenshot
+        // tool) offers an image MIME, often beside text. Receive every
+        // kind on offer (receive may be issued more than once per
+        // offer); the worker picks files → image → text, so browser
+        // links etc. still arrive as TEXT.
         const bool  want_uri_list = mimes.count(kUriListMime) > 0;
+        const char* image_mime    = image_encode::PickInboundImageMime(
+            [&mimes](const char* m) { return mimes.count(m) > 0; });
         const char* text_mime     = nullptr;
         for (const char* candidate : kTextMimeTypes) {
             if (mimes.count(candidate)) { text_mime = candidate; break; }
         }
-        if (!want_uri_list && text_mime == nullptr) {
-            // Neither files nor text; ignore.
+        if (!want_uri_list && image_mime == nullptr && text_mime == nullptr) {
+            // No files, image or text; ignore.
             ext_data_control_offer_v1_destroy(offer);
             return;
         }
 
-        const int uri_fd  = want_uri_list ? ReceiveToPipe(offer, kUriListMime) : -1;
-        const int text_fd = (text_mime != nullptr) ? ReceiveToPipe(offer, text_mime) : -1;
+        const int uri_fd   = want_uri_list ? ReceiveToPipe(offer, kUriListMime) : -1;
+        const int image_fd = (image_mime != nullptr) ? ReceiveToPipe(offer, image_mime) : -1;
+        const int text_fd  = (text_mime != nullptr) ? ReceiveToPipe(offer, text_mime) : -1;
         if (display_) display_->Flush();
 
         ext_data_control_offer_v1_destroy(offer);
 
-        if (uri_fd < 0 && text_fd < 0) return;  // pipe2 failed (logged)
+        if (uri_fd < 0 && image_fd < 0 && text_fd < 0) return;  // pipe2 failed (logged)
 
         // Worker captures shared_ptr<state>, not `this`.
-        std::thread(ReceiveAndDispatchOnWorker, state_, uri_fd, text_fd).detach();
+        std::thread(ReceiveAndDispatchOnWorker, state_, uri_fd, image_fd,
+                    std::string(image_mime != nullptr ? image_mime : ""), text_fd)
+            .detach();
     }
 
     // Ask the selection source to write `mime` into a fresh pipe and

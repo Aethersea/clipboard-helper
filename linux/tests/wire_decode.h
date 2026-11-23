@@ -44,6 +44,12 @@ struct Frame {
     std::uint64_t offset{0};
     bool          is_last{false};
 
+    // ClipboardDataRequest (field 5) — outbound DATA_REQUEST. Field
+    // numbers from Proto/clipboard.proto: content_hash=1, content_type=2.
+    bool        has_data_request{false};
+    std::string req_content_hash;
+    int         req_content_type{0};
+
     // HelperFileChunkRequest (field 8) – only used to build, not decoded.
 };
 
@@ -110,6 +116,27 @@ inline bool DecodeClipboardData(const std::uint8_t* p, std::size_t n, Frame& out
     return true;
 }
 
+inline bool DecodeDataRequest(const std::uint8_t* p, std::size_t n, Frame& out) {
+    pw::Reader r(p, n);
+    while (!r.eof()) {
+        std::uint32_t fld;
+        pw::WireType  wt;
+        if (!r.ReadTag(fld, wt)) return false;
+        if (wt == pw::Varint) {
+            std::uint64_t v;
+            if (!r.ReadVarint(v)) return false;
+            if (fld == 2) out.req_content_type = static_cast<int>(v);
+        } else if (wt == pw::LengthDelim) {
+            std::string s;
+            if (!ReadStr(r, s)) return false;
+            if (fld == 1) out.req_content_hash = s;
+        } else if (!r.SkipField(wt)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 inline bool DecodeChunk(const std::uint8_t* p, std::size_t n, Frame& out) {
     pw::Reader r(p, n);
     while (!r.eof()) {
@@ -155,6 +182,9 @@ inline Frame Decode(const std::vector<std::uint8_t>& bytes) {
             if (fld == 2) {
                 f.has_clipboard_data = true;
                 if (!DecodeClipboardData(sp, sn, f)) return f;
+            } else if (fld == 5) {
+                f.has_data_request = true;
+                if (!DecodeDataRequest(sp, sn, f)) return f;
             } else if (fld == 6) {
                 f.error_message.assign(reinterpret_cast<const char*>(sp), sn);
             } else if (fld == 9) {
@@ -170,9 +200,9 @@ inline Frame Decode(const std::vector<std::uint8_t>& bytes) {
 }
 
 // Message-type numbers from Proto/clipboard_helper.proto.
-constexpr int kSetClipboard = 1, kChanged = 10, kDataRequest = 11, kError = 13, kReady = 14,
-              kChunkRequest = 15, kChunkData = 16, kProgress = 17;
-constexpr int kText = 1, kFiles = 3;
+constexpr int kSetClipboard = 1, kAnnounceDelayed = 2, kChanged = 10, kDataRequest = 11,
+              kError = 13, kReady = 14, kChunkRequest = 15, kChunkData = 16, kProgress = 17;
+constexpr int kText = 1, kImage = 2, kFiles = 3;
 
 // ─── Builders for inbound frames ─────────────────────────────────────────
 
@@ -200,6 +230,24 @@ inline std::vector<std::uint8_t> SetClipboardText(const std::string& text) {
     pw::Writer w;
     w.WriteEnumField(1, kText);
     w.WriteBytesField(2, reinterpret_cast<const std::uint8_t*>(text.data()), text.size());
+    const auto sub = w.take();
+    return Envelope(kSetClipboard, 2, &sub);
+}
+
+// ANNOUNCE_DELAYED: announcement sub-message in field 3, carrying
+// content_type (1) and content_hash (2).
+inline std::vector<std::uint8_t> AnnounceDelayed(int content_type, const std::string& hash) {
+    pw::Writer w;
+    w.WriteEnumField(1, content_type);
+    w.WriteStringField(2, hash);
+    const auto sub = w.take();
+    return Envelope(kAnnounceDelayed, 3, &sub);
+}
+
+inline std::vector<std::uint8_t> SetClipboardImage(const std::vector<std::uint8_t>& webp) {
+    pw::Writer w;
+    w.WriteEnumField(1, kImage);
+    if (!webp.empty()) w.WriteBytesField(2, webp.data(), webp.size());
     const auto sub = w.take();
     return Envelope(kSetClipboard, 2, &sub);
 }

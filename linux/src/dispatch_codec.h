@@ -9,7 +9,8 @@
 // move bytes in and out of the schema live here.
 //
 // Linux subset of the Windows dispatch_codec: TEXT plus the generic
-// envelope plumbing, CLIPBOARD_CHANGED(FILES) for local file copies, and
+// envelope plumbing, CLIPBOARD_CHANGED(IMAGE) for local image copies,
+// CLIPBOARD_CHANGED(FILES) for local file copies, and
 // the FILE_CHUNK_REQUEST / FILE_CHUNK_DATA pair used to serve those
 // files to the parent. (SET_CLIPBOARD with FILES is not supported on
 // Linux, so there is no inbound FileMetadata parser.)
@@ -52,6 +53,13 @@ std::vector<std::uint8_t> EncodeError(std::string_view message,
 std::vector<std::uint8_t> EncodeClipboardChangedText(std::string_view utf8_payload,
                                                      std::string_view content_hash,
                                                      ClockFn          clock = &NowUnixMillis);
+
+// CLIPBOARD_CHANGED(image): pushed when the user copies an image in
+// another application. `png` is the PNG payload; `content_hash` the
+// SHA-256 hex of it (same convention as the macOS / Windows helpers).
+std::vector<std::uint8_t> EncodeClipboardChangedImage(const std::vector<std::uint8_t>& png,
+                                                      std::string_view content_hash,
+                                                      ClockFn          clock = &NowUnixMillis);
 
 // DATA_REQUEST: fired when the OS wants to render the bytes of a
 // delayed-rendered slot we previously announced. Parent answers with

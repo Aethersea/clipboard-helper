@@ -68,6 +68,27 @@ std::vector<std::uint8_t> EncodeClipboardChangedText(std::string_view utf8_paylo
     return w.take();
 }
 
+std::vector<std::uint8_t> EncodeClipboardChangedImage(const std::vector<std::uint8_t>& png,
+                                                      std::string_view content_hash,
+                                                      ClockFn          clock) {
+    Writer inner;
+    inner.WriteEnumField(proto::kCDFieldContentType,
+                         static_cast<std::int32_t>(ClipboardContentType::Image));
+    if (!png.empty()) {
+        inner.WriteBytesField(proto::kCDFieldPayload, png.data(), png.size());
+    }
+    if (!content_hash.empty()) {
+        inner.WriteStringField(proto::kCDFieldContentHash, content_hash);
+    }
+
+    Writer w;
+    w.WriteEnumField(proto::kFieldType,
+                     static_cast<std::int32_t>(HelperMessageType::ClipboardChanged));
+    w.WriteSubMessageField(proto::kFieldClipboardData, inner.take());
+    w.WriteUint64Field(proto::kFieldTimestamp, clock());
+    return w.take();
+}
+
 std::vector<std::uint8_t> EncodeDataRequest(std::string_view             content_hash,
                                             proto::ClipboardContentType content_type,
                                             ClockFn                      clock) {
