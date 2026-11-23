@@ -81,7 +81,9 @@ public:
     virtual std::optional<std::string> GetClipboardText() = 0;
 
     // Called when the OS clipboard changes due to *external* activity
-    // (user copied something in another application). Implementations
+    // (user copied something in another application) and the change is
+    // text. Empty text is not reported: a source offering an empty text
+    // rendering has nothing for the parent to paste. Implementations
     // must suppress callbacks for changes triggered by our own
     // SetClipboardText / AnnounceDelayed calls (the "echo suppression"
     // problem documented in the macOS helper's PasteboardManager).
@@ -104,6 +106,24 @@ public:
     // simply never reports FILES.
     virtual void SetOnFilesChanged(
             std::function<void(const std::vector<std::string>& abs_paths)> cb) {
+        (void)cb;
+    }
+
+    // Called instead of the text callback when an external change offers
+    // an image (one of image_encode::kInboundImageMimes on Wayland, or
+    // image data on X11) and is not a local file copy. `png` is the image
+    // re-encoded as PNG (passed through when the source already offered
+    // image/png) — the payload format every helper reports for IMAGE.
+    // Images win over text because image sources (browsers, chat apps)
+    // commonly offer a text rendering too; same order as the macOS
+    // helper's readPasteboard. The Dispatcher hashes, size-checks and
+    // frames it. Same echo-suppression rule as SetOnClipboardChanged: our
+    // own SetClipboardImage / AnnounceDelayedImage must never come back
+    // through here.
+    //
+    // Not pure, for the same reason as SetOnFilesChanged.
+    virtual void SetOnImageChanged(
+            std::function<void(const std::vector<std::uint8_t>& png)> cb) {
         (void)cb;
     }
 

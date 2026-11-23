@@ -63,12 +63,22 @@ constexpr std::uint32_t kDefaultChunkSize = 262144;
 // 16 MiB frame cap.
 constexpr std::uint32_t kMaxChunkSize = 4 * 1024 * 1024;
 
+// Largest PNG we report. The CLIPBOARD_CHANGED frame must fit under the
+// socket's frame cap (which the parent enforces too) with room for the
+// envelope; anything bigger would be refused by SendFrame and leave the
+// parent with the previous clipboard, so we skip it with a log instead.
+constexpr std::size_t kMaxImagePayload = SocketServer::kMaxFrameSize - 64 * 1024;
+
 // Lowercase hex SHA-256, the content_hash convention every helper uses.
-std::string Sha256Hex(const std::string& bytes) {
+std::string Sha256Hex(const char* data, std::size_t len) {
     const QByteArray digest = QCryptographicHash::hash(
-        QByteArray::fromRawData(bytes.data(), static_cast<qsizetype>(bytes.size())),
+        QByteArray::fromRawData(data, static_cast<qsizetype>(len)),
         QCryptographicHash::Sha256);
     return digest.toHex().toStdString();
+}
+
+std::string Sha256Hex(const std::string& bytes) {
+    return Sha256Hex(bytes.data(), bytes.size());
 }
 
 // Last path component; the path itself for "/" (whose basename would
@@ -96,18 +106,21 @@ Dispatcher::~Dispatcher() {
 void Dispatcher::Attach() {
     if (attached_.exchange(true)) return;
 
-    // ClipboardManager → outbound CLIPBOARD_CHANGED frame (TEXT / FILES).
+    // ClipboardManager → outbound CLIPBOARD_CHANGED frame (TEXT / IMAGE / FILES).
     clipboard_->SetOnClipboardChanged([this](const std::string& utf8) {
         OnLocalTextChanged(utf8);
     });
     clipboard_->SetOnFilesChanged([this](const std::vector<std::string>& abs_paths) {
         OnLocalFilesChanged(abs_paths);
     });
+    clipboard_->SetOnImageChanged([this](const std::vector<std::uint8_t>& png) {
+        OnLocalImageChanged(png);
+    });
 
     // ClipboardManager → outbound DATA_REQUEST frame.
     clipboard_->SetOnDataRequest([this](const std::string& content_hash) {
         auto frame = dispatch_codec::EncodeDataRequest(
-            content_hash, proto::ClipboardContentType::Text);
+            content_hash, AnnouncedTypeFor(content_hash));
         if (socket_ != nullptr) {
             socket_->SendFrame(frame);
         }
@@ -119,11 +132,24 @@ void Dispatcher::Detach() {
     if (clipboard_ != nullptr) {
         clipboard_->SetOnClipboardChanged({});
         clipboard_->SetOnFilesChanged({});
+        clipboard_->SetOnImageChanged({});
         clipboard_->SetOnDataRequest({});
     }
 }
 
+proto::ClipboardContentType Dispatcher::AnnouncedTypeFor(const std::string& content_hash) {
+    std::lock_guard<std::mutex> g(announce_mu_);
+    if (content_hash == announced_hash_) return announced_type_;
+    return proto::ClipboardContentType::Text;
+}
+
 void Dispatcher::OnLocalTextChanged(const std::string& utf8) {
+    // An empty text rendering has nothing to paste; the backends already
+    // drop it, this guards any future one that doesn't.
+    if (utf8.empty()) {
+        LH_LOG_DEBUG("Dispatcher: empty local text change; not reporting");
+        return;
+    }
     // Text content_hash is left empty so the parent computes it from the
     // payload, as it does for the macOS / Windows text path.
     auto frame = dispatch_codec::EncodeClipboardChangedText(utf8, /*content_hash=*/"");
@@ -193,6 +219,39 @@ void Dispatcher::OnLocalFilesChanged(const std::vector<std::string>& abs_paths) 
         std::ostringstream m;
         m << "Dispatcher: local FILES change (" << metas.size() << " of "
           << abs_paths.size() << " path(s))";
+        LH_LOG_INFO(m.str());
+    }
+    if (socket_ != nullptr) {
+        socket_->SendFrame(frame);
+    }
+}
+
+void Dispatcher::OnLocalImageChanged(const std::vector<std::uint8_t>& png) {
+    if (png.empty()) {
+        LH_LOG_DEBUG("Dispatcher: empty local image change; not reporting");
+        return;
+    }
+    if (png.size() > kMaxImagePayload) {
+        std::ostringstream m;
+        m << "Dispatcher: local image is " << png.size() << " bytes as PNG, over the "
+          << kMaxImagePayload << "-byte limit; not reporting";
+        LH_LOG_WARN(m.str());
+        return;
+    }
+
+    const std::string hash =
+        Sha256Hex(reinterpret_cast<const char*>(png.data()), png.size());
+    auto frame = dispatch_codec::EncodeClipboardChangedImage(png, hash);
+
+    std::lock_guard<std::mutex> report(report_mu_);
+    {
+        // The clipboard no longer holds the files we last reported.
+        std::lock_guard<std::mutex> g(files_mu_);
+        local_files_.clear();
+    }
+    {
+        std::ostringstream m;
+        m << "Dispatcher: local IMAGE change (" << png.size() << " bytes PNG)";
         LH_LOG_INFO(m.str());
     }
     if (socket_ != nullptr) {
@@ -284,6 +343,19 @@ std::vector<std::uint8_t> Dispatcher::HandleAnnounceDelayed(const std::uint8_t* 
         return dispatch_codec::EncodeError("ANNOUNCE_DELAYED parse failure");
     }
     if (clipboard_ == nullptr) return {};
+
+    switch (ann.content_type) {
+        case proto::ClipboardContentType::Text:
+        case proto::ClipboardContentType::Image:
+        case proto::ClipboardContentType::Files: {
+            std::lock_guard<std::mutex> g(announce_mu_);
+            announced_hash_ = ann.content_hash;
+            announced_type_ = ann.content_type;
+            break;
+        }
+        default:
+            break;
+    }
 
     switch (ann.content_type) {
         case proto::ClipboardContentType::Text:
