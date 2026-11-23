@@ -49,6 +49,7 @@
 #include <vector>
 
 #include "echo_suppressor.h"
+#include "image_encode.h"
 #include "log.h"
 #include "uri_list_format.h"
 #include "webp_decode.h"
@@ -94,8 +95,34 @@ struct DelayedState {
     std::optional<std::string>                       cached_clipboard_text;
     std::function<void(const std::string&)>          on_changed;
     std::function<void(const std::vector<std::string>&)> on_files_changed;
+    std::function<void(const std::vector<std::uint8_t>&)> on_image_changed;
     std::function<void(const std::string&)>          on_request;
 };
+
+// PNG bytes for an external clipboard that carries an image, or nullopt.
+// Takes the first image MIME the owner offers (image_encode's preference
+// order: image/png is passed through, others are re-encoded); when the
+// owner offers none of those but Qt still sees image data (Qt-side
+// owners via application/x-qt-image), encodes that.
+std::optional<std::vector<std::uint8_t>> ReadImageAsPng(const QMimeData& mime) {
+    const char* picked = image_encode::PickInboundImageMime([&mime](const char* m) {
+        return mime.hasFormat(QString::fromLatin1(m));
+    });
+    if (picked != nullptr) {
+        const QByteArray raw = mime.data(QString::fromLatin1(picked));
+        auto png = image_encode::ToPng(reinterpret_cast<const std::uint8_t*>(raw.constData()),
+                                       static_cast<std::size_t>(raw.size()), picked);
+        if (png) return png;
+        std::ostringstream m;
+        m << "[x11/image] local " << picked << " (" << raw.size()
+          << " bytes) did not convert to PNG";
+        LH_LOG_WARN(m.str());
+    }
+    if (mime.hasImage()) {
+        return image_encode::QImageToPng(qvariant_cast<QImage>(mime.imageData()));
+    }
+    return std::nullopt;
+}
 
 class DelayedClipboardMimeData : public QMimeData {
 public:
@@ -476,6 +503,12 @@ public:
         state_->on_files_changed = std::move(cb);
     }
 
+    void SetOnImageChanged(
+            std::function<void(const std::vector<std::uint8_t>&)> cb) override {
+        std::lock_guard<std::mutex> g(state_->mu);
+        state_->on_image_changed = std::move(cb);
+    }
+
 private slots:
     void OnClipboardChanged() {
         auto* cb = QGuiApplication::clipboard();
@@ -514,9 +547,32 @@ private slots:
             }
         }
 
+        // Image before text: "Copy Image" in a browser or chat app also
+        // offers a text rendering (the URL, alt text, HTML) that would
+        // otherwise win. Same order as the macOS helper's readPasteboard.
+        // Our own SetClipboardImage / AnnounceDelayedImage never reach
+        // here — the pointer check above returned for them.
+        if (auto png = ReadImageAsPng(*mime)) {
+            std::function<void(const std::vector<std::uint8_t>&)> image_fn;
+            {
+                std::lock_guard<std::mutex> g(state_->mu);
+                // GET_CLIPBOARD is text-only; don't serve a stale one.
+                state_->cached_clipboard_text.reset();
+                image_fn = state_->on_image_changed;
+            }
+            if (image_fn) image_fn(*png);
+            return;
+        }
+
         if (!mime->hasText()) return;
         const QString text = mime->text();
         const std::string utf8 = text.toUtf8().toStdString();
+        // An empty text rendering has nothing to paste. Still consume a
+        // matching eager-set expectation so it can't go stale.
+        if (utf8.empty()) {
+            echo_.ConsumeEagerSetTextEcho(utf8);
+            return;
+        }
 
         // One-shot content match for SetClipboardText's own echo. A real
         // external copy with a different string between our setMimeData

@@ -24,6 +24,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "helper_proto.h"
+
 namespace leviathan::clipboard_helper {
 
 class ClipboardManager;
@@ -71,6 +73,12 @@ private:
     // receive worker for the Wayland backends.
     void OnLocalTextChanged(const std::string& utf8);
     void OnLocalFilesChanged(const std::vector<std::string>& abs_paths);
+    void OnLocalImageChanged(const std::vector<std::uint8_t>& png);
+
+    // DATA_REQUEST content_type for `content_hash`: the type of the
+    // ANNOUNCE_DELAYED that carried that hash, or TEXT when the hash is
+    // not the current announcement.
+    proto::ClipboardContentType AnnouncedTypeFor(const std::string& content_hash);
 
     // One file of the most recently reported local FILES change. The
     // path comes only from our own clipboard observation — never from a
@@ -98,6 +106,12 @@ private:
     // held across I/O.
     std::mutex            files_mu_;
     std::unordered_map<std::string, LocalFile> local_files_;  // file_id → file
+
+    // Last ANNOUNCE_DELAYED, written on the socket thread and read from
+    // the backend thread that raises DATA_REQUEST.
+    std::mutex                  announce_mu_;
+    std::string                 announced_hash_;
+    proto::ClipboardContentType announced_type_{proto::ClipboardContentType::Text};
 };
 
 }  // namespace leviathan::clipboard_helper

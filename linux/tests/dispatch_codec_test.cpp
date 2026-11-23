@@ -257,3 +257,71 @@ TEST(DispatchCodec, ParseAnnouncementDetectsFilesContentType) {
               static_cast<int>(ch::proto::ClipboardContentType::Files));
     EXPECT_EQ(out.content_hash, std::string("fileshash"));
 }
+
+// ─── EncodeClipboardChangedImage (local image reporting) ────────────────
+
+TEST(DispatchCodec, EncodeClipboardChangedImageRoundTrips) {
+    const std::vector<std::uint8_t> png = {0x89, 'P', 'N', 'G', 0x0D, 0x0A,
+                                           0x1A, 0x0A, 0x00, 0xFF};
+    const auto frame = cc::EncodeClipboardChangedImage(png, "imghash", StubClock);
+
+    cc::ParsedHelperMessage parsed{};
+    ASSERT_TRUE(cc::ParseHelperMessage(frame, parsed));
+    EXPECT_EQ(static_cast<int>(parsed.type),
+              static_cast<int>(ch::proto::HelperMessageType::ClipboardChanged));
+    ASSERT_TRUE(parsed.clipboard_data_ptr != nullptr);
+
+    cc::ParsedClipboardData cd{};
+    ASSERT_TRUE(cc::ParseClipboardData(parsed.clipboard_data_ptr,
+                                       parsed.clipboard_data_len, cd));
+    EXPECT_EQ(static_cast<int>(cd.content_type),
+              static_cast<int>(ch::proto::ClipboardContentType::Image));
+    ASSERT_EQ(cd.payload_len, png.size());
+    EXPECT_TRUE(std::vector<std::uint8_t>(cd.payload_ptr,
+                                          cd.payload_ptr + cd.payload_len) == png);
+    EXPECT_EQ(cd.content_hash, std::string("imghash"));
+}
+
+TEST(DispatchCodec, EncodeClipboardChangedImagePreservesBinaryPayload) {
+    // Bytes that look like protobuf tags and contain NULs must survive
+    // unchanged: the encoder length-delimits the payload.
+    std::vector<std::uint8_t> payload = {0x08, 0x02, 0x12, 0x03, 0x00, 0x00, 0xFF};
+    for (std::size_t i = 0; i < 256; ++i) {
+        payload.push_back(static_cast<std::uint8_t>(i));
+    }
+
+    const auto frame = cc::EncodeClipboardChangedImage(payload, "h", StubClock);
+    cc::ParsedHelperMessage parsed{};
+    ASSERT_TRUE(cc::ParseHelperMessage(frame, parsed));
+    cc::ParsedClipboardData cd{};
+    ASSERT_TRUE(cc::ParseClipboardData(parsed.clipboard_data_ptr,
+                                       parsed.clipboard_data_len, cd));
+    ASSERT_EQ(cd.payload_len, payload.size());
+    EXPECT_TRUE(std::vector<std::uint8_t>(cd.payload_ptr,
+                                          cd.payload_ptr + cd.payload_len) == payload);
+}
+
+TEST(DispatchCodec, EncodeClipboardChangedImageHandlesEmptyPayload) {
+    const auto frame = cc::EncodeClipboardChangedImage({}, "emptypng", StubClock);
+    cc::ParsedHelperMessage parsed{};
+    ASSERT_TRUE(cc::ParseHelperMessage(frame, parsed));
+    cc::ParsedClipboardData cd{};
+    ASSERT_TRUE(cc::ParseClipboardData(parsed.clipboard_data_ptr,
+                                       parsed.clipboard_data_len, cd));
+    EXPECT_EQ(static_cast<int>(cd.content_type),
+              static_cast<int>(ch::proto::ClipboardContentType::Image));
+    EXPECT_EQ(cd.payload_len, static_cast<std::size_t>(0));
+    EXPECT_EQ(cd.content_hash, std::string("emptypng"));
+}
+
+TEST(DispatchCodec, EncodeClipboardChangedImageOmitsEmptyHash) {
+    const std::vector<std::uint8_t> png = {'P', 'N', 'G'};
+    const auto frame = cc::EncodeClipboardChangedImage(png, "", StubClock);
+    cc::ParsedHelperMessage parsed{};
+    ASSERT_TRUE(cc::ParseHelperMessage(frame, parsed));
+    cc::ParsedClipboardData cd{};
+    ASSERT_TRUE(cc::ParseClipboardData(parsed.clipboard_data_ptr,
+                                       parsed.clipboard_data_len, cd));
+    EXPECT_TRUE(cd.content_hash.empty());
+    ASSERT_EQ(cd.payload_len, png.size());
+}

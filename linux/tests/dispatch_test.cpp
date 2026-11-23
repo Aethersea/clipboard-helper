@@ -76,6 +76,14 @@ public:
     void SetOnDataRequest(std::function<void(const std::string&)> cb) override {
         on_request_cb = std::move(cb);
     }
+    void SetOnFilesChanged(
+            std::function<void(const std::vector<std::string>&)> cb) override {
+        on_files_cb = std::move(cb);
+    }
+    void SetOnImageChanged(
+            std::function<void(const std::vector<std::uint8_t>&)> cb) override {
+        on_image_cb = std::move(cb);
+    }
 
     // Recorded state.
     bool                      set_text_called{false};
@@ -96,6 +104,8 @@ public:
 
     std::function<void(const std::string&)> on_changed_cb;
     std::function<void(const std::string&)> on_request_cb;
+    std::function<void(const std::vector<std::string>&)> on_files_cb;
+    std::function<void(const std::vector<std::uint8_t>&)> on_image_cb;
 };
 
 // ─── Inbound frame builders (mirror what shen/leviathan put on the wire) ──
@@ -419,14 +429,20 @@ TEST(Dispatcher, AttachInstallsCallbacksDetachClearsThem) {
 
     EXPECT_TRUE(mock.on_changed_cb == nullptr);
     EXPECT_TRUE(mock.on_request_cb == nullptr);
+    EXPECT_TRUE(mock.on_files_cb == nullptr);
+    EXPECT_TRUE(mock.on_image_cb == nullptr);
 
     d.Attach();
     EXPECT_TRUE(mock.on_changed_cb != nullptr);
     EXPECT_TRUE(mock.on_request_cb != nullptr);
+    EXPECT_TRUE(mock.on_files_cb != nullptr);
+    EXPECT_TRUE(mock.on_image_cb != nullptr);
 
     d.Detach();
     EXPECT_TRUE(mock.on_changed_cb == nullptr);
     EXPECT_TRUE(mock.on_request_cb == nullptr);
+    EXPECT_TRUE(mock.on_files_cb == nullptr);
+    EXPECT_TRUE(mock.on_image_cb == nullptr);
 }
 
 TEST(Dispatcher, AttachIsIdempotent) {
@@ -453,6 +469,8 @@ TEST(Dispatcher, AttachedCallbacksWithNullSocketDoNotCrash) {
     mock.on_changed_cb("some external clipboard text");
     ASSERT_TRUE(mock.on_request_cb != nullptr);
     mock.on_request_cb("requested-content-hash");
+    ASSERT_TRUE(mock.on_image_cb != nullptr);
+    mock.on_image_cb(std::vector<std::uint8_t>{0x89, 'P', 'N', 'G', 0x00, 0xFF});
 
     EXPECT_TRUE(true);  // reached here ⇒ no crash through the guarded path
 }

@@ -4,9 +4,16 @@ Qt 6 / C++17 implementation of the `clipboard-helper` agent for Linux. Sibling t
 
 Speaks the same length-prefixed `HelperMessage` protobuf wire protocol; runtime-selects between **Wayland** (`ext-data-control-v1` for KDE Plasma 6, `wlr-data-control-unstable-v1` for wlroots compositors), **X11** (Qt `xcb` QClipboard), and **GNOME XWayland** (force `QT_QPA_PLATFORM=xcb` because Mutter does not implement any data-control extension).
 
-> **Status — P3 complete (TEXT + IMAGE + FILES)**: IPC layer, dispatch, parent watchdog, backend detector all in. **Wayland (`wlr-data-control` + `ext-data-control`) and X11 backends handle all three content types in delayed rendering.**
+> **Status — TEXT + IMAGE + FILES in both directions**: IPC layer, dispatch, parent watchdog, backend detector all in. The Wayland (`wlr-data-control` + `ext-data-control`) and X11 backends serve all three content types to local pasters (remote → local, delayed rendering) and report all three when the user copies locally (local → remote, `CLIPBOARD_CHANGED`).
 
-The IMAGE path decodes the lossless WebP shen sends on the wire via **libwebp** directly (see `src/webp_decode.*`) and re-encodes per paste consumer's MIME (PNG / BMP / Qt-native QImage) using qtbase's built-in image writers. Decoding via libwebp avoids depending on the optional Qt WebP image-format plugin (`qt6-image-formats-plugins` / `qt6-qtimageformats`), which is trivially absent on a minimal install and silently breaks image paste.
+| Direction | TEXT | IMAGE | FILES |
+|---|---|---|---|
+| Remote → local (`SET_CLIPBOARD` / `ANNOUNCE_DELAYED`) | yes | yes (WebP in, PNG/BMP out) | yes (paths via `PROVIDE_DATA`) |
+| Local → remote (`CLIPBOARD_CHANGED`) | yes (empty text is not reported) | yes (PNG payload) | yes (served via `FILE_CHUNK_REQUEST`) |
+
+Remote → local IMAGE decodes the lossless WebP shen sends on the wire via **libwebp** directly (see `src/webp_decode.*`) and re-encodes per paste consumer's MIME (PNG / BMP / Qt-native QImage) using qtbase's built-in image writers. Decoding via libwebp avoids depending on the optional Qt WebP image-format plugin (`qt6-image-formats-plugins` / `qt6-qtimageformats`), which is trivially absent on a minimal install and silently breaks image paste.
+
+Local → remote IMAGE (`src/image_encode.*`) reports the copied image as **PNG** with `content_hash` = SHA-256 of the PNG bytes, the same payload the macOS and Windows helpers report. Priority on a local change is files → image → text, as on macOS, because image sources (browsers, chat apps) also offer a text rendering. Accepted source MIMEs, in order: `image/png` (passed through), `image/webp` (libwebp), `image/bmp`, `image/x-bmp`, `image/jpeg`, `image/gif`; on X11, any other image Qt can read is taken via `QMimeData::imageData()`. A PNG larger than the 16 MiB frame cap minus 64 KiB is not reported (logged as a warning) and nothing else is reported for that change.
 
 The FILES path mirrors the macOS helper's flow: shen downloads files locally and returns newline-joined absolute paths via PROVIDE_DATA; the helper formats those into `file://` URIs joined by CRLF per RFC 2483 and writes them to the paste consumer's fd as `text/uri-list`.
 
@@ -21,8 +28,9 @@ clipboard-helper
   ├─ socket_server (worker thread, accept + frame I/O)
   ├─ dispatch (HelperMessage routing)
   ├─ clipboard_manager (Qt event loop, QClipboard + DelayedMimeData)
-  │     ├─ Wayland backend  (ext-data-control / wlr-data-control)  [stub]
-  │     └─ X11 backend       (Qt xcb QClipboard)                    [stub]
+  │     ├─ Wayland backend  (ext-data-control / wlr-data-control)
+  │     └─ X11 backend       (Qt xcb QClipboard)
+  ├─ image_encode (local image → PNG payload)
   ├─ backend_detector (env vars → backend choice)
   └─ parent_watchdog (prctl PR_SET_PDEATHSIG + /proc/<pid> poll)
 ```

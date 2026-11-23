@@ -13,6 +13,7 @@
 #include <stdlib.h>
 
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <vector>
@@ -55,6 +56,25 @@ inline void ExternalSet(QMimeData* mime) {
 inline void ExternalSetText(const std::string& utf8) {
     auto* m = new QMimeData;
     m->setText(QString::fromUtf8(utf8.c_str(), static_cast<qsizetype>(utf8.size())));
+    ExternalSet(m);
+}
+
+// An arbitrary MIME byte stream, optionally with a text rendering too.
+// Browsers and chat apps offer both for a copied image; a test uses the
+// text to prove the image path wins (and falls back correctly on garbage).
+inline void ExternalSetData(const char*                       mime,
+                            const std::vector<std::uint8_t>& bytes,
+                            const std::string&               also_text = std::string()) {
+    auto* m = new QMimeData;
+    m->setData(QString::fromLatin1(mime),
+               bytes.empty()
+                   ? QByteArray()
+                   : QByteArray(reinterpret_cast<const char*>(bytes.data()),
+                                static_cast<qsizetype>(bytes.size())));
+    if (!also_text.empty()) {
+        m->setText(QString::fromUtf8(also_text.c_str(),
+                                     static_cast<qsizetype>(also_text.size())));
+    }
     ExternalSet(m);
 }
 
