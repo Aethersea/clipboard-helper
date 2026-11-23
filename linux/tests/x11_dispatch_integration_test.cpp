@@ -10,6 +10,7 @@
 
 #include <QClipboard>
 #include <QGuiApplication>
+#include <QImage>
 
 #include <cstdint>
 #include <cstdio>
@@ -20,7 +21,7 @@
 
 #include "clipboard_manager.h"
 #include "frame_pipe.h"
-#include "proto_wire.h"
+#include "image_test_util.h"
 #include "qt_gui_env.h"
 #include "test_lite.h"
 #include "uri_list_format.h"
@@ -70,14 +71,6 @@ private:
     std::string              dir_;
     std::vector<std::string> files_, dirs_;
 };
-
-std::vector<std::uint8_t> Announce(int content_type, const std::string& hash) {
-    leviathan::clipboard_helper::proto_wire::Writer w;
-    w.WriteEnumField(1, content_type);
-    w.WriteStringField(2, hash);
-    const auto sub = w.take();
-    return wt::Envelope(2 /*ANNOUNCE_DELAYED*/, 3, &sub);
-}
 
 struct Stack {
     std::unique_ptr<ch::ClipboardManager> mgr;
@@ -231,15 +224,124 @@ TEST(X11DispatchIntegration, OwnAnnouncementsProduceNoFrameAndNoDataRequest) {
     Stack st;
     ASSERT_TRUE(st.ok);
 
-    EXPECT_TRUE(st.disp->Handle(Announce(wt::kFiles, "hash-f")).empty());
+    EXPECT_TRUE(st.disp->Handle(wt::AnnounceDelayed(wt::kFiles, "hash-f")).empty());
     guitest::Pump(150);
     EXPECT_TRUE(st.pipe.NoFrameWithin(200));  // neither CLIPBOARD_CHANGED nor DATA_REQUEST
 
-    EXPECT_TRUE(st.disp->Handle(Announce(wt::kText, "hash-t")).empty());
+    EXPECT_TRUE(st.disp->Handle(wt::AnnounceDelayed(wt::kText, "hash-t")).empty());
     guitest::Pump(150);
     EXPECT_TRUE(st.pipe.NoFrameWithin(200));
 
-    EXPECT_TRUE(st.disp->Handle(Announce(2 /*IMAGE*/, "hash-i")).empty());
+    EXPECT_TRUE(st.disp->Handle(wt::AnnounceDelayed(wt::kImage, "hash-i")).empty());
     guitest::Pump(150);
     EXPECT_TRUE(st.pipe.NoFrameWithin(200));
+}
+
+// ─── Local image reporting (X11 backend → Dispatcher → wire) ────────────
+
+TEST(X11DispatchIntegration, ExternalImageCopyProducesImageFrame) {
+    Stack st;
+    ASSERT_TRUE(st.ok);
+
+    const auto png = imgtest::PngBytes();
+    ASSERT_TRUE(!png.empty());
+
+    // An external copy (with the usual text rendering browsers attach).
+    guitest::ExternalSetData("image/png", png, "alt text");
+
+    const auto f = st.Next(5000);
+    ASSERT_TRUE(f.ok);
+    EXPECT_EQ(f.type, wt::kChanged);
+    EXPECT_EQ(f.content_type, wt::kImage);
+    ASSERT_EQ(f.payload.size(), png.size());
+    EXPECT_TRUE(std::vector<std::uint8_t>(f.payload.begin(), f.payload.end()) == png);
+    EXPECT_EQ(f.content_hash, imgtest::Sha256Hex(png));
+    EXPECT_TRUE(f.timestamp != 0);
+    EXPECT_TRUE(f.files.empty());
+
+    // Exactly one frame — no TEXT follow-up for the same copy.
+    EXPECT_TRUE(st.pipe.NoFrameWithin(200));
+}
+
+TEST(X11DispatchIntegration, ExternalWebpCopyProducesPngImageFrame) {
+    Stack st;
+    ASSERT_TRUE(st.ok);
+
+    const auto webp = imgtest::WebpLosslessSample();
+    ASSERT_TRUE(!webp.empty());
+
+    guitest::ExternalSetData("image/webp", webp);
+
+    const auto f = st.Next(5000);
+    ASSERT_TRUE(f.ok);
+    EXPECT_EQ(f.content_type, wt::kImage);
+    const std::vector<std::uint8_t> payload(f.payload.begin(), f.payload.end());
+    EXPECT_TRUE(imgtest::HasPngSignature(payload));
+    EXPECT_EQ(f.content_hash, imgtest::Sha256Hex(payload));
+
+    const auto decoded = imgtest::Decode(payload, "PNG");
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_TRUE(imgtest::RgbaOf(*decoded) == imgtest::SampleRgba());
+}
+
+TEST(X11DispatchIntegration, OwnSetClipboardImageProducesNoFrame) {
+    Stack st;
+    ASSERT_TRUE(st.ok);
+
+    const auto webp = imgtest::WebpLosslessSample();
+    ASSERT_TRUE(!webp.empty());
+
+    // SET_CLIPBOARD(IMAGE) from the parent: the helper writes the
+    // clipboard eagerly and must not report its own write back.
+    EXPECT_TRUE(st.disp->Handle(wt::SetClipboardImage(webp)).empty());
+    guitest::Pump(200);
+    EXPECT_FALSE(QGuiApplication::clipboard()->image().isNull());
+    EXPECT_TRUE(st.pipe.NoFrameWithin(250));
+
+    // Positive control: the same channel reports a genuine external copy.
+    const auto png = imgtest::PngBytes();
+    guitest::ExternalSetData("image/png", png);
+    const auto f = st.Next(5000);
+    ASSERT_TRUE(f.ok);
+    EXPECT_EQ(f.content_type, wt::kImage);
+    EXPECT_TRUE(std::vector<std::uint8_t>(f.payload.begin(), f.payload.end()) == png);
+}
+
+TEST(X11DispatchIntegration, ExternalImageInvalidatesPreviouslyReportedFileIds) {
+    Scratch sc;
+    const auto file = sc.File("served.txt", "file-content");
+
+    Stack st;
+    ASSERT_TRUE(st.ok);
+
+    guitest::ExternalSetUriList(ul::FormatTextUriList({file}));
+    const auto files = st.Next();
+    ASSERT_TRUE(files.ok);
+    EXPECT_EQ(files.content_type, wt::kFiles);
+    EXPECT_EQ(st.Chunk("0", 0, 0).data, std::string("file-content"));
+
+    const auto png = imgtest::PngBytes();
+    guitest::ExternalSetData("image/png", png);
+    const auto image = st.Next(5000);
+    ASSERT_TRUE(image.ok);
+    EXPECT_EQ(image.content_type, wt::kImage);
+
+    const auto c = st.Chunk("0", 0, 0);
+    EXPECT_NE(c.error, std::string());  // the clipboard no longer holds the file
+    EXPECT_EQ(c.data, std::string());
+    EXPECT_TRUE(c.is_last);
+}
+
+TEST(X11DispatchIntegration, UndecodableImageFallsBackToTextFrame) {
+    Stack st;
+    ASSERT_TRUE(st.ok);
+
+    const std::vector<std::uint8_t> junk = {'n', 'o', 't', 'a', 'n', 'i', 'm', 'g'};
+    guitest::ExternalSetData("image/png", junk, "plain fallback");
+
+    const auto f = st.Next(5000);
+    ASSERT_TRUE(f.ok);
+    EXPECT_EQ(f.type, wt::kChanged);
+    EXPECT_EQ(f.content_type, wt::kText);  // not an IMAGE frame for garbage bytes
+    EXPECT_EQ(f.payload, std::string("plain fallback"));
 }
